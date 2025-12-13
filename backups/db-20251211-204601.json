@@ -1,0 +1,239 @@
+{
+  "users": {
+    "5440089231": {
+      "tg_id": "5440089231",
+      "tg_username": "TAKE IT",
+      "custom_name": "",
+      "is_active": true,
+      "activation_date": "2025-12-03",
+      "expiry_date": "2026-01-02",
+      "balance": 0,
+      "plan": "monthly",
+      "services": {
+        "carfax": true,
+        "photos_badvin": true,
+        "photos_auction": true,
+        "photos_accident": true
+      },
+      "limits": {
+        "daily": 50,
+        "monthly": 500,
+        "today_used": 1,
+        "month_used": 57,
+        "last_day": "2025-12-11",
+        "last_month": "2025-12"
+      },
+      "stats": {
+        "total_reports": 42,
+        "last_report_ts": "2025-12-11 18:30:58 UTC",
+        "pending_reports": 15
+      },
+      "notes": "",
+      "audit": [
+        {
+          "ts": "2025-12-03 17:46:48 UTC",
+          "admin": "5440089231",
+          "op": "monthly_activate_from_pending",
+          "add_days": 30,
+          "daily_limit": 25,
+          "monthly_limit": 500
+        },
+        {
+          "ts": "2025-12-03 20:11:37 UTC",
+          "admin": "5440089231",
+          "op": "set_daily",
+          "value": 50
+        }
+      ],
+      "phone": "+962792008086",
+      "flags": {
+        "reply_keyboard_ready": true
+      },
+      "onboarded": true,
+      "last_auto_notifications": {
+        "limit_daily_hit": "2025-12-03"
+      },
+      "language": "ar",
+      "report_lang": "ar"
+    },
+    "8572386667": {
+      "tg_id": "8572386667",
+      "tg_username": "Mo",
+      "custom_name": "",
+      "is_active": true,
+      "activation_date": "2025-12-11",
+      "expiry_date": "2026-01-10",
+      "balance": 0,
+      "plan": "custom",
+      "services": {
+        "carfax": true,
+        "photos_badvin": true,
+        "photos_auction": true,
+        "photos_accident": true
+      },
+      "limits": {
+        "daily": 75,
+        "monthly": 500,
+        "today_used": 5,
+        "month_used": 105,
+        "last_day": "2025-12-11",
+        "last_month": "2025-12"
+      },
+      "stats": {
+        "total_reports": 37,
+        "last_report_ts": "2025-12-11 20:44:59 UTC",
+        "pending_reports": 68
+      },
+      "notes": "",
+      "audit": [
+        {
+          "ts": "2025-12-11 15:25:31 UTC",
+          "admin": "5440089231",
+          "op": "activate_custom",
+          "days": 30,
+          "daily_limit": 25,
+          "monthly_limit": 500,
+          "extra_reports": 0
+        },
+        {
+          "ts": "2025-12-11 16:17:55 UTC",
+          "admin": "5440089231",
+          "op": "reset_today"
+        },
+        {
+          "ts": "2025-12-11 17:02:56 UTC",
+          "admin": "5440089231",
+          "op": "set_daily",
+          "value": 50
+        },
+        {
+          "ts": "2025-12-11 17:25:21 UTC",
+          "admin": "5440089231",
+          "op": "set_daily",
+          "value": 75
+        },
+        {
+          "ts": "2025-12-11 20:19:52 UTC",
+          "admin": "5440089231",
+          "op": "reset_today"
+        }
+      ],
+      "language": "ckb",
+      "report_lang": "ckb",
+      "phone": "+962797684993",
+      "prefs": {
+        "report_lang": "ckb"
+      },
+      "lang": "ckb",
+      "last_auto_notifications": {
+        "limit_daily_hit": "2025-12-11",
+        "limit_daily_hit_super": "2025-12-11"
+      }
+    },
+    "962792008086": {
+      "tg_id": "962792008086",
+      "tg_username": "962792008086",
+      "custom_name": "",
+      "is_active": true,
+      "activation_date": "2025-12-11",
+      "expiry_date": "2026-01-10",
+      "balance": 0,
+      "plan": "custom",
+      "services": {
+        "carfax": true,
+        "photos_badvin": true,
+        "photos_auction": true,
+        "photos_accident": true
+      },
+      "limits": {
+        "daily": 25,
+        "monthly": 500,
+        "today_used": 2,
+        "month_used": 26,
+        "last_day": "2025-12-11",
+        "last_month": "2025-12"
+      },
+      "stats": {
+        "total_reports": 21,
+        "last_report_ts": "2025-12-11 20:43:09 UTC",
+        "pending_reports": 6
+      },
+      "notes": "",
+      "audit": [
+        {
+          "ts": "2025-12-11 18:04:19 UTC",
+          "admin": "5440089231",
+          "op": "activate_custom",
+          "days": 30,
+          "daily_limit": 25,
+          "monthly_limit": 500,
+          "extra_reports": 0
+        },
+        {
+          "ts": "2025-12-11 19:59:05 UTC",
+          "admin": "5440089231",
+          "op": "reset_today"
+        },
+        {
+          "ts": "2025-12-11 19:59:21 UTC",
+          "admin": "5440089231",
+          "op": "reset_today"
+        }
+      ],
+      "phone": "962792008086",
+      "language": "ckb",
+      "report_lang": "ckb",
+      "lang": "ckb"
+    },
+    "380947126049": {
+      "tg_id": "380947126049",
+      "tg_username": "380947126049",
+      "custom_name": "",
+      "is_active": true,
+      "activation_date": "2025-12-11",
+      "expiry_date": "2026-01-10",
+      "balance": 0,
+      "plan": "custom",
+      "services": {
+        "carfax": true,
+        "photos_badvin": true,
+        "photos_auction": true,
+        "photos_accident": true
+      },
+      "limits": {
+        "daily": 25,
+        "monthly": 500,
+        "today_used": 1,
+        "month_used": 1,
+        "last_day": "2025-12-11",
+        "last_month": "2025-12"
+      },
+      "stats": {
+        "total_reports": 2,
+        "last_report_ts": "2025-12-11 18:12:25 UTC",
+        "pending_reports": 0
+      },
+      "notes": "",
+      "audit": [
+        {
+          "ts": "2025-12-11 18:09:56 UTC",
+          "admin": "5440089231",
+          "op": "activate_custom",
+          "days": 30,
+          "daily_limit": 25,
+          "monthly_limit": 500,
+          "extra_reports": 0
+        }
+      ],
+      "phone": "380947126049",
+      "language": "ku",
+      "report_lang": "ku",
+      "lang": "ku",
+      "state": "report_options:5NMP5DGL5SH094967"
+    }
+  },
+  "activation_requests": [],
+  "settings": {},
+  "super_admins": [],
+  "activation_presets": {}
+}

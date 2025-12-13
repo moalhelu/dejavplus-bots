@@ -1,0 +1,21 @@
+
+DejaVu Plus Telegram Bot — Photos Service Integration
+----------------------------------------------------
+- Added Photos service toggle in Super Admin > User Card > Services.
+- Added post-report button: "🖼 عرض صور السيارة" (if Photos service is enabled).
+- Integrated Badvin.com scraper (badvin.py) to fetch all available images for a VIN.
+- Added env keys support (optional): BADVIN_EMAIL, BADVIN_PASSWORD.
+- Safe fallbacks if credentials are missing (button won't crash; shows 'no images' message).
+
+Files updated:
+- app.py (patched)
+- badvin.py (new)
+
+How to use:
+1) Put your Badvin credentials in .env:
+   BADVIN_EMAIL=you@example.com
+   BADVIN_PASSWORD=your_password
+
+2) pip install -r requirements.txt
+3) python app.py
+

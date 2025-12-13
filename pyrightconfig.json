@@ -1,0 +1,27 @@
+{
+  "typeCheckingMode": "off",
+  "useLibraryCodeForTypes": false,
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportMissingTypeStubs": "none",
+  "diagnosticSeverityOverrides": {
+    "reportGeneralTypeIssues": "none",
+    "reportUnknownArgumentType": "none",
+    "reportUnknownVariableType": "none",
+    "reportUnknownMemberType": "none",
+    "reportUnknownParameterType": "none",
+    "reportUnknownLambdaType": "none",
+    "reportUnknownCallableType": "none",
+    "reportMissingTypeArgument": "none",
+    "reportPrivateUsage": "none",
+    "reportConstantRedefinition": "none",
+    "reportDeprecated": "none",
+    "reportUnnecessaryIsInstance": "none",
+    "reportUnusedImport": "none",
+    "reportUnusedFunction": "none",
+    "reportUnusedClass": "none",
+    "reportUnusedCoroutine": "none",
+    "reportUnusedVariable": "none",
+    "reportUnusedExpression": "none"
+  }
+}

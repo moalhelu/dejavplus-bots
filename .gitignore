@@ -1,0 +1,14 @@
+# Ignore virtual environments and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Ignore database backups
+backups/db-*.json
+
+# Ignore generated PDFs
+temp_static/*.pdf
+
+# Ignore misc logs
+pdf_errors.log

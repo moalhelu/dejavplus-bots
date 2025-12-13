@@ -12,7 +12,8 @@ from typing import Any, Dict, Optional, Final
 from bot_core.config import get_env
 
 _DB_LOCK = Lock()
-_BACKUP_RETENTION: Final[int] = max(1, int(os.getenv("DB_BACKUP_RETENTION", "10") or "10"))
+# Default to 1 retained backup; env DB_BACKUP_RETENTION can override
+_BACKUP_RETENTION: Final[int] = max(1, int(os.getenv("DB_BACKUP_RETENTION", "1") or "1"))
 
 
 def _blank_db() -> Dict[str, Any]:

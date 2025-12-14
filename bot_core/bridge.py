@@ -48,6 +48,19 @@ LOGGER = logging.getLogger(__name__)
 
 VIN_COMMAND_PREFIXES = ("/vin", "/report", "/carfax", "vin:", "report:")
 VIN_TOKEN_SPLIT_RE = re.compile(r"[\s,:;\n]+")
+
+# Capabilities question patterns for multi-language detection
+# Kept intentionally specific to match bot capability questions while avoiding false positives
+CAPABILITIES_PATTERNS = [
+    "ماذا يمكنك أن تفعل",  # What can you do (formal Arabic)
+    "ماذا يمكنك ان تفعل",  # What can you do (without diacritics)
+    "ماذا تستطيع أن تفعل",  # What are you able to do
+    "ماذا تستطيع ان تفعل",  # What are you able to do (without diacritics)
+    "what can you do",
+    "what do you do",
+    "چی دەکرێت بکەیت",  # What can you do (Kurdish)
+]
+
 PHONE_INPUT_RE = re.compile(r"^[+\d][\d\s()-]{6,}$")
 _VIN_CONTROL_RE = re.compile(r"[\u200c\u200d\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 _VIN_DIGIT_TRANSLATE = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
@@ -2090,6 +2103,113 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "📚 FAQ",
         "ku": "📚 پرسیارە باوەکان",
     },
+    "help.button.capabilities": {
+        "ar": "🤖 ماذا يمكنني أن أفعل؟",
+        "en": "🤖 What can I do?",
+        "ku": "🤖 چی دەکرێت بکەم؟",
+    },
+    "help.capabilities": {
+        "ar": (
+            "🤖 <b>ماذا يمكنني أن أفعل؟</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>📋 الميزات الرئيسية:</b>\n\n"
+            "📄 <b>تقارير Carfax:</b>\n"
+            "• احصل على تقارير مفصلة لأي سيارة بإرسال رقم الشاصي (VIN)\n"
+            "• التقارير متوفرة بصيغة PDF عالية الجودة\n"
+            "• دعم اللغات: العربية، الإنجليزية، الكردية (بادينية وسورانية)\n\n"
+            "📷 <b>صور السيارات:</b>\n"
+            "• صور السيارة المخفية من BadVin\n"
+            "• صور المزاد الحالي من Apicar\n"
+            "• صور الحوادث السابقة\n\n"
+            "💳 <b>إدارة الاشتراك:</b>\n"
+            "• متابعة رصيدك الشهري واليومي\n"
+            "• طلب تفعيل الحساب أو رفع الحدود\n"
+            "• إشعارات تلقائية عند اقتراب انتهاء الاشتراك\n\n"
+            "🌐 <b>تعدد اللغات:</b>\n"
+            "• تبديل فوري بين اللغات المدعومة\n"
+            "• واجهة كاملة بلغتك المفضلة\n\n"
+            "📱 <b>الدعم والمساعدة:</b>\n"
+            "• تواصل مع فريق الدعم عبر واتساب أو البريد الإلكتروني\n"
+            "• أسئلة شائعة لحل المشاكل السريعة\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 <i>استخدم الأزرار أدناه للوصول لجميع الميزات!</i>"
+        ),
+        "en": (
+            "🤖 <b>What can I do?</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>📋 Main Features:</b>\n\n"
+            "📄 <b>Carfax Reports:</b>\n"
+            "• Get detailed reports for any vehicle by sending the VIN\n"
+            "• High-quality PDF reports\n"
+            "• Language support: Arabic, English, Kurdish (Badini & Sorani)\n\n"
+            "📷 <b>Vehicle Images:</b>\n"
+            "• Hidden car photos from BadVin\n"
+            "• Current auction photos from Apicar\n"
+            "• Previous accident photos\n\n"
+            "💳 <b>Subscription Management:</b>\n"
+            "• Track your monthly and daily balance\n"
+            "• Request account activation or limit increases\n"
+            "• Automatic notifications before subscription expiry\n\n"
+            "🌐 <b>Multi-language:</b>\n"
+            "• Instant switching between supported languages\n"
+            "• Complete interface in your preferred language\n\n"
+            "📱 <b>Support & Help:</b>\n"
+            "• Contact support team via WhatsApp or Email\n"
+            "• FAQ for quick solutions\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 <i>Use the buttons below to access all features!</i>"
+        ),
+        "ku": (
+            "🤖 <b>چی دەکرێت بکەم؟</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>📋 تایبەتمەندییە سەرەکییەکان:</b>\n\n"
+            "📄 <b>ڕاپۆرتەکانی Carfax:</b>\n"
+            "• ڕاپۆرتی ورد بۆ هەر ئۆتۆمبێلێک بە ناردنی VIN\n"
+            "• ڕاپۆرتی PDF بە کوالێتی بەرز\n"
+            "• پشتگیری زمان: عەرەبی، ئینگلیزی، کوردی (بادینی و سۆرانی)\n\n"
+            "📷 <b>وێنەکانی ئۆتۆمبێل:</b>\n"
+            "• وێنە شاراوەکان لە BadVin\n"
+            "• وێنەکانی مزایدەی ئێستا لە Apicar\n"
+            "• وێنەکانی ڕووداوی پێشوو\n\n"
+            "💳 <b>بەڕێوەبردنی بەشداری:</b>\n"
+            "• شوێنکەوتنی باڵانسی مانگانە و ڕۆژانە\n"
+            "• داواکردنی چالاککردنی هەژمار یان زیادکردنی سنوور\n"
+            "• ئاگادارکردنەوەی ئۆتۆماتیکی پێش کۆتایی بەشداری\n\n"
+            "🌐 <b>فرە-زمان:</b>\n"
+            "• گۆڕینی خێرا لە نێوان زمانە پشتگیریکراوەکان\n"
+            "• ڕووکاری تەواو بە زمانی دڵخوازت\n\n"
+            "📱 <b>پشتگیری و یارمەتی:</b>\n"
+            "• پەیوەندی بە تیمی پشتگیری لە ڕێگەی WhatsApp یان Email\n"
+            "• پرسیارە باوەکان بۆ چارەسەری خێرا\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 <i>دوگمەکانی خوارەوە بەکاربەرە بۆ دەستگەیشتن بە هەموو تایبەتمەندییەکان!</i>"
+        ),
+        "ckb": (
+            "🤖 <b>چی دەکرێت بکەم؟</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>📋 تایبەتمەندییە سەرەکییەکان:</b>\n\n"
+            "📄 <b>ڕاپۆرتەکانی Carfax:</b>\n"
+            "• ڕاپۆرتی ورد بۆ هەر ئۆتۆمبێلێک بە ناردنی VIN\n"
+            "• ڕاپۆرتی PDF بە کوالێتی بەرز\n"
+            "• پشتگیری زمان: عەرەبی، ئینگلیزی، کوردی (بادینی و سۆرانی)\n\n"
+            "📷 <b>وێنەکانی ئۆتۆمبێل:</b>\n"
+            "• وێنە شاراوەکان لە BadVin\n"
+            "• وێنەکانی مزایدەی ئێستا لە Apicar\n"
+            "• وێنەکانی ڕووداوی پێشوو\n\n"
+            "💳 <b>بەڕێوەبردنی بەشداری:</b>\n"
+            "• شوێنکەوتنی باڵانسی مانگانە و ڕۆژانە\n"
+            "• داواکردنی چالاککردنی هەژمار یان زیادکردنی سنوور\n"
+            "• ئاگادارکردنەوەی ئۆتۆماتیکی پێش کۆتایی بەشداری\n\n"
+            "🌐 <b>فرە-زمان:</b>\n"
+            "• گۆڕینی خێرا لە نێوان زمانە پشتگیریکراوەکان\n"
+            "• ڕووکاری تەواو بە زمانی دڵخوازت\n\n"
+            "📱 <b>پشتگیری و یارمەتی:</b>\n"
+            "• پەیوەندی بە تیمی پشتگیری لە ڕێگەی WhatsApp یان Email\n"
+            "• پرسیارە باوەکان بۆ چارەسەری خێرا\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 <i>دوگمەکانی خوارەوە بەکاربەرە بۆ دەستگەیشتن بە هەموو تایبەتمەندییەکان!</i>"
+        ),
+    },
     "photos.badvin.label": {
         "ar": "صور السيارة المخفية",
         "en": "Hidden car photos",
@@ -3073,6 +3193,12 @@ async def handle_text(
     phone_candidate = _extract_general_phone_candidate(user, text)
     if phone_candidate:
         resp = await _handle_activation_submission(user, message, phone_candidate, context)
+        return await _localize_response(resp, user.language)
+
+    # Check for capabilities question using centralized patterns (case-insensitive)
+    if any(pattern.lower() in lowered for pattern in CAPABILITIES_PATTERNS):
+        resp = BridgeResponse()
+        resp.messages.append(t("help.capabilities", user.language))
         return await _localize_response(resp, user.language)
 
     return await render_main_menu(user)

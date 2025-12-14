@@ -3195,8 +3195,8 @@ async def handle_text(
         resp = await _handle_activation_submission(user, message, phone_candidate, context)
         return await _localize_response(resp, user.language)
 
-    # Check for capabilities question using centralized patterns
-    if any(pattern in lowered for pattern in CAPABILITIES_PATTERNS):
+    # Check for capabilities question using centralized patterns (case-insensitive)
+    if any(pattern.lower() in lowered for pattern in CAPABILITIES_PATTERNS):
         resp = BridgeResponse()
         resp.messages.append(t("help.capabilities", user.language))
         return await _localize_response(resp, user.language)

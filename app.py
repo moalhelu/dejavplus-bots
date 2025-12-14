@@ -47,6 +47,7 @@ from bot_core.auth import (
 )
 from bot_core.config import get_env, get_report_default_lang
 from bot_core import bridge as _bridge
+from bot_core.bridge import CAPABILITIES_PATTERNS as _CAPABILITIES_PATTERNS
 from bot_core.storage import (
     load_db as _load_db,
     save_db as _save_db,
@@ -5554,8 +5555,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🚀 ابدأ الآن$"), start_button_handler))  # توافق مع النسخ السابقة
     app.add_handler(MessageHandler(filters.Regex("^🆘 المساعدة والتواصل$"), help_command))
     app.add_handler(MessageHandler(filters.Regex("^📄 تقرير جديد$"), new_report_command))
-    # Handler for "What can you do?" in multiple languages - matches specific question patterns
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)(ماذا يمكن|ماذا تستطيع|ماذا يمكنك|what can you do|what do you do|چی دەکرێت)"), capabilities_command))
+    # Handler for "What can you do?" - uses centralized patterns from bridge
+    _capabilities_regex = "(?i)(" + "|".join(re.escape(p) for p in _CAPABILITIES_PATTERNS) + ")"
+    app.add_handler(MessageHandler(filters.Regex(_capabilities_regex), capabilities_command))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(main_menu_cb, pattern=r"^(main_menu|ref):"))

@@ -50,8 +50,15 @@ VIN_COMMAND_PREFIXES = ("/vin", "/report", "/carfax", "vin:", "report:")
 VIN_TOKEN_SPLIT_RE = re.compile(r"[\s,:;\n]+")
 
 # Capabilities question patterns for multi-language detection
+# Kept intentionally specific to match bot capability questions while avoiding false positives
 CAPABILITIES_PATTERNS = [
-    "ماذا يمكن", "ماذا تستطيع", "ماذا يمكنك", "what can you do", "what do you do", "چی دەکرێت"
+    "ماذا يمكنك أن تفعل",  # What can you do (formal Arabic)
+    "ماذا يمكنك ان تفعل",  # What can you do (without diacritics)
+    "ماذا تستطيع أن تفعل",  # What are you able to do
+    "ماذا تستطيع ان تفعل",  # What are you able to do (without diacritics)
+    "what can you do",
+    "what do you do",
+    "چی دەکرێت بکەیت",  # What can you do (Kurdish)
 ]
 
 PHONE_INPUT_RE = re.compile(r"^[+\d][\d\s()-]{6,}$")

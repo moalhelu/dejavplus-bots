@@ -71,6 +71,7 @@ from bot_core.services.images import (
 from bot_core.services.translation import (
     inject_rtl as _inject_rtl,
     translate_html as _translate_html,
+    close_http_session as _close_translation_session,
 )
 from bot_core.services.pdf import (
     html_to_pdf_bytes_chromium as _html_to_pdf_bytes_chromium,
@@ -81,7 +82,11 @@ from bot_core.services.notifications import (
     notify_supers as _notify_supers,
     notify_user as _notify_user,
 )
-from bot_core.services.reports import ReportResult as _ReportResult, generate_vin_report as _generate_vin_report
+from bot_core.services.reports import (
+    ReportResult as _ReportResult,
+    close_http_session as _close_reports_session,
+    generate_vin_report as _generate_vin_report,
+)
 from bot_core.utils.vin import (
     VIN_RE,
     normalize_vin as _norm_vin,
@@ -250,6 +255,8 @@ _MAIN_MENU_PROMPT_FALLBACK = {
 def _resolve_lang_for_tg(tg_id: Optional[str], fallback: Optional[str] = None) -> str:
     lang_candidate = _normalize_report_lang_code(fallback or get_report_default_lang() or "ar")
     try:
+        if tg_id and _is_super_admin(str(tg_id)):
+            return "ar"
         if tg_id:
             db = _load_db()
             user = db.get("users", {}).get(str(tg_id)) or {}
@@ -263,13 +270,7 @@ def _main_menu_prompt_text(lang: Optional[str]) -> str:
     lang_code = _normalize_report_lang_code(lang)
     header = _bridge.t("menu.header", lang_code, default=_MAIN_MENU_HEADER_FALLBACK.get(lang_code, _MAIN_MENU_HEADER_FALLBACK["en"]))
     prompt = _bridge.t("menu.telegram.prompt", lang_code, default=_MAIN_MENU_PROMPT_FALLBACK.get(lang_code, _MAIN_MENU_PROMPT_FALLBACK["en"]))
-    text = f"{header}\n{prompt}"
-    if lang_code in {"ar", "ku", "ckb"}:
-        try:
-            text = _inject_rtl(text, lang=lang_code)
-        except Exception:
-            pass
-    return text
+    return f"{header}\n{prompt}"
 
 
 def _normalize_report_lang_code(lang: Optional[str]) -> str:
@@ -561,6 +562,9 @@ async def _panel_message(update, context: ContextTypes.DEFAULT_TYPE, text: str, 
     if isinstance(chat_data, dict):
         is_main = text.strip().startswith("🏠") and any(label in text for label in MAIN_MENU_TEXTS)
         chat_data["main_menu_visible"] = is_main
+        if is_main:
+            # Prevent downstream fallback from duplicating the main menu
+            chat_data["suppress_fallback"] = True
     return msg
 
 
@@ -688,8 +692,8 @@ def _compute_super_dashboard_snapshot() -> Dict[str, Any]:
         if last_ts:
             recent_activity.append((str(last_ts), str(tg_id), user))
 
-        platform_label = "واتساب" if str(tg_id).isdigit() and len(str(tg_id)) > 10 else "تيليغرام"
-        if platform_label == "واتساب":
+        platform_code = "wa" if str(tg_id).isdigit() and len(str(tg_id)) > 10 else "tg"
+        if platform_code == "wa":
             wa_users += 1
         else:
             tg_users += 1
@@ -703,11 +707,13 @@ def _compute_super_dashboard_snapshot() -> Dict[str, Any]:
 
         compact.append({
             "name": _display_name(user),
-            "platform": "📞 WA" if platform_label == "واتساب" else "💬 TG",
-            "plan": f"خطة: {plan}",
-            "days": f"ينتهي: {days_left if days_left is not None else '—'}",
-            "daily": f"{daily_used}/{daily_limit if daily_limit > 0 else '∞'}",
-            "monthly": f"{monthly_used}/{monthly_limit if monthly_limit > 0 else '∞'}",
+            "platform": platform_code,
+            "plan": plan,
+            "days_left": days_left,
+            "daily_used": daily_used,
+            "daily_limit": daily_limit,
+            "monthly_used": monthly_used,
+            "monthly_limit": monthly_limit,
         })
 
         days_left = _days_left(user.get("expiry_date"))
@@ -768,6 +774,15 @@ SUPER_DASHBOARD_LOCALE = {
         "footer": "⚙️ استخدم الأزرار لتحديث أو إخفاء اللوحة.",
         "btn_refresh": "↻ تحديث",
         "btn_hide": "❌ إخفاء",
+        "platforms": "📞 واتساب: <b>{wa}</b> | 💬 تيليغرام: <b>{tg}</b>",
+        "compact_header": "\n\n📊 حالة المستخدمين (أعلى {cnt}):\n",
+        "compact_entry": "• {name} — {platform} | {plan} | {expiry} | {daily} | {monthly}\n",
+        "platform_wa": "📞 WA",
+        "platform_tg": "💬 TG",
+        "plan_label": "خطة: {plan}",
+        "expiry_label": "ينتهي: {expiry}",
+        "daily_label": "يومي {used}/{limit}",
+        "monthly_label": "شهري {used}/{limit}",
     },
     "en": {
         "header": "🛡️ <b>Live Super Dashboard</b>\n━━━━━━━━━━━━━━━━━━━━\n",
@@ -785,6 +800,15 @@ SUPER_DASHBOARD_LOCALE = {
         "footer": "⚙️ Use the buttons to refresh or hide.",
         "btn_refresh": "↻ Refresh",
         "btn_hide": "❌ Hide",
+        "platforms": "📞 WhatsApp: <b>{wa}</b> | 💬 Telegram: <b>{tg}</b>",
+        "compact_header": "\n\n📊 User status (top {cnt}):\n",
+        "compact_entry": "• {name} — {platform} | {plan} | {expiry} | {daily} | {monthly}\n",
+        "platform_wa": "📞 WA",
+        "platform_tg": "💬 TG",
+        "plan_label": "Plan: {plan}",
+        "expiry_label": "Expires: {expiry}",
+        "daily_label": "Daily {used}/{limit}",
+        "monthly_label": "Monthly {used}/{limit}",
     },
     "ku": {
         "header": "🛡️ <b>داشبۆردی سوپەر ڕاستەوخۆ</b>\n━━━━━━━━━━━━━━━━━━━━\n",
@@ -802,6 +826,41 @@ SUPER_DASHBOARD_LOCALE = {
         "footer": "⚙️ دوگمەکان بەکاربهێنە بۆ نوێکردنەوە یان شاردنەوە.",
         "btn_refresh": "↻ نوێکردنەوە",
         "btn_hide": "❌ شاردنەوە",
+        "platforms": "📞 واتساپ: <b>{wa}</b> | 💬 تیلیگرام: <b>{tg}</b>",
+        "compact_header": "\n\n📊 دۆخی بەکارهێنەران (سەری {cnt}):\n",
+        "compact_entry": "• {name} — {platform} | {plan} | {expiry} | {daily} | {monthly}\n",
+        "platform_wa": "📞 WA",
+        "platform_tg": "💬 TG",
+        "plan_label": "پلانی: {plan}",
+        "expiry_label": "دەکۆتایەوە: {expiry}",
+        "daily_label": "ڕۆژانە {used}/{limit}",
+        "monthly_label": "مانگانە {used}/{limit}",
+    },
+    "ckb": {
+        "header": "🛡️ <b>داشبۆردی سووپەر بەردەوام</b>\n━━━━━━━━━━━━━━━━━━━━\n",
+        "active": "👥 چالاک: <b>{active}</b>/<b>{total}</b>",
+        "soon": "⏳ لە ٣ ڕۆژدا دەکۆتایەوە: <b>{soon}</b>",
+        "expired": "🛑 بەسەرچوو: <b>{expired}</b>",
+        "today": "📊 ڕاپۆرتەکانی ئەمڕۆ: <b>{today}</b>",
+        "month": "🗓️ ئەم مانگە: <b>{month}</b>",
+        "pending_activation": "📥 داواکاریی چالاککردن چاوەڕوان: <b>{pending_activation}</b>",
+        "pending_reports": "⏳ ڕاپۆرتە جێبەجێبوونەکان: <b>{pending_reports}</b>",
+        "recent_header": "⏱️ دوایین ڕاپۆرتەکان:\n",
+        "recent_total": " (کۆی گشتی: {total})\n",
+        "events_header": "📰 دوایین رووداوەکان:\n",
+        "no_events": "• هیچ رووداوێکی نوێ نییە",
+        "footer": "⚙️ دوگمەکان بەکاربهێنە بۆ نوێکردنەوە یان شاردنەوە.",
+        "btn_refresh": "↻ نوێکردنەوە",
+        "btn_hide": "❌ شاردنەوە",
+        "platforms": "📞 واتساپ: <b>{wa}</b> | 💬 تێلەگرام: <b>{tg}</b>",
+        "compact_header": "\n\n📊 دۆخی بەکارهێنەران (سەری {cnt}):\n",
+        "compact_entry": "• {name} — {platform} | {plan} | {expiry} | {daily} | {monthly}\n",
+        "platform_wa": "📞 WA",
+        "platform_tg": "💬 TG",
+        "plan_label": "پلانی: {plan}",
+        "expiry_label": "کۆتایی: {expiry}",
+        "daily_label": "ڕۆژانە {used}/{limit}",
+        "monthly_label": "مانگانە {used}/{limit}",
     },
 }
 
@@ -833,18 +892,29 @@ def _format_super_dashboard_text(snapshot: Dict[str, Any], events: List[str], *,
         loc["expired"].format(expired=snapshot["expired_users"]),
         loc["today"].format(today=snapshot["reports_today"]),
         loc["month"].format(month=snapshot["reports_month"]),
-        f"📞 واتساب: <b>{snapshot['wa_users']}</b> | 💬 تيليغرام: <b>{snapshot['tg_users']}</b>",
+        loc["platforms"].format(wa=snapshot["wa_users"], tg=snapshot["tg_users"]),
         loc["pending_activation"].format(pending_activation=snapshot["pending_activation"]),
         loc["pending_reports"].format(pending_reports=snapshot["pending_reports"]),
     ]
     text = loc["header"] + "\n".join(lines)
 
     if snapshot.get("users_compact"):
-        text += "\n\n📊 حالة المستخدمين (أعلى {cnt}):\n".format(cnt=len(snapshot["users_compact"]))
+        text += loc["compact_header"].format(cnt=len(snapshot["users_compact"]))
         for entry in snapshot["users_compact"]:
-            text += (
-                f"• {entry['name']} — {entry['platform']} | {entry['plan']} | {entry['days']} | "
-                f"يومي {entry['daily']} | شهري {entry['monthly']}\n"
+            platform_label = loc["platform_wa"] if entry.get("platform") == "wa" else loc["platform_tg"]
+            expiry_val = entry.get("days_left")
+            expiry_display = entry.get("days_left") if expiry_val is not None else "—"
+            daily_limit = entry.get("daily_limit")
+            monthly_limit = entry.get("monthly_limit")
+            daily_limit_disp = daily_limit if daily_limit > 0 else "∞"
+            monthly_limit_disp = monthly_limit if monthly_limit > 0 else "∞"
+            text += loc["compact_entry"].format(
+                name=entry.get("name"),
+                platform=platform_label,
+                plan=loc["plan_label"].format(plan=entry.get("plan")),
+                expiry=loc["expiry_label"].format(expiry=expiry_display),
+                daily=loc["daily_label"].format(used=entry.get("daily_used"), limit=daily_limit_disp),
+                monthly=loc["monthly_label"].format(used=entry.get("monthly_used"), limit=monthly_limit_disp),
             )
 
     if snapshot.get("top_recent"):
@@ -1038,6 +1108,39 @@ def _remove_pending_request(db: Dict[str, Any], tg_id: str) -> None:
     db["activation_requests"] = [
         req for req in db.get("activation_requests", []) if str(req.get("tg_id")) != tg_str
     ]
+
+
+def _prune_resolved_activation_requests(db: Dict[str, Any]) -> bool:
+    """Drop pending activation requests for users who are already active and not expired."""
+
+    pending = db.get("activation_requests", []) or []
+    if not pending:
+        return False
+
+    cleaned: List[Dict[str, Any]] = []
+    dirty = False
+
+    for req in pending:
+        tg = str(req.get("tg_id") or "")
+        if not tg:
+            dirty = True
+            continue
+
+        user = _ensure_user(db, tg, None)
+        left_days = _days_left(user.get("expiry_date"))
+        is_active = bool(user.get("is_active")) and (left_days is None or left_days > 0)
+
+        if is_active:
+            dirty = True
+            continue
+
+        cleaned.append(req)
+
+    if dirty:
+        db["activation_requests"] = cleaned
+        _save_db(db)
+
+    return dirty
 
 # =================== UI ===================
 
@@ -1468,16 +1571,8 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = _bridge._compose_profile_overview(u, lang)
 
     kb_rows: List[List[InlineKeyboardButton]] = []
-    add_phone_label = {
-        "ar": "📞 إضافة هاتف",
-        "en": "📞 Add phone",
-        "ku": "📞 زۆرکردنی ژمارە",
-    }.get(lang, "📞 Add phone")
-    back_label = {
-        "ar": "🏠 القائمة الرئيسية",
-        "en": "🏠 Main Menu",
-        "ku": "🏠 لیستی سەرەکی",
-    }.get(lang, "🏠 Main Menu")
+    add_phone_label = _bridge.t("profile.add_phone", lang)
+    back_label = _bridge.t("common.main_menu", lang)
 
     phone = (u.get("phone") or "").strip()
     if not phone:
@@ -1494,11 +1589,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = (u.get("language") or "ar").lower()
     text = _bridge._compose_balance_overview(u, lang)
 
-    back_label = {
-        "ar": "🏠 القائمة الرئيسية",
-        "en": "🏠 Main Menu",
-        "ku": "🏠 لیستی سەرەکی",
-    }.get(lang, "🏠 Main Menu")
+    back_label = _bridge.t("common.main_menu", lang)
 
     await _panel_message(
         update,
@@ -1516,44 +1607,53 @@ def _refresh_env() -> bool:
         logger.error("Error reloading env: %s", exc)
         return False
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر debug للتحقق من صلاحيات المستخدم ومتغيرات البيئة"""
+    """Localized debug command for permissions and environment summary."""
     tg_id = str(update.effective_user.id)
-    
-    # إعادة تحميل ENV للتأكد من أحدث القيم
-    env_reloaded = _refresh_env()
-    
-    env_admins = _env_super_admins()
     db = _load_db()
+    u = _ensure_user(db, tg_id, update.effective_user.username if update and update.effective_user else None)
+    lang = _get_user_report_lang(u)
+
+    env_reloaded = _refresh_env()
+    env_admins = _env_super_admins()
     db_admins = _db_super_admins(db)
     is_super = _is_super_admin(tg_id)
     is_admin = _is_admin_tg(tg_id)
     is_ultimate = _is_ultimate_super(tg_id)
-    
-    # معلومات ENV
-    env_info = (
-        f"📋 <b>معلومات متغيرات البيئة:</b>\n"
-        f"• TELEGRAM_SUPER_ADMINS: <code>{', '.join(_env_super_admins()) or 'غير محدد'}</code>\n"
-        f"• تم تحميل dotenv: {'✅ نعم' if env_reloaded else '❌ لا'}\n"
-        f"• BOT_TOKEN: <code>{'محدد' if BOT_TOKEN else 'غير محدد'}</code>\n"
-        f"• DB_PATH: <code>{DB_PATH}</code>\n\n"
-    )
-    
-    text = (
-        f"🔍 <b>معلومات الصلاحيات والبيئة</b>\n\n"
-        f"معرفك: <code>{tg_id}</code>\n"
-        f"اسم المستخدم: @{update.effective_user.username or 'غير متوفر'}\n\n"
-        f"<b>الصلاحيات:</b>\n"
-        f"• سوبر أدمن: {'✅ نعم' if is_super else '❌ لا'}\n"
-        f"• أدمن: {'✅ نعم' if is_admin else '❌ لا'}\n"
-        f"• سوبر أدمن مطلق (.env): {'✅ نعم' if is_ultimate else '❌ لا'}\n\n"
-        f"<b>السوبر أدمن من .env:</b>\n"
-        f"{', '.join(map(str, env_admins)) if env_admins else 'لا يوجد'}\n\n"
-        f"<b>السوبر أدمن من db.json:</b>\n"
-        f"{', '.join(db_admins) if db_admins else 'لا يوجد'}\n\n"
-        f"{env_info}"
-        f"<i>💡 نصيحة: إذا قمت بتعديل ملف .env، استخدم /debug لإعادة تحميل المتغيرات</i>"
-    )
-    await _panel_message(update, context, text, parse_mode=ParseMode.HTML, reply_markup=build_main_menu(tg_id))
+
+    yes_text = _bridge.t("common.status.yes", lang)
+    no_text = _bridge.t("common.status.no", lang)
+    def yn(flag: bool) -> str:
+        return yes_text if flag else no_text
+
+    env_supers_val = ", ".join(env_admins) if env_admins else _bridge.t("common.unset", lang)
+    db_admins_val = ", ".join(db_admins) if db_admins else _bridge.t("common.unset", lang)
+    bot_token_val = _bridge.t("common.set", lang) if BOT_TOKEN else _bridge.t("common.unset", lang)
+    username_val = f"@{update.effective_user.username}" if update and update.effective_user and update.effective_user.username else _bridge.t("common.unavailable", lang)
+
+    lines = [
+        _bridge.t("admin.debug.title", lang),
+        _bridge.t("admin.debug.user_id", lang, tg_id=tg_id),
+        _bridge.t("admin.debug.username", lang, username=username_val),
+        "",
+        _bridge.t("admin.debug.roles.header", lang),
+        _bridge.t("admin.debug.roles.super", lang, value=yn(is_super)),
+        _bridge.t("admin.debug.roles.admin", lang, value=yn(is_admin)),
+        _bridge.t("admin.debug.roles.ultimate", lang, value=yn(is_ultimate)),
+        "",
+        _bridge.t("admin.debug.env.header", lang),
+        _bridge.t("admin.debug.env.telegram_supers", lang, env_supers=env_supers_val),
+        _bridge.t("admin.debug.env.dotenv_loaded", lang, value=yn(env_reloaded)),
+        _bridge.t("admin.debug.env.bot_token", lang, value=bot_token_val),
+        _bridge.t("admin.debug.env.db_path", lang, value=DB_PATH),
+        "",
+        _bridge.t("admin.debug.env.supers_env", lang, env_admins=env_supers_val),
+        _bridge.t("admin.debug.env.supers_db", lang, db_admins=db_admins_val),
+        "",
+        _bridge.t("admin.debug.tip", lang),
+    ]
+
+    text = "\n".join(lines)
+    await _panel_message(update, context, text, parse_mode=ParseMode.HTML, reply_markup=build_main_menu(tg_id, lang))
 
 # قائمة المستخدمين (مكررة - تم دمجها مع _users_keyboard أعلاه)
 
@@ -1565,7 +1665,8 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (_is_admin_tg(tg_id) or _is_super_admin(tg_id)):
         return await _panel_message(update, context, _unauthorized(lang), parse_mode=ParseMode.HTML, reply_markup=build_main_menu(tg_id))
     context.user_data["last_users_page"] = 0
-    return await _panel_message(update, context, USERS_PANEL_TEXT, parse_mode=ParseMode.HTML, reply_markup=_users_keyboard(db, 0))
+    users_panel_text = _bridge.t("users.panel.header", lang)
+    return await _panel_message(update, context, users_panel_text, parse_mode=ParseMode.HTML, reply_markup=_users_keyboard(db, 0, 8, lang))
 async def users_pager_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1582,9 +1683,12 @@ async def users_pager_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = 0
     db = db or _load_db()
     context.user_data["last_users_page"] = page
-    return await q.edit_message_text(USERS_PANEL_TEXT, parse_mode=ParseMode.HTML, reply_markup=_users_keyboard(db, page))
+    users_panel_text = _bridge.t("users.panel.header", lang)
+    return await q.edit_message_text(users_panel_text, parse_mode=ParseMode.HTML, reply_markup=_users_keyboard(db, page, 8, lang))
 
 def _collect_stats(db: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    _prune_resolved_activation_requests(db)
+
     users = list(db.get("users", {}).values())
     users.sort(
         key=lambda x: (
@@ -1739,6 +1843,8 @@ async def admin_stats_command(update: Update, context):
     await _panel_message(update, context, header, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 def _pending_keyboard(db: Dict[str, Any]) -> InlineKeyboardMarkup:
+    _prune_resolved_activation_requests(db)
+
     rows: List[List[InlineKeyboardButton]] = []
     for req in db.get("activation_requests", []):
         tg = str(req.get("tg_id"))
@@ -2473,21 +2579,14 @@ async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         db_users = _load_db()
-        text = (
-            "👥 <b>قائمة المستخدمين</b>\n\n━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>انقر على اسم المستخدم لفتح بطاقته</i>\n\n"
-            "<b>💡 في البطاقة ستجد:</b>\n"
-            "• ✉️ إشعار سريع\n"
-            "• 💳 ضبط الرصيد\n"
-            "• 📝 ملاحظة\n"
-            "• وغيرها من الخيارات"
-        )
+        lang = _get_user_report_lang(_ensure_user(db_users, tg_id, q.from_user.username if q and q.from_user else None))
+        text = _bridge.t("admin.users.list.intro", lang)
         try:
-            kb = _users_keyboard(db_users, 0)
+            kb = _users_keyboard(db_users, 0, 8, lang)
             context.user_data["last_users_page"] = 0
         except Exception as e:
             logging.error(f"Error creating users keyboard: {e}")
-            await q.answer("❌ حدث خطأ في تحميل قائمة المستخدمين", show_alert=True)
+            await q.answer(_bridge.t("admin.users.load_error", lang), show_alert=True)
             return
 
         try:
@@ -2506,12 +2605,13 @@ async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer(_bridge.t("common.unauthorized", lang), show_alert=True)
             return
         db_users = _load_db()
+        lang = _get_user_report_lang(_ensure_user(db_users, tg_id, q.from_user.username if q and q.from_user else None))
         try:
-            kb = _users_keyboard(db_users, 0)
-            await q.edit_message_text(USERS_PANEL_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb)
+            kb = _users_keyboard(db_users, 0, 8, lang)
+            await q.edit_message_text(_bridge.t("users.panel.header", lang), parse_mode=ParseMode.HTML, reply_markup=kb)
         except Exception as exc:
             logging.error(f"Error opening users stats panel: {exc}")
-            await q.answer("❌ تعذر فتح الإحصائيات", show_alert=True)
+            await q.answer(_bridge.t("admin.stats.open_error", lang), show_alert=True)
             return
         return
     if target_action == "pending":
@@ -3052,13 +3152,14 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if root == "users":
         # معالجة أزرار التنقل في قائمة المستخدمين
+        lang_users = _resolve_lang_for_tg(caller_tg)
         if not (_is_admin_tg(caller_tg) or _is_super_admin(caller_tg)):
-            return await q.edit_message_text("❌ غير مصرح لك.", parse_mode=ParseMode.HTML)
+            return await q.edit_message_text(_unauthorized(lang_users), parse_mode=ParseMode.HTML)
         
         if len(parts) >= 2 and parts[1] == "none":
-            return await q.answer("لا يوجد مستخدمون في هذه الصفحة.", show_alert=True)
+            return await q.answer(_bridge.t("admin.users.page.empty", lang_users), show_alert=True)
 
-        list_text = USERS_PANEL_TEXT
+        list_text = _bridge.t("users.panel.header", lang_users)
 
         if len(parts) >= 2 and parts[1] == "page":
             try:
@@ -3067,11 +3168,11 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 page = 0
             page = max(0, page)
             context.user_data["last_users_page"] = page
-            return await _refresh_users_overview(q, db, page)
+            return await _refresh_users_overview(q, db, page, lang_users)
 
         if len(parts) >= 2 and parts[1] == "back":
             page = max(0, context.user_data.get("last_users_page", 0))
-            return await _refresh_users_overview(q, db, page)
+            return await _refresh_users_overview(q, db, page, lang_users)
         
         if len(parts) >= 2 and parts[1] == "open":
             target_tg = parts[2] if len(parts) > 2 else None
@@ -3220,6 +3321,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await _render_usercard(update, context, target_tg)
 
         if action == "monthly":
+            _remove_pending_request(db, target_tg)
             preset = _resolve_activation_preset(db, "monthly")
             days = preset["days"]
             daily_limit = preset["daily"]
@@ -3259,6 +3361,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await _render_usercard(update, context, target_tg)
 
         if action == "trial":
+            _remove_pending_request(db, target_tg)
             preset = _resolve_activation_preset(db, "trial")
             days = preset["days"]
             daily_limit = preset["daily"]
@@ -3288,6 +3391,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await _render_usercard(update, context, target_tg)
 
         if action == "enable30":
+            _remove_pending_request(db, target_tg)
             preset = _resolve_activation_preset(db, "monthly")
             days = preset["days"]
             daily_limit = preset["daily"]
@@ -3324,6 +3428,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         if action == "renew30":
+            _remove_pending_request(db, target_tg)
             preset = _resolve_activation_preset(db, "monthly")
             days = preset["days"]
             today = datetime.utcnow().date()
@@ -3367,7 +3472,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             support_link = "<a href='https://wa.me/962795378832'>+962 7 9537 8832</a>"
             await _notify_user(context, target_tg, _bridge.t("usercard.notify.disabled", target_lang, support=support_link))
             await _notify_supers(context, f"⛔ (Admin:{admin_tg}) عطّل {_fmt_tg_with_phone(target_tg)}.")
-            return await q.edit_message_text(_bridge.t("usercard.result.disabled", lang), parse_mode=ParseMode.HTML)
+            lang_rows.append([InlineKeyboardButton(_bridge.t("admin.users.main", current_lang), callback_data="main_menu:show")])
 
         if action == "services":
             return await q.edit_message_text(_bridge.t("services.manage.title", lang), parse_mode=ParseMode.HTML, reply_markup=_svc_kb(u, lang))
@@ -3376,6 +3481,8 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text(_bridge.t("limits.manage.title", lang), parse_mode=ParseMode.HTML, reply_markup=_limits_kb(u, lang))
 
         if action == "note":
+            admin_lang = _get_user_report_lang(_ensure_user(db, tg_id, update.effective_user.username))
+            await _panel_message(update, context, _bridge.t("users.panel.header", admin_lang), parse_mode=ParseMode.HTML, reply_markup=_users_keyboard(db, 0, 8, admin_lang))
             context.user_data["await"] = {"op": "note_set", "target": target_tg}
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(_bridge.t("action.cancel", lang), callback_data="main_menu:show")]])
             return await q.edit_message_text(_bridge.t("usercard.prompt.note", lang), parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -3931,11 +4038,7 @@ async def request_activation_command(update: Update, context: ContextTypes.DEFAU
 
     pending_requests = db.get("activation_requests", [])
     already_pending = any(str(req.get("tg_id")) == tg_id for req in pending_requests)
-    if already_pending:
-        text = _bridge.t("activation.request_pending", lang)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(_main_menu_button_text(lang), callback_data="main_menu:show")]])
-        await _panel_message(update, context, text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        return
+    # حتى لو كان هناك طلب معلق، استمر في جمع رقم الهاتف لتحديثه وإعادة الإشعار
     # بدء جمع رقم الهاتف مع مفتاح البلد
     context.user_data["await"] = {"op": "activation_phone"}
     cancel_label = _bridge.t("action.cancel", lang)
@@ -3948,8 +4051,10 @@ async def request_activation_command(update: Update, context: ContextTypes.DEFAU
          InlineKeyboardButton("🌍 رمز آخر", callback_data="activation:cc:other")],
         [InlineKeyboardButton(cancel_label, callback_data="main_menu:show")]
     ])
+    pending_note = _bridge.t("activation.request_pending", lang) if already_pending else ""
     txt = _bridge.t("activation.prompt.cc", lang)
-    await _panel_message(update, context, txt, parse_mode=ParseMode.HTML, reply_markup=cc_kb)
+    full_txt = f"{pending_note}\n\n{txt}" if pending_note else txt
+    await _panel_message(update, context, full_txt, parse_mode=ParseMode.HTML, reply_markup=cc_kb)
 
 # =================== VIN flow (send PDF only) ===================
 async def _send_pdf_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, filename: str, caption: str):
@@ -4014,25 +4119,6 @@ async def activation_cc_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Minimal plain-text main menu fallback (avoids heavy HTML) throttled per chat
-    try:
-        chat_data = context.chat_data if isinstance(context.chat_data, dict) else {}
-        last_plain = chat_data.get("last_plain_menu_ts", 0)
-        now_ts = time.time()
-        if now_ts - last_plain > 15 and getattr(update, "effective_chat", None):
-            tg_id_plain = str(update.effective_user.id) if update and update.effective_user else None
-            menu_text_plain = "🏠 القائمة الرئيسية\nاختر أحد الأزرار للمتابعة."
-            try:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=menu_text_plain,
-                    reply_markup=build_main_menu(tg_id_plain),
-                )
-                chat_data["last_plain_menu_ts"] = now_ts
-            except Exception:
-                pass
-    except Exception:
-        pass
-
     aw = context.user_data.get("await")
     op = aw.get("op") if isinstance(aw, dict) else None
 
@@ -4044,6 +4130,23 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lang = _get_user_report_lang(_lang_user)
     except Exception:
         lang = None
+
+    chat_data = context.chat_data if isinstance(context.chat_data, dict) else {}
+
+    async def _show_main_menu_single() -> None:
+        """Always reopen the main menu by editing/creating one panel message and hide the user text."""
+        if isinstance(chat_data, dict):
+            chat_data["suppress_fallback"] = True
+        try:
+            await _panel_message(
+                update,
+                context,
+                _main_menu_prompt_text(lang),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_main_menu(tg_id, lang),
+            )
+        except Exception:
+            pass
 
     is_super = _is_super_admin(str(update.effective_user.id))
     is_admin = _is_admin_tg(str(update.effective_user.id))
@@ -4577,14 +4680,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_db(db)
             context.user_data.pop("await", None)
 
+            target_u = _ensure_user(db, target, None)
+            target_lang = _get_user_report_lang(target_u)
             await _notify_user(
                 context,
                 target,
-                (
-                    "📈 <b>تم تحديث حدك اليومي</b>\n\n"
-                    f"الحد الجديد: <b>{limits['daily']}</b> تقرير كل يوم.\n"
-                    f"👤 بواسطة الإدارة: <code>{tg_id}</code>"
-                ),
+                _bridge.t("limits.updated.daily.user", target_lang, value=limits["daily"], admin=tg_id),
             )
 
             success = _bridge.t("limits.updated.daily", lang)
@@ -4596,9 +4697,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _panel_message(
                     update,
                     context,
-                    f"{success}\n\n{USERS_PANEL_TEXT}",
+                    f"{success}\n\n{_bridge.t('users.panel.header', lang)}",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=_users_keyboard(db, page_idx)
+                    reply_markup=_users_keyboard(db, page_idx, 8, lang)
                 )
             return
 
@@ -4615,14 +4716,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_db(db)
             context.user_data.pop("await", None)
 
+            target_u = _ensure_user(db, target, None)
+            target_lang = _get_user_report_lang(target_u)
             await _notify_user(
                 context,
                 target,
-                (
-                    "📊 <b>تم تحديث حدك الشهري</b>\n\n"
-                    f"الحد الجديد: <b>{limits['monthly']}</b> تقرير في الشهر.\n"
-                    f"👤 بواسطة الإدارة: <code>{tg_id}</code>"
-                ),
+                _bridge.t("limits.updated.monthly.user", target_lang, value=limits["monthly"], admin=tg_id),
             )
 
             success = _bridge.t("limits.updated.monthly", lang)
@@ -4634,9 +4733,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _panel_message(
                     update,
                     context,
-                    f"{success}\n\n{USERS_PANEL_TEXT}",
+                    f"{success}\n\n{_bridge.t('users.panel.header', lang)}",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=_users_keyboard(db, page_idx)
+                    reply_markup=_users_keyboard(db, page_idx, 8, lang)
                 )
             return
 
@@ -4687,18 +4786,23 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Intercept menu action to render native Telegram keyboard (Old System)
             if isinstance(bridge_text_responses, _bridge.BridgeResponse) and bridge_text_responses.actions.get("menu"):
                 lang_menu = bridge_user_ctx.language or _get_user_report_lang(u) if u else None
-                text_msg = _main_menu_prompt_text(lang_menu)
                 await _panel_message(
                     update,
                     context,
-                    text_msg,
+                    _main_menu_prompt_text(lang_menu),
                     parse_mode=ParseMode.HTML,
                     reply_markup=build_main_menu(tg_id)
                 )
+                if isinstance(chat_data, dict):
+                    chat_data["suppress_fallback"] = True
                 return
 
             await _send_bridge_responses(update, bridge_text_responses, context=context)
+            if isinstance(chat_data, dict):
+                chat_data["suppress_fallback"] = True
             return
+
+    vin = bridge_vin_candidate or _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
 
 # ===== VIN detection =====
     # استثناء زريّ المساعدة والتقرير الجديد قبل فحص VIN
@@ -4726,7 +4830,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await broadcast_menu_handler(update, context)
         return
 
-    vin = bridge_vin_candidate or _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
+    if not vin:
+        await _show_main_menu_single()
+        return
+
     if bridge_user_ctx and bridge_user_ctx.language == "ku":
         try:
             logger.debug("ku.trace.vin_branch", extra={"tg_id": tg_id, "vin": vin, "raw": txt})
@@ -5016,7 +5123,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             text = _bridge.t("language.change.prompt", _get_user_report_lang(u), current=_lang_label(current_lang))
             lang_rows = _language_choice_rows(current_lang, lambda code: f"lang:user_set:{code}")
-            lang_rows.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu:show")])
+            lang_rows.append([InlineKeyboardButton(_bridge.t("admin.users.main", current_lang), callback_data="main_menu:show")])
             kb = InlineKeyboardMarkup(lang_rows)
             await _panel_message(update, context, text, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
@@ -5024,7 +5131,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if txt == "👥 المستخدمون":
                 # عرض قائمة المستخدمين مع القائمة المرجعية
                 db = _load_db()
-                await _panel_message(update, context, USERS_PANEL_TEXT, parse_mode=ParseMode.HTML, reply_markup=_users_keyboard(db, 0))
+                admin_lang = _get_user_report_lang(_ensure_user(db, tg_id, update.effective_user.username))
+                await _panel_message(update, context, _bridge.t("users.panel.header", admin_lang), parse_mode=ParseMode.HTML, reply_markup=_users_keyboard(db, 0, 8, admin_lang))
                 return
             if txt == "📊 إحصائيات": return await admin_stats_command(update, context)
             if txt == "📝 قائمة المنتظرين": return await pending_list_command(update, context)
@@ -5036,11 +5144,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         db_check = _load_db()
                         db_admins = _db_super_admins(db_check)
                         debug_info = (
-                            f"❌ <b>هذه الإعدادات متاحة فقط للسوبر أدمن.</b>\n\n"
-                            f"معرفك: <code>{tg_id}</code>\n"
-                            f"السوبر أدمن من .env: {', '.join(map(str, env_admins)) if env_admins else 'لا يوجد'}\n"
-                            f"السوبر أدمن من db.json: {', '.join(db_admins) if db_admins else 'لا يوجد'}\n\n"
-                            f"<i>لإضافة نفسك كسوبر أدمن، أضف معرفك في متغير البيئة TELEGRAM_SUPER_ADMINS</i>"
+                            f"{_bridge.t('admin.settings.super_only', lang)}\n\n"
+                            f"ID: <code>{tg_id}</code>\n"
+                            f"ENV super admins: {', '.join(map(str, env_admins)) if env_admins else '—'}\n"
+                            f"DB super admins: {', '.join(db_admins) if db_admins else '—'}\n\n"
+                            f"<i>Set TELEGRAM_SUPER_ADMINS in .env to grant access.</i>"
                         )
                         return await _panel_message(
                             update,
@@ -5055,20 +5163,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return await _panel_message(
                         update,
                         context,
-                        f"❌ حدث خطأ: {str(e)}\n\nاستخدم /debug للتحقق من صلاحياتك.",
+                        _bridge.t("admin.settings.error", lang, error=str(e)),
                         parse_mode=ParseMode.HTML,
                         reply_markup=build_main_menu(tg_id)
                     )
         return
 
-    # غير معروف
-    await _panel_message(
-        update,
-        context,
-        "⚠️ الرجاء التأكد من رقم الشاصي الصحيح وإعادة المحاولة.",
-        reply_markup=build_main_menu(tg_id),
-        parse_mode=ParseMode.HTML
-    )
+    # غير معروف: افتح القائمة الرئيسية وأخفِ الرسالة
+    await _show_main_menu_single()
+    return
 
 # =================== Photos callback ===================
 
@@ -5084,13 +5187,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt in ALL_BUTTON_LABELS or not txt:
         return 
     if looks_like_vin and not vin_try:
-        return await _panel_message(
-            update,
-            context,
-            "⚠️ الرجاء التأكد من رقم الشاصي الصحيح (VIN من 17 خانة) ثم أعد المحاولة.",
-            reply_markup=build_main_menu(str(update.effective_user.id)),
-            parse_mode=ParseMode.HTML
-        )
+        await _show_main_menu_single()
+        return
 
     return 
 async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5099,61 +5197,53 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         _, action, vin = q.data.split(":", 2)
     except ValueError:
-        return await q.answer("⚠️ زر غير صالح.", show_alert=True)
+        return await q.answer(_bridge.t("common.invalid_button", user_lang), show_alert=True)
     tg_id = str(q.from_user.id)
     db = _load_db()
     u = _ensure_user(db, tg_id, None)
     services = u.get("services", {})
 
     def _accident_no_images(lang: str) -> str:
-        mapping = {
-            "en": "⚠️ No accident images available for this VIN.",
-            "ku": "⚠️ وێنەی ڕووداو بۆ ئەم ژمارەی شاصیە بوونی نییە.",
-        }
-        return mapping.get(lang, "⚠️ لا توجد صور حادث متاحة لهذا رقم الشاصي.")
+        return _bridge.t("report.photos.empty.accident", lang)
 
     def _accident_error(lang: str) -> str:
-        mapping = {
-            "en": "⚠️ Error while fetching accident images.",
-            "ku": "⚠️ هەڵە ڕوویدا لە هێنانى وێنەکانى ڕووداو.",
-        }
-        return mapping.get(lang, "⚠️ حدث خطأ أثناء جلب صور الحادث.")
+        return _bridge.t("report.photos.accident.error", lang)
 
     user_lang = _get_user_report_lang(u)
 
     photo_actions: Dict[str, Dict[str, Any]] = {
         "badvin": {
             "service": "photos_badvin",
-            "label": "صور السيارة المخفية",
+            "label": _bridge.t("photos.label.hidden", user_lang),
             "loader": _get_badvin_images,
-            "empty": "⚠️ لا توجد صور السيارة المخفية متاحة حالياً.",
-            "heading": "📷 صور السيارة المخفية",
+            "empty": _bridge.t("report.photos.empty.hidden", user_lang),
+            "heading": _bridge.t("photos.heading.hidden", user_lang),
         },
         "auction": {
             "service": "photos_auction",
-            "label": "صور المزاد الحالي",
+            "label": _bridge.t("photos.label.auction", user_lang),
             "loader": _get_apicar_current_images,
-            "empty": "⚠️ لا توجد صور مزاد حالياً.",
-            "heading": "🚗 صور المزاد الحالي",
+            "empty": _bridge.t("report.photos.empty.auction", user_lang),
+            "heading": _bridge.t("photos.heading.auction", user_lang),
         },
         "accident": {
             "service": "photos_accident",
-            "label": "صور حادث سابق",
+            "label": _bridge.t("photos.label.accident", user_lang),
             "loader": _get_apicar_accident_images,
             "empty": _accident_no_images(user_lang),
-            "heading": "💥 صور حادث سابق",
+            "heading": _bridge.t("photos.heading.accident", user_lang),
         },
     }
 
     info = photo_actions.get(action)
     if not info:
-        return await q.answer("⚠️ خيار غير معروف.", show_alert=True)
+        return await q.answer(_bridge.t("common.unknown_option", user_lang), show_alert=True)
 
     service_key = info["service"]
     if not services.get(service_key, False):
-        return await q.answer(f"⛔ {info['label']} غير مفعلة لحسابك.", show_alert=True)
+        return await q.answer(_bridge.t("photos.not_enabled", user_lang, label=info["label"]), show_alert=True)
 
-    await q.answer("⌛ جارٍ تجهيز الصور", show_alert=False)
+    await q.answer(_bridge.t("report.photos.collecting", user_lang, label=info["label"], vin=vin), show_alert=False)
 
     chat_id = q.message.chat_id
     status_msg = None
@@ -5456,10 +5546,36 @@ async def super_dashboard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # =================== Main ===================
 
+async def _post_shutdown_cleanup(app: Application) -> None:
+    """Close shared aiohttp sessions to avoid shutdown warnings."""
+
+    try:
+        await _close_translation_session()
+    except Exception:
+        pass
+
+    try:
+        await _close_reports_session()
+    except Exception:
+        pass
+
+    try:
+        bot_session = getattr(app.bot, "session", None)
+        if bot_session and not bot_session.closed:
+            await bot_session.close()
+    except Exception:
+        pass
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN in .env")
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_shutdown(_post_shutdown_cleanup)
+        .build()
+    )
 
     # Commands - معطلة (البوت يعمل فقط بالأزرار)
     # فقط أمر start للبدء
@@ -5503,9 +5619,10 @@ def main():
     app.add_handler(CallbackQueryHandler(renewal_cb, pattern=r"^renewal:"))
 
     # Text
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    # Block downstream handlers once text_router consumes the update to avoid duplicate menus
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router, block=True))
     # Media with captions (ensure admin can send photo+caption for notifications)
-    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, text_router))
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, text_router, block=True))
     try:
         app.add_handler(MessageHandler(filters.Document.IMAGE & ~filters.COMMAND, text_router))
     except Exception:
@@ -5643,7 +5760,8 @@ async def vin_info_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• رخصة المركبة\n"
         "• باب السائق من الداخل"
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ رجوع", callback_data="main_menu:show")]])
+    admin_lang = _resolve_lang_for_tg(str(q.from_user.id))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(_bridge.t("admin.users.back", admin_lang), callback_data="main_menu:show")]])
     try:
         await q.edit_message_text(info, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception:
@@ -5666,7 +5784,12 @@ async def activation_request_cb(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         await request_activation_command(update, context)
     except Exception:
-        await context.bot.send_message(chat_id=q.message.chat_id, text="أرسل طلب التفعيل من زر 🛂 طلب تفعيل في القائمة.", parse_mode=ParseMode.HTML)
+        admin_lang = _resolve_lang_for_tg(str(q.from_user.id))
+        await context.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=_bridge.t("admin.activation.hint", admin_lang),
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def report_prompt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5674,7 +5797,8 @@ async def report_prompt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     return await new_report_command(update, context)
 
-def _users_keyboard(db: Dict[str, Any], page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
+def _users_keyboard(db: Dict[str, Any], page: int = 0, per_page: int = 8, lang: Optional[str] = None) -> InlineKeyboardMarkup:
+    lang_code = _normalize_report_lang_code(lang)
     users = list(db.get("users", {}).values())
     users.sort(
         key=lambda x: (
@@ -5704,10 +5828,10 @@ def _users_keyboard(db: Dict[str, Any], page: int = 0, per_page: int = 8) -> Inl
             else:
                 phone_btn = InlineKeyboardButton("📞 " + phone, callback_data=f"user:contact:{tg}")
         else:
-            phone_btn = InlineKeyboardButton("📞 لا يوجد", callback_data=f"user:contact:{tg}")
+            phone_btn = InlineKeyboardButton(_bridge.t("admin.users.phone.missing", lang_code), callback_data=f"user:contact:{tg}")
 
         expiry_raw = u.get("expiry_date") or "-"
-        expiry_display = _fmt_date(expiry_raw) if expiry_raw not in (None, "-") else "غير محدد"
+        expiry_display = _fmt_date(expiry_raw) if expiry_raw not in (None, "-") else _bridge.t("admin.users.expiry.unset", lang_code)
         status_label, status_state = _user_status_meta(u)
 
         expiry_btn = InlineKeyboardButton(f"⏰ {expiry_display}", callback_data=f"ucard:activate_custom:{tg}")
@@ -5715,32 +5839,33 @@ def _users_keyboard(db: Dict[str, Any], page: int = 0, per_page: int = 8) -> Inl
             status_label,
             callback_data=f"users:status:{status_state}:{tg}:{page}"
         )
-        delete_btn = InlineKeyboardButton("🗑️ حذف", callback_data=f"ucard:delete:{tg}")
+        delete_btn = InlineKeyboardButton(_bridge.t("admin.users.delete", lang_code), callback_data=f"ucard:delete:{tg}")
 
         rows.append([phone_btn, expiry_btn, status_btn, delete_btn])
 
     if not rows:
-        rows.append([InlineKeyboardButton("لا يوجد مستخدمون حالياً", callback_data="users:none")])
+        rows.append([InlineKeyboardButton(_bridge.t("admin.users.none", lang_code), callback_data="users:none")])
 
     nav: List[InlineKeyboardButton] = []
     if start > 0:
-        nav.append(InlineKeyboardButton("« السابق", callback_data=f"users:page:{max(page-1,0)}"))
+        nav.append(InlineKeyboardButton(_bridge.t("admin.users.prev", lang_code), callback_data=f"users:page:{max(page-1,0)}"))
     if end < len(users):
-        nav.append(InlineKeyboardButton("التالي »", callback_data=f"users:page:{page+1}"))
+        nav.append(InlineKeyboardButton(_bridge.t("admin.users.next", lang_code), callback_data=f"users:page:{page+1}"))
     if nav:
         rows.append(nav)
 
-    rows.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu:show")])
+    rows.append([InlineKeyboardButton(_bridge.t("admin.users.main", lang_code), callback_data="main_menu:show")])
     if touched:
         _save_db(db)
     return InlineKeyboardMarkup(rows)
 
 
-async def _refresh_users_overview(q, db: Dict[str, Any], page: int) -> None:
+async def _refresh_users_overview(q, db: Dict[str, Any], page: int, lang: Optional[str] = None) -> None:
+    lang_code = _normalize_report_lang_code(lang)
     await q.edit_message_text(
-        USERS_PANEL_TEXT,
+        _bridge.t("users.panel.header", lang_code),
         parse_mode=ParseMode.HTML,
-        reply_markup=_users_keyboard(db, page)
+        reply_markup=_users_keyboard(db, page, 8, lang_code)
     )
 
 async def users_status_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5755,7 +5880,7 @@ async def users_status_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     parts = q.data.split(":")
     if len(parts) < 3:
-        return await q.answer("⚠️ زر غير صالح.", show_alert=True)
+        return await q.answer(_bridge.t("common.invalid_button", lang), show_alert=True)
 
     mode = parts[1]
     sub_action = parts[2]
@@ -5763,7 +5888,7 @@ async def users_status_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = int(parts[4]) if len(parts) > 4 else 0
 
     if not target_tg:
-        return await q.answer("⚠️ مستخدم غير معروف.", show_alert=True)
+        return await q.answer(_bridge.t("admin.user.unknown", lang), show_alert=True)
 
     db = _load_db()
     u = _ensure_user(db, target_tg, None)
@@ -5771,25 +5896,30 @@ async def users_status_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "status":
         if sub_action == "active":
             if not u.get("is_active"):
-                return await q.answer("ℹ️ المستخدم متوقف بالفعل.", show_alert=True)
+                return await q.answer(_bridge.t("admin.user.already_stopped", lang), show_alert=True)
             u["is_active"] = False
             _audit(u, admin_tg, "manual_suspend")
             _save_db(db)
-            await _notify_user(context, target_tg, "⛔ تم إيقاف حسابك من قبل الإدارة.")
-            await _notify_supers(context, f"⛔ (Admin:{admin_tg}) أوقف {_fmt_tg_with_phone(target_tg)}.")
-            await q.answer("✅ تم توقيف المستخدم.")
-            return await _refresh_users_overview(q, db, page)
+            await _notify_user(context, target_tg, _bridge.t("admin.user.suspend.notify", lang))
+            await _notify_supers(
+                context,
+                _bridge.t(
+                    "admin.user.suspend.log",
+                    lang,
+                    admin=_fmt_tg_with_phone(admin_tg),
+                    user=_fmt_tg_with_phone(target_tg),
+                ),
+            )
+            await q.answer(_bridge.t("admin.user.suspend.toast", lang))
+            return await _refresh_users_overview(q, db, page, lang)
 
         if sub_action == "stopped":
-            reactivate_text = (
-                f"⛔ <b>{_display_name(u)}</b> متوقف.\n\n"
-                "اختر طريقة لإعادة التفعيل:"
-            )
+            reactivate_text = _bridge.t("admin.user.reactivate.prompt", lang, name=_display_name(u))
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧪 تجربة افتراضية", callback_data=f"pending:trial:{target_tg}")],
-                [InlineKeyboardButton("🟢 اشتراك شهري", callback_data=f"pending:monthly:{target_tg}")],
-                [InlineKeyboardButton("🧾 تفعيل مخصّص", callback_data=f"ucard:activate_custom:{target_tg}")],
-                [InlineKeyboardButton("🔎 فتح البطاقة", callback_data=f"ucard:open:{target_tg}")]
+                [InlineKeyboardButton(_bridge.t("admin.user.reactivate.option.trial", lang), callback_data=f"pending:trial:{target_tg}")],
+                [InlineKeyboardButton(_bridge.t("admin.user.reactivate.option.monthly", lang), callback_data=f"pending:monthly:{target_tg}")],
+                [InlineKeyboardButton(_bridge.t("admin.user.reactivate.option.custom", lang), callback_data=f"ucard:activate_custom:{target_tg}")],
+                [InlineKeyboardButton(_bridge.t("admin.user.reactivate.option.open_card", lang), callback_data=f"ucard:open:{target_tg}")]
             ])
             await context.bot.send_message(
                 chat_id=int(admin_tg),
@@ -5797,17 +5927,14 @@ async def users_status_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb
             )
-            return await q.answer("📨 تم إرسال خيارات التفعيل.")
+            return await q.answer(_bridge.t("admin.user.reactivate.sent", lang))
 
         if sub_action == "limit":
-            limit_text = (
-                f"📈 <b>{_display_name(u)}</b> وصل الحد المسموح.\n\n"
-                "اختر الحد الذي تريد تعديله:"
-            )
+            limit_text = _bridge.t("admin.limit.prompt", lang, name=_display_name(u))
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📅 رفع الحد اليومي", callback_data=f"users:limit:daily:{target_tg}:{page}")],
-                [InlineKeyboardButton("📆 رفع الحد الشهري", callback_data=f"users:limit:monthly:{target_tg}:{page}")],
-                [InlineKeyboardButton("↩️ إغلاق", callback_data="main_menu:show")]
+                [InlineKeyboardButton(_bridge.t("admin.limit.option.daily", lang), callback_data=f"users:limit:daily:{target_tg}:{page}")],
+                [InlineKeyboardButton(_bridge.t("admin.limit.option.monthly", lang), callback_data=f"users:limit:monthly:{target_tg}:{page}")],
+                [InlineKeyboardButton(_bridge.t("action.cancel", lang), callback_data="main_menu:show")]
             ])
             await context.bot.send_message(
                 chat_id=int(admin_tg),
@@ -5815,20 +5942,20 @@ async def users_status_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb
             )
-            return await q.answer("📨 تم إرسال خيارات الحد.")
+            return await q.answer(_bridge.t("admin.limit.sent", lang))
 
-        return await q.answer("⚠️ خيار غير معروف.", show_alert=True)
+        return await q.answer(_bridge.t("common.unknown_option", lang), show_alert=True)
 
     if mode == "limit":
         if sub_action not in {"daily", "monthly"}:
-            return await q.answer("⚠️ خيار غير معروف.", show_alert=True)
+            return await q.answer(_bridge.t("common.unknown_option", lang), show_alert=True)
         op = "set_daily" if sub_action == "daily" else "set_monthly"
-        prompt = "📅 أرسل الحد اليومي الجديد (رقم):" if sub_action == "daily" else "📆 أرسل الحد الشهري الجديد (رقم):"
+        prompt = _bridge.t("admin.limit.prompt.daily", lang) if sub_action == "daily" else _bridge.t("admin.limit.prompt.monthly", lang)
         context.user_data["await"] = {"op": op, "target": target_tg, "users_page": page}
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ إلغاء", callback_data="main_menu:show")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(_bridge.t("action.cancel", lang), callback_data="main_menu:show")]])
         return await q.edit_message_text(prompt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    return await q.answer("⚠️ زر غير معروف.", show_alert=True)
+    return await q.answer(_bridge.t("common.invalid_button", lang), show_alert=True)
 
 # === Buttons-only mode: disable ALL slash-commands and show menu instead ===
 async def _commands_disabled(update, context):
@@ -5851,6 +5978,10 @@ async def _commands_disabled(update, context):
 
 # === Global smart fallback handler (text) ===
 async def _smart_fallback(update, context):
+    chat_data = context.chat_data if isinstance(getattr(context, "chat_data", None), dict) else {}
+    if isinstance(chat_data, dict) and chat_data.pop("suppress_fallback", False):
+        return
+
     txt = (update.message.text or "").strip() if update and update.message and update.message.text else ""
     tg_id = str(update.effective_user.id) if update and update.effective_user else ""
 
@@ -5871,7 +6002,7 @@ async def _smart_fallback(update, context):
         return await _panel_message(
             update,
             context,
-            "⚠️ الرجاء التأكد من رقم الشاصي الصحيح (VIN من 17 خانة) ثم أعد المحاولة.",
+            _bridge.t("common.invalid_vin", lang),
             reply_markup=build_main_menu(tg_id),
             parse_mode=ParseMode.HTML
         )

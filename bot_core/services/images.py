@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import time
 from datetime import datetime
@@ -19,9 +20,21 @@ except Exception:  # pragma: no cover
     BadvinScraper = None  # type: ignore
 
 _CACHE_TTL = 30 * 60  # seconds
+_BADVIN_TOTAL_TIMEOUT = float(os.getenv("BADVIN_TOTAL_TIMEOUT", "25") or 25.0)
 _IMAGE_CACHE: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
 _BADVIN_SEM = asyncio.Semaphore(2)  # simple rate-limit for Badvin login/scrape
-_PHOTO_EXCLUDE_TOKENS = ("360", "threesixty")
+_PHOTO_EXCLUDE_MARKERS = (
+    "360view",
+    "360-view",
+    "360_view",
+    "360deg",
+    "360-degree",
+    "360degree",
+    "360spin",
+    "spin360",
+    "threesixty",
+    "3sixty",
+)
 _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 _HTTP_CLIENT_LOCK = asyncio.Lock()
 
@@ -87,7 +100,11 @@ async def get_badvin_images(vin: str) -> List[str]:
             LOGGER.warning("badvin fetch failed vin=%s error=%s", vin, last_err)
         return []
 
-    urls = await _fetch_with_retries()
+    try:
+        urls = await asyncio.wait_for(_fetch_with_retries(), timeout=_BADVIN_TOTAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        LOGGER.warning("badvin fetch timed out vin=%s timeout=%s", vin, _BADVIN_TOTAL_TIMEOUT)
+        urls = []
     if urls:
         _cache_set(key, urls)
     return urls
@@ -128,13 +145,25 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
             pass
 
 
+def _is_360_spin_url(url: str) -> bool:
+    lower = url.lower()
+    if "360" not in lower and "three" not in lower:
+        return False
+    if any(marker in lower for marker in _PHOTO_EXCLUDE_MARKERS):
+        return True
+    # Treat explicit /360/ path segments as 360-view assets but allow resolution numbers elsewhere.
+    if "/360/" in lower or lower.endswith("/360"):
+        return True
+    return False
+
+
 def _select_images(urls: List[str], limit: int = 20) -> List[str]:
     selected: List[str] = []
     for url in urls:
         if not isinstance(url, str):
             continue
         lower = url.lower()
-        if any(token in lower for token in _PHOTO_EXCLUDE_TOKENS):
+        if _is_360_spin_url(lower):
             continue
         if lower.startswith(("http://", "https://")) and url not in selected:
             selected.append(url)

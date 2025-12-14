@@ -123,6 +123,7 @@ class BadvinScraper:
         self.session = requests.Session()
         self.base_url = "https://badvin.com"
         self.logged_in = False
+        self.timeout = float(os.getenv("BADVIN_REQUEST_TIMEOUT", "12") or 12.0)
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -135,7 +136,7 @@ class BadvinScraper:
     def login(self):
         try:
             login_url = f"{self.base_url}/users/login"
-            r = self.session.get(login_url, headers=self.headers)
+            r = self.session.get(login_url, headers=self.headers, timeout=self.timeout)
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
             csrf = soup.find('input', {'name':'_csrf'})
@@ -143,12 +144,12 @@ class BadvinScraper:
                 logger.info("No CSRF found on login page")
                 return False
             data = {'_csrf': csrf.get('value'), 'email': self.email, 'password': self.password}
-            r = self.session.post(login_url, data=data, headers=self.headers, allow_redirects=True)
+            r = self.session.post(login_url, data=data, headers=self.headers, allow_redirects=True, timeout=self.timeout)
             if r.status_code == 200 and ("already logged in" in r.text.lower() or self.email in r.text):
                 self.logged_in = True
                 return True
             # double check
-            r = self.session.get(self.base_url, headers=self.headers)
+            r = self.session.get(self.base_url, headers=self.headers, timeout=self.timeout)
             if r.status_code == 200 and ("already logged in" in r.text.lower() or self.email in r.text):
                 self.logged_in = True
                 return True
@@ -161,7 +162,7 @@ class BadvinScraper:
         try:
             if not self.logged_in and not self.login():
                 return None
-            r = self.session.get(self.base_url, headers=self.headers)
+            r = self.session.get(self.base_url, headers=self.headers, timeout=self.timeout)
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
             csrf = soup.find('input', {'name':'_csrf'})
@@ -170,7 +171,7 @@ class BadvinScraper:
             data = {'_csrf': csrf.get('value'), 'str': vin}
             headers = self.headers.copy()
             headers["Referer"] = self.base_url
-            r = self.session.post(f"{self.base_url}/search", data=data, headers=headers, allow_redirects=True)
+            r = self.session.post(f"{self.base_url}/search", data=data, headers=headers, allow_redirects=True, timeout=self.timeout)
             if r.status_code==200 and "/v/" in r.url and vin.lower() in r.url.lower():
                 return r.url
             return None
@@ -180,22 +181,22 @@ class BadvinScraper:
 
     def get_free_report(self, result_url, vin):
         try:
-            r = self.session.get(result_url, headers=self.headers)
+            r = self.session.get(result_url, headers=self.headers, timeout=self.timeout)
             r.raise_for_status()
             # try buy-basic flow
             buy_url = result_url + "/buy/?reportType=basic"
-            r = self.session.get(buy_url, headers={**self.headers, "Referer": result_url})
+            r = self.session.get(buy_url, headers={**self.headers, "Referer": result_url}, timeout=self.timeout)
             soup = BeautifulSoup(r.text, "html.parser")
             csrf = soup.find('input', {'name':'_csrf'})
             if not csrf or not csrf.get('value'):
                 report_url = result_url + "?buySuccess=basic"
-                r = self.session.get(report_url, headers=self.headers); r.raise_for_status()
+                r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
                 return report_url, r.text
             # submit form
             form = soup.find('form', {'action': lambda a: a and '/buy' in a})
             if not form:
                 report_url = result_url + "?buySuccess=basic"
-                r = self.session.get(report_url, headers=self.headers); r.raise_for_status()
+                r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
                 return report_url, r.text
             submit_url = urljoin(self.base_url, form.get('action'))
             data = {'_csrf': csrf.get('value'), 'reportType':'basic'}
@@ -203,11 +204,11 @@ class BadvinScraper:
                 name = inp.get('name'); value = inp.get('value')
                 if name and name not in data and name != '_csrf':
                     data[name]=value
-            r = self.session.post(submit_url, data=data, headers={**self.headers, "Referer": buy_url}, allow_redirects=True)
+            r = self.session.post(submit_url, data=data, headers={**self.headers, "Referer": buy_url}, allow_redirects=True, timeout=self.timeout)
             if "buySuccess=basic" in r.url:
                 return r.url, r.text
             report_url = result_url + "?buySuccess=basic"
-            r = self.session.get(report_url, headers=self.headers); r.raise_for_status()
+            r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
             return report_url, r.text
         except Exception as e:
             logger.error(f"get_free_report error for {vin}: {e}")

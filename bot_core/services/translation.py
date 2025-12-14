@@ -20,10 +20,10 @@ ARABIC_INDIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 ARABIC_INDIC_DIGITS = False  # forced off per user request
 KURDISH_LANGS = {"ku", "ckb"}
 RTL_LANGS = {"ar", "ku", "ckb"}
-# Budget targets (seconds)
-TRANSLATE_TOTAL_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_TOTAL_TIMEOUT", "8") or 8)
-PROVIDER_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_PROVIDER_TIMEOUT", "3") or 3)
-FREE_GOOGLE_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_FREE_GOOGLE_TIMEOUT", "4") or 4)
+# Budget targets (seconds) — tightened to fail fast and fall back quicker for non-English
+TRANSLATE_TOTAL_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_TOTAL_TIMEOUT", "6") or 6)
+PROVIDER_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_PROVIDER_TIMEOUT", "1.5") or 1.5)
+FREE_GOOGLE_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_FREE_GOOGLE_TIMEOUT", "2") or 2)
 MAX_CONCURRENCY = int(get_env().translator_defaults.get("TRANSLATE_CONCURRENCY", "10") or 10)
 
 # Simple TTL cache to avoid retranslating common fragments
@@ -49,6 +49,16 @@ async def _get_http_session(timeout: float = PROVIDER_TIMEOUT) -> aiohttp.Client
         connector = aiohttp.TCPConnector(limit=100, limit_per_host=0, enable_cleanup_closed=True, ttl_dns_cache=120)
         _HTTP_SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), connector=connector)
         return _HTTP_SESSION
+
+
+async def close_http_session() -> None:
+    """Close the shared translation ClientSession on shutdown."""
+
+    global _HTTP_SESSION
+    async with _HTTP_SESSION_LOCK:
+        if _HTTP_SESSION and not _HTTP_SESSION.closed:
+            await _HTTP_SESSION.close()
+        _HTTP_SESSION = None
 
 
 def _rtl_css_block(lang_code: str = "ar") -> str:

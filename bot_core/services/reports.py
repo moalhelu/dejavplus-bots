@@ -99,6 +99,16 @@ async def _get_http_session() -> aiohttp.ClientSession:
         return _HTTP_SESSION
 
 
+async def close_http_session() -> None:
+    """Close the shared reports ClientSession on shutdown."""
+
+    global _HTTP_SESSION
+    async with _HTTP_SESSION_LOCK:
+        if _HTTP_SESSION and not _HTTP_SESSION.closed:
+            await _HTTP_SESSION.close()
+        _HTTP_SESSION = None
+
+
 @dataclass(slots=True)
 class ReportResult:
     """Structured outcome for VIN report generation."""

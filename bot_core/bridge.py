@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Tuple
-
 from bot_core.auth import is_admin_tg as _is_admin_tg, is_super_admin as _is_super_admin
 from bot_core.services.notifications import notify_supers
 from bot_core.services.images import download_image_bytes
@@ -53,21 +52,15 @@ PHONE_INPUT_RE = re.compile(r"^[+\d][\d\s()-]{6,}$")
 _VIN_CONTROL_RE = re.compile(r"[\u200c\u200d\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 _VIN_DIGIT_TRANSLATE = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
-
 def _sanitize_for_vin(text: str) -> str:
-    """Aggressive VIN sanitization for RTL/Unicode inputs."""
-
     cleaned = _VIN_CONTROL_RE.sub("", text or "")
     cleaned = cleaned.translate(_VIN_DIGIT_TRANSLATE)
     cleaned = re.sub(r"[\s:-]", "", cleaned)
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", cleaned)
     return cleaned.upper()
 
 
 @dataclass(slots=True)
 class UserContext:
-    """Minimal transport-neutral view of a user."""
-
     user_id: str
     phone: Optional[str] = None
     language: str = "ar"
@@ -75,10 +68,8 @@ class UserContext:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
-    def is_active(self) -> bool:
-        """Placeholder activation status (will use storage helpers later)."""
-        # TODO: integrate with bot_core.storage to reflect real activation state.
-        return bool(self.metadata.get("active", True))
+    def is_anonymous(self) -> bool:
+        return not self.phone
 
 
 @dataclass(slots=True)
@@ -222,26 +213,31 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ar": "⚠️ رقم غير صالح. أعد الإرسال بصيغة <code>+رمز_الدولة</code> ثم الرقم (مثال: <code>+962795378832</code>){cc_hint}",
         "en": "⚠️ Invalid number. Please resend it as <code>+country_code</code> followed by the number (example: <code>+962795378832</code>).{cc_hint}",
         "ku": "⚠️ ژمارە دروست نییە. تکایە بە شێوەی <code>+کۆدی وڵات</code> دواتر ژمارە بنێرە (نمونە: <code>+962795378832</code>).{cc_hint}",
+        "ckb": "⚠️ ژمارە نادروستە. تکایە بە شێوەی <code>+کۆدی وڵات</code> دوای ژمارە بنێرە (نمونە: <code>+962795378832</code>).{cc_hint}",
     },
     "activation.invalid_cc_hint": {
         "ar": "\nيمكنك أيضًا إرسال الرقم بدون + بعد إزالة الصفر الأول بعد اختيار <b>{cc}</b>.",
         "en": "\nYou can also send the number without + after removing the leading zero once <b>{cc}</b> is selected.",
         "ku": "\nدەتوانیت ژمارەکە بۆنێریت بەبێ + دوای سڕینەوەی صفر لە پێشدا کاتێک <b>{cc}</b> هەڵتبژێردرا.",
+        "ckb": "\nدەتوانیت ژمارەکە بنێریت بەبێ + دوای سڕینەوەی صفرەکە لە پێشدا کاتێک <b>{cc}</b> هەڵتبژێردرا.",
     },
     "activation.already_active": {
         "ar": "✅ حسابك مفعل حالياً، لا حاجة لإضافتك لقائمة الانتظار.",
         "en": "✅ Your account is already active, no need to join the waitlist.",
         "ku": "✅ ئەکاونتەکەت چالاکە؛ پێویست بە داواکاری چالاککردن نییە.",
+        "ckb": "✅ هەژمارەکەت چالاکە؛ پێویست بە داواکاری چالاککردن نییە.",
     },
     "activation.request_pending": {
         "ar": "📨 <b>طلبك قيد المراجعة</b>\n\nلقد استلمنا طلب تفعيلك وننتظر موافقة الإدارة.\nسيتم إشعارك فور اكتمال المراجعة.",
         "en": "📨 <b>Your request is under review</b>\n\nWe already received your activation request and are waiting for approval.\nYou'll be notified as soon as it is processed.",
         "ku": "📨 <b>داواکاریەکەت لە چاوپێکەوتندایە</b>\n\nداواکاریی چالاککردنت گەیەندراوە و چاوەڕێی پەسەندکردنە.\nپەیام دەگەیتەوە کاتێک تەواوبێت.",
+        "ckb": "📨 <b>داواکارییەکەت لە چاوپێکەوتندایە</b>\n\nداواکاریی چالاککردنتمان وەرگرتووە و چاوەڕێی پەسەندکردنی یە.\nهەنگاوەکانت ئاگادار دەکەین کاتێک تەواوبێت.",
     },
     "activation.request_received": {
         "ar": "✅ تم استلام رقم هاتفك وإرسال طلب التفعيل.\nسنقوم بالمراجعة وإعلامك قريبًا.",
         "en": "✅ We received your phone number and submitted the activation request.\nWe'll review it and update you shortly.",
         "ku": "✅ ژمارەی مۆبایلەکەت وەرگیرا و داواکاریی چالاککردن نێردرا.\nزوو پەیامدەدرێت بە نوێکاریەکان.",
+        "ckb": "✅ ژمارەی مۆبایلت وەرگرت و داواکاریی چالاککردن نێردرا.\nبە زووترین کات ئاگادارت دەکەین بە دۆخی داواکاریەکە.",
     },
     "activation.prompt.cc": {
         "ar": (
@@ -265,41 +261,433 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "• یان کۆد هەڵبژێرە و ژمارە بنێرە بەبێ + و بەبێ صفر لە دەستپێکدا\n"
             "• نمونە دوای +962: <code>795378832</code>\n"
         ),
+        "ckb": (
+            "🛂 <b>داوای چالاککردن</b>\n\n"
+            "سەرەتا <b>کۆدی وڵات</b> هەڵبژێرە، دواتر ژمارەکەت بنێرە.\n\n"
+            "• فۆرماتێکی باش: <code>+962795xxxxxx</code>\n"
+            "• یان کۆدەکە هەڵبژێرە و ژمارە بنێرە بەبێ + و بەبێ صفر لە سەرەتا\n"
+            "• نمونە دوای هەڵبژاردنی +962: <code>795378832</code>\n"
+        ),
     },
     "activation.cc.enter_full": {
         "ar": "🌍 أرسل رقمك كاملاً بصيغة <code>+رمز_الدولة</code> ثم الرقم. مثال: <code>+962795378832</code>",
         "en": "🌍 Send your full number as <code>+country_code</code> followed by the digits. Example: <code>+962795378832</code>",
         "ku": "🌍 ژمارەکەت بە تەواوی بنێرە بە شێوەی <code>+کۆدی وڵات</code> دواتر ژمارە. نمونە: <code>+962795378832</code>",
+        "ckb": "🌍 ژمارەکەت بە تەواوی بنێرە بە شێوەی <code>+کۆدی وڵات</code> دواتر ژمارە. نمونە: <code>+962795378832</code>",
     },
     "activation.cc.other": {
         "ar": "🌍 رمز آخر",
         "en": "🌍 Other code",
         "ku": "🌍 کۆدی تر",
+        "ckb": "🌍 کۆدی تر",
     },
     "activation.cc.selected": {
         "ar": "📞 المفتاح المختار: <b>{cc}</b>\nأرسل الآن رقمك بدون + وبدون الصفر الأول. مثال: <code>795378832</code>",
         "en": "📞 Selected code: <b>{cc}</b>\nSend your number now without + and without the leading zero. Example: <code>795378832</code>",
         "ku": "📞 کۆدی هەڵبژێردراو: <b>{cc}</b>\nئێستا ژمارەکەت بنێرە بەبێ + و بەبێ صفر لە دەستپێکدا. نمونە: <code>795378832</code>",
+        "ckb": "📞 کۆدی هەڵبژێردراو: <b>{cc}</b>\nئێستا ژمارە بنێرە بەبێ + و بەبێ صفر لە سەرەتا. نمونە: <code>795378832</code>",
     },
     "activation.error.retry": {
         "ar": "⚠️ حدث خطأ أثناء معالجة الطلب. حاول مرة أخرى باستخدام زر 🛂 طلب تفعيل.",
         "en": "⚠️ Something went wrong processing the request. Try again from the 🛂 Activation button.",
         "ku": "⚠️ هەڵەیەک ڕوویدا لە کاتی پڕۆسەکردن. دووبارە هەوڵبدە لە دوگمەی 🛂 چالاککردنەوە.",
+        "ckb": "⚠️ هەڵەیەک ڕوویدا لە کاتی پڕۆسەکردن. دوبارە هەوڵبدە لە دوگمەی 🛂 چالاککردنەوە.",
     },
     "common.cancelled": {
         "ar": "✅ تم إلغاء العملية.",
         "en": "✅ Operation cancelled.",
         "ku": "✅ کردار هەڵوەشێنرایەوە.",
+        "ckb": "✅ کردار هەڵوەشێنرایەوە.",
     },
     "common.unauthorized": {
         "ar": "⛔ غير مصرح.",
         "en": "⛔ Not authorized.",
         "ku": "⛔ ڕێگەپێدراو نییە.",
+        "ckb": "⛔ ڕێگەپێدراو نییە.",
     },
     "common.invalid_data": {
         "ar": "❌ بيانات غير صحيحة.",
         "en": "❌ Invalid data.",
         "ku": "❌ داتا هەڵەیە.",
+        "ckb": "❌ داتا هەڵەیە.",
+    },
+    "common.invalid_vin": {
+        "ar": "⚠️ الرجاء التأكد من رقم الشاصي الصحيح (VIN من 17 خانة) ثم أعد المحاولة.",
+        "en": "⚠️ Please provide a valid VIN (17 characters) and try again.",
+        "ku": "⚠️ تکایە VIN دروست (17 پیت) بنێرە و دووبارە هەوڵبدە.",
+        "ckb": "⚠️ تکایە VIN ـێکی دروست (١٧ پیت) بنێرە و جارێکی تر هەوڵبدە.",
+    },
+    "common.invalid_button": {
+        "ar": "⚠️ زر غير صالح.",
+        "en": "⚠️ Invalid button.",
+        "ku": "⚠️ دوگمە نادروستە.",
+        "ckb": "⚠️ دوگمە نادروستە.",
+    },
+    "common.unknown_option": {
+        "ar": "⚠️ خيار غير معروف.",
+        "en": "⚠️ Unknown option.",
+        "ku": "⚠️ هەڵبژاردەی نەناسراو.",
+        "ckb": "⚠️ هەڵبژاردەی نەناسراو.",
+    },
+    "admin.user.unknown": {
+        "ar": "⚠️ مستخدم غير معروف.",
+        "en": "⚠️ Unknown user.",
+        "ku": "⚠️ بەکارهێنەر نەناسراوە.",
+        "ckb": "⚠️ بەکارهێنەر نەناسراوە.",
+    },
+    "admin.user.already_stopped": {
+        "ar": "ℹ️ المستخدم متوقف بالفعل.",
+        "en": "ℹ️ User is already stopped.",
+        "ku": "ℹ️ بەکارهێنەر پێشتر وەستێنراوە.",
+        "ckb": "ℹ️ بەکارهێنەر پێشتر وەستێنراوە.",
+    },
+    "admin.user.suspend.notify": {
+        "ar": "⛔ تم إيقاف حسابك من قبل الإدارة.",
+        "en": "⛔ Your account has been suspended by admin.",
+        "ku": "⛔ هەژمارەکەت لەلایەن بەڕێوەبەرەوە وەستێنرا.",
+        "ckb": "⛔ هەژمارەکەت لەلایەن بەڕێوەبەرەوە وەستێنرا.",
+    },
+    "admin.user.suspend.toast": {
+        "ar": "✅ تم توقيف المستخدم.",
+        "en": "✅ User has been suspended.",
+        "ku": "✅ بەکارهێنەر وەستێنرا.",
+        "ckb": "✅ بەکارهێنەر وەستێنرا.",
+    },
+    "admin.user.suspend.log": {
+        "ar": "⛔ (Admin:{admin}) أوقف {user}.",
+        "en": "⛔ (Admin:{admin}) suspended {user}.",
+        "ku": "⛔ (ئادمین:{admin}) {user} وەستێناند.",
+        "ckb": "⛔ (ئادمین:{admin}) {user} وەستێناند.",
+    },
+    "admin.user.reactivate.prompt": {
+        "ar": "⛔ <b>{name}</b> متوقف.\n\nاختر طريقة لإعادة التفعيل:",
+        "en": "⛔ <b>{name}</b> is stopped.\n\nChoose how to reactivate:",
+        "ku": "⛔ <b>{name}</b> وەستێنراوە.\n\nڕێگای چالاککردن هەڵبژێرە:",
+        "ckb": "⛔ <b>{name}</b> وەستێنراوە.\n\nڕێگای چالاککردن هەڵبژێرە:",
+    },
+    "admin.user.reactivate.option.trial": {
+        "ar": "🧪 تجربة افتراضية",
+        "en": "🧪 Trial preset",
+        "ku": "🧪 تاقیکردنەوەی بنەڕەتی",
+        "ckb": "🧪 تاقیکردنەوەی بنەڕەتی",
+    },
+    "admin.user.reactivate.option.monthly": {
+        "ar": "🟢 اشتراك شهري",
+        "en": "🟢 Monthly plan",
+        "ku": "🟢 پلانی مانگانە",
+        "ckb": "🟢 پلانی مانگانە",
+    },
+    "admin.user.reactivate.option.custom": {
+        "ar": "🧾 تفعيل مخصّص",
+        "en": "🧾 Custom activation",
+        "ku": "🧾 چالاککردنی تایبەتی",
+        "ckb": "🧾 چالاککردنی تایبەتی",
+    },
+    "admin.user.reactivate.option.open_card": {
+        "ar": "🔎 فتح البطاقة",
+        "en": "🔎 Open user card",
+        "ku": "🔎 کارتی بەکارهێنەر بکەرەوە",
+        "ckb": "🔎 کارتی بەکارهێنەر بکەرەوە",
+    },
+    "admin.user.reactivate.sent": {
+        "ar": "📨 تم إرسال خيارات التفعيل.",
+        "en": "📨 Activation options sent.",
+        "ku": "📨 هەڵبژاردەکانی چالاککردن نێردران.",
+        "ckb": "📨 هەڵبژاردەکانی چالاککردن نێردران.",
+    },
+    "admin.limit.prompt": {
+        "ar": "📈 <b>{name}</b> وصل الحد المسموح.\n\nاختر الحد الذي تريد تعديله:",
+        "en": "📈 <b>{name}</b> reached the limit.\n\nChoose which limit to adjust:",
+        "ku": "📈 <b>{name}</b> گەیشتووە سنوورەکە.\n\nکام سنوور هەڵبژێریت بگۆڕیت؟",
+        "ckb": "📈 <b>{name}</b> گەیشتووە سنوورەکە.\n\nکام سنوور هەڵبژێریت بگۆڕیت؟",
+    },
+    "admin.limit.option.daily": {
+        "ar": "📅 رفع الحد اليومي",
+        "en": "📅 Increase daily limit",
+        "ku": "📅 بەرزکردنەوەی سنووری ڕۆژانە",
+        "ckb": "📅 بەرزکردنەوەی سنووری ڕۆژانە",
+    },
+    "admin.limit.option.monthly": {
+        "ar": "📆 رفع الحد الشهري",
+        "en": "📆 Increase monthly limit",
+        "ku": "📆 بەرزکردنەوەی سنووری مانگانە",
+        "ckb": "📆 بەرزکردنەوەی سنووری مانگانە",
+    },
+    "admin.limit.sent": {
+        "ar": "📨 تم إرسال خيارات الحد.",
+        "en": "📨 Limit options sent.",
+        "ku": "📨 هەڵبژاردەکانی سنوور نێردران.",
+        "ckb": "📨 هەڵبژاردەکانی سنوور نێردران.",
+    },
+    "admin.limit.prompt.daily": {
+        "ar": "📅 أرسل الحد اليومي الجديد (رقم):",
+        "en": "📅 Send the new daily limit (number):",
+        "ku": "📅 سنووری نوێی ڕۆژانە بنێرە (ژمارە):",
+        "ckb": "📅 سنووری نوێی ڕۆژانە بنێرە (ژمارە):",
+    },
+    "admin.limit.prompt.monthly": {
+        "ar": "📆 أرسل الحد الشهري الجديد (رقم):",
+        "en": "📆 Send the new monthly limit (number):",
+        "ku": "📆 سنووری نوێی مانگانە بنێرە (ژمارە):",
+        "ckb": "📆 سنووری نوێی مانگانە بنێرە (ژمارە):",
+    },
+    "admin.users.back": {
+        "ar": "↩️ رجوع",
+        "en": "↩️ Back",
+        "ku": "↩️ گەڕانەوە",
+        "ckb": "↩️ گەڕانەوە",
+    },
+    "admin.users.prev": {
+        "ar": "« السابق",
+        "en": "« Prev",
+        "ku": "« پێشوو",
+        "ckb": "« پێشوو",
+    },
+    "admin.users.next": {
+        "ar": "التالي »",
+        "en": "Next »",
+        "ku": "دواتر »",
+        "ckb": "دواتر »",
+    },
+    "admin.users.main": {
+        "ar": "🏠 القائمة الرئيسية",
+        "en": "🏠 Main menu",
+        "ku": "🏠 لیستەی سەرەکی",
+        "ckb": "🏠 لیستەی سەرەکی",
+    },
+    "admin.users.none": {
+        "ar": "لا يوجد مستخدمون حالياً",
+        "en": "No users right now.",
+        "ku": "هیچ بەکارهێنەرێک نییە لە ئێستادا.",
+        "ckb": "هیچ بەکارهێنەرێک نییە لە ئێستادا.",
+    },
+    "admin.users.page.empty": {
+        "ar": "لا يوجد مستخدمون في هذه الصفحة.",
+        "en": "No users on this page.",
+        "ku": "لەمانەوە بەکارهێنەر نییە لەم لاپەرەدا.",
+        "ckb": "لەمانەوە بەکارهێنەر نییە لەم پەڕەدا.",
+    },
+    "admin.users.phone.missing": {
+        "ar": "📞 لا يوجد",
+        "en": "📞 None",
+        "ku": "📞 نییە",
+        "ckb": "📞 نییە",
+    },
+    "admin.users.expiry.unset": {
+        "ar": "غير محدد",
+        "en": "Not set",
+        "ku": "دیار نەکراوە",
+        "ckb": "دیار نەکراوە",
+    },
+    "admin.users.delete": {
+        "ar": "🗑️ حذف",
+        "en": "🗑️ Delete",
+        "ku": "🗑️ سڕینەوە",
+        "ckb": "🗑️ سڕینەوە",
+    },
+    "admin.activation.hint": {
+        "ar": "أرسل طلب التفعيل من زر 🛂 طلب تفعيل في القائمة.",
+        "en": "Send the activation request from the 🛂 Activation Request button in the menu.",
+        "ku": "داوای چالاککردن لە دوگمەی 🛂 داوای چالاککردن لە لیستە بکە.",
+        "ckb": "داوای چالاککردن لە دوگمەی 🛂 داوای چالاککردن لە لیستە بکە.",
+    },
+    "admin.users.list.intro": {
+        "ar": "👥 <b>قائمة المستخدمين</b>\n\n━━━━━━━━━━━━━━━━━━━━\n<i>انقر على اسم المستخدم لفتح بطاقته</i>\n\n<b>💡 في البطاقة ستجد:</b>\n• ✉️ إشعار سريع\n• 💳 ضبط الرصيد\n• 📝 ملاحظة\n• وغيرها من الخيارات",
+        "en": "👥 <b>Users list</b>\n\n━━━━━━━━━━━━━━━━━━━━\n<i>Tap the username to open the card</i>\n\n<b>💡 In the card you will find:</b>\n• ✉️ Quick notify\n• 💳 Balance adjust\n• 📝 Note\n• Other actions",
+        "ku": "👥 <b>لیستی بەکارهێنەرەکان</b>\n\n━━━━━━━━━━━━━━━━━━━━\n<i>ناوی بەکارهێنەر بکەرەوە بۆ کردنی کارد</i>\n\n<b>💡 لە کاردەدا دەتوانیت:</b>\n• ✉️ ئاگادارکردنەوەی خێرا\n• 💳 ڕێکخستنی باڵانس\n• 📝 تێبینی\n• هەڵبژاردەی تر",
+        "ckb": "👥 <b>لیستی بەکارهێنەران</b>\n\n━━━━━━━━━━━━━━━━━━━━\n<i>ناوی بەکارهێنەر دابگرە بۆ کردنی کارد</i>\n\n<b>💡 لە کاردەدا دەتوانیت:</b>\n• ✉️ ئاگادارکردنی خێرا\n• 💳 ڕێکخستنی باڵانس\n• 📝 تێبینی\n• هەڵبژاردەی دیکە",
+    },
+    "admin.users.load_error": {
+        "ar": "❌ حدث خطأ في تحميل قائمة المستخدمين.",
+        "en": "❌ Failed to load user list.",
+        "ku": "❌ هەڵە ڕووی دا لە بارکردنی لیستی بەکارهێنەران.",
+        "ckb": "❌ هەڵە ڕووی دا لە بارکردنی لیستی بەکارهێنەران.",
+    },
+    "admin.stats.open_error": {
+        "ar": "❌ تعذر فتح الإحصائيات.",
+        "en": "❌ Could not open stats.",
+        "ku": "❌ ناتوانرێت ئامار بکەرەوە.",
+        "ckb": "❌ ناتوانرێت ئامار بکەرەوە.",
+    },
+    "admin.settings.super_only": {
+        "ar": "❌ هذه الإعدادات متاحة فقط للسوبر أدمن.",
+        "en": "❌ Settings are restricted to super admins only.",
+        "ku": "❌ ئەم ڕێکخستنە تایبەتە بە سووپەر ئەدمینەکانە.",
+        "ckb": "❌ ئەم ڕێکخستنە تەنها بۆ سووپەر ئەدمینەکانە.",
+    },
+    "admin.settings.error": {
+        "ar": "❌ حدث خطأ: {error}\n\nاستخدم /debug للتحقق من صلاحياتك.",
+        "en": "❌ Error: {error}\n\nUse /debug to check your permissions.",
+        "ku": "❌ هەڵە: {error}\n\n/\u2026 بەکاربهێنە بۆ دڵنیابوون لە دەسەڵاتەکانت.",
+        "ckb": "❌ هەڵە: {error}\n\n/\u2026 بەکاربهێنە بۆ دڵنیابوون لە دەسەڵاتەکانت.",
+    },
+    "photos.heading.hidden": {
+        "ar": "📷 صور السيارة المخفية",
+        "en": "📷 Hidden car photos",
+        "ku": "📷 وێنەکانی شاراوەی ئۆتۆمبێل",
+        "ckb": "📷 وێنەکانی شاراوەی ئۆتۆمبێل",
+    },
+    "photos.heading.auction": {
+        "ar": "🚗 صور المزاد الحالي",
+        "en": "🚗 Current auction photos",
+        "ku": "🚗 وێنەکانی مزاودەی ئێستا",
+        "ckb": "🚗 وێنەکانی مزاودەی ئێستا",
+    },
+    "photos.heading.accident": {
+        "ar": "💥 صور حادث سابق",
+        "en": "💥 Previous accident photos",
+        "ku": "💥 وێنەکانی پەڕینی پێشوو",
+        "ckb": "💥 وێنەکانی پەڕینی پێشوو",
+    },
+    "photos.not_enabled": {
+        "ar": "⛔ {label} غير مفعلة لحسابك.",
+        "en": "⛔ {label} is not enabled for your account.",
+        "ku": "⛔ {label} بۆ هەژمارەکەت چالاک نییە.",
+        "ckb": "⛔ {label} بۆ هەژمارەکەت چالاک نییە.",
+    },
+    "common.status.yes": {
+        "ar": "✅ نعم",
+        "en": "✅ Yes",
+        "ku": "✅ بەڵێ",
+        "ckb": "✅ بەڵێ",
+    },
+    "common.status.no": {
+        "ar": "❌ لا",
+        "en": "❌ No",
+        "ku": "❌ نەخێر",
+        "ckb": "❌ نەخێر",
+    },
+    "common.set": {
+        "ar": "محدد",
+        "en": "set",
+        "ku": "دیاریکراو",
+        "ckb": "دیاریکراو",
+    },
+    "common.unset": {
+        "ar": "غير محدد",
+        "en": "not set",
+        "ku": "دیار نەکراوە",
+        "ckb": "دیار نەکراوە",
+    },
+    "common.unavailable": {
+        "ar": "غير متوفر",
+        "en": "Unavailable",
+        "ku": "بەردەست نییە",
+        "ckb": "بەردەست نییە",
+    },
+    "admin.debug.title": {
+        "ar": "🔍 <b>معلومات الصلاحيات والبيئة</b>",
+        "en": "🔍 <b>Permissions and environment</b>",
+        "ku": "🔍 <b>زانیاری دەسەڵات و ژینگە</b>",
+        "ckb": "🔍 <b>زانیاری دەسەڵات و ژینگە</b>",
+    },
+    "admin.debug.user_id": {
+        "ar": "معرفك: <code>{tg_id}</code>",
+        "en": "Your ID: <code>{tg_id}</code>",
+        "ku": "ناسنامە: <code>{tg_id}</code>",
+        "ckb": "ناسنامەت: <code>{tg_id}</code>",
+    },
+    "admin.debug.username": {
+        "ar": "اسم المستخدم: {username}",
+        "en": "Username: {username}",
+        "ku": "ناوی بەکارهێنەر: {username}",
+        "ckb": "ناوی بەکارهێنەر: {username}",
+    },
+    "admin.debug.roles.header": {
+        "ar": "<b>الصلاحيات:</b>",
+        "en": "<b>Roles:</b>",
+        "ku": "<b>دەسەڵاتەکان:</b>",
+        "ckb": "<b>دەسەڵاتەکان:</b>",
+    },
+    "admin.debug.roles.super": {
+        "ar": "• سوبر أدمن: {value}",
+        "en": "• Super admin: {value}",
+        "ku": "• سووپەر ئەدمین: {value}",
+        "ckb": "• سووپەر ئەدمین: {value}",
+    },
+    "admin.debug.roles.admin": {
+        "ar": "• أدمن: {value}",
+        "en": "• Admin: {value}",
+        "ku": "• ئەدمین: {value}",
+        "ckb": "• ئەدمین: {value}",
+    },
+    "admin.debug.roles.ultimate": {
+        "ar": "• سوبر أدمن مطلق (.env): {value}",
+        "en": "• Ultimate super (.env): {value}",
+        "ku": "• سووپەر ئەدمینی سەرەکی (.env): {value}",
+        "ckb": "• سووپەر ئەدمینی سەرەکی (.env): {value}",
+    },
+    "admin.debug.env.header": {
+        "ar": "📋 <b>معلومات متغيرات البيئة:</b>",
+        "en": "📋 <b>Environment variables:</b>",
+        "ku": "📋 <b>گۆڕاوەکانی ژینگە:</b>",
+        "ckb": "📋 <b>گۆڕاوەکانی ژینگە:</b>",
+    },
+    "admin.debug.env.telegram_supers": {
+        "ar": "• TELEGRAM_SUPER_ADMINS: <code>{env_supers}</code>",
+        "en": "• TELEGRAM_SUPER_ADMINS: <code>{env_supers}</code>",
+        "ku": "• TELEGRAM_SUPER_ADMINS: <code>{env_supers}</code>",
+        "ckb": "• TELEGRAM_SUPER_ADMINS: <code>{env_supers}</code>",
+    },
+    "admin.debug.env.dotenv_loaded": {
+        "ar": "• تم تحميل dotenv: {value}",
+        "en": "• Dotenv loaded: {value}",
+        "ku": "• dotenv بارکرا: {value}",
+        "ckb": "• dotenv بارکرا: {value}",
+    },
+    "admin.debug.env.bot_token": {
+        "ar": "• BOT_TOKEN: <code>{value}</code>",
+        "en": "• BOT_TOKEN: <code>{value}</code>",
+        "ku": "• BOT_TOKEN: <code>{value}</code>",
+        "ckb": "• BOT_TOKEN: <code>{value}</code>",
+    },
+    "admin.debug.env.db_path": {
+        "ar": "• DB_PATH: <code>{value}</code>",
+        "en": "• DB_PATH: <code>{value}</code>",
+        "ku": "• DB_PATH: <code>{value}</code>",
+        "ckb": "• DB_PATH: <code>{value}</code>",
+    },
+    "admin.debug.env.supers_env": {
+        "ar": "<b>السوبر أدمن من .env:</b> {env_admins}",
+        "en": "<b>Super admins from .env:</b> {env_admins}",
+        "ku": "<b>سووپەر ئەدمینەکانی .env:</b> {env_admins}",
+        "ckb": "<b>سووپەر ئەدمینەکانی .env:</b> {env_admins}",
+    },
+    "admin.debug.env.supers_db": {
+        "ar": "<b>السوبر أدمن من db.json:</b> {db_admins}",
+        "en": "<b>Super admins from db.json:</b> {db_admins}",
+        "ku": "<b>سووپەر ئەدمینەکانی db.json:</b> {db_admins}",
+        "ckb": "<b>سووپەر ئەدمینەکانی db.json:</b> {db_admins}",
+    },
+    "admin.debug.tip": {
+        "ar": "<i>💡 نصيحة: إذا قمت بتعديل ملف .env، استخدم /debug لإعادة تحميل المتغيرات</i>",
+        "en": "<i>💡 Tip: after editing .env, run /debug to reload variables.</i>",
+        "ku": "<i>💡 پێشنیار: دوای دەستکاری .env، /debug بەکاربهێنە بۆ دووبارە بارکردن.</i>",
+        "ckb": "<i>💡 پێشنیار: دوای دەستکاری .env، /debug بەکاربهێنە بۆ دووبارە بارکردن.</i>",
+    },
+    "profile.add_phone": {
+        "ar": "📞 إضافة هاتف",
+        "en": "📞 Add phone",
+        "ku": "📞 زۆرکردنی ژمارە",
+        "ckb": "📞 زیادکردنی ژمارە",
+    },
+    "common.main_menu": {
+        "ar": "🏠 القائمة الرئيسية",
+        "en": "🏠 Main Menu",
+        "ku": "🏠 لیستی سەرەکی",
+        "ckb": "🏠 لیستی سەرەکی",
+    },
+    "limits.updated.daily.user": {
+        "ar": "📈 <b>تم تحديث حدك اليومي</b>\n\nالحد الجديد: <b>{value}</b> تقرير كل يوم.\n👤 بواسطة الإدارة: <code>{admin}</code>",
+        "en": "📈 <b>Your daily limit was updated</b>\n\nNew limit: <b>{value}</b> reports per day.\n👤 By admin: <code>{admin}</code>",
+        "ku": "📈 <b>سنووری ڕۆژانت نوێ کرایەوە</b>\n\nسنووری نوێ: <b>{value}</b> ڕاپۆرت لە ڕۆژێکدا.\n👤 لەلایەن بەڕێوەبەرەوە: <code>{admin}</code>",
+        "ckb": "📈 <b>سنووری ڕۆژانت نوێ کرایەوە</b>\n\nسنووری نوێ: <b>{value}</b> ڕاپۆرت لە ڕۆژێکدا.\n👤 لەلایەن بەڕێوەبەرەوە: <code>{admin}</code>",
+    },
+    "limits.updated.monthly.user": {
+        "ar": "📊 <b>تم تحديث حدك الشهري</b>\n\nالحد الجديد: <b>{value}</b> تقرير في الشهر.\n👤 بواسطة الإدارة: <code>{admin}</code>",
+        "en": "📊 <b>Your monthly limit was updated</b>\n\nNew limit: <b>{value}</b> reports per month.\n👤 By admin: <code>{admin}</code>",
+        "ku": "📊 <b>سنووری مانگانەت نوێ کرایەوە</b>\n\nسنووری نوێ: <b>{value}</b> ڕاپۆرت لە مانگێکدا.\n👤 لەلایەن بەڕێوەبەرەوە: <code>{admin}</code>",
+        "ckb": "📊 <b>سنووری مانگانەت نوێ کرایەوە</b>\n\nسنووری نوێ: <b>{value}</b> ڕاپۆرت لە مانگێکدا.\n👤 لەلایەن بەڕێوەبەرەوە: <code>{admin}</code>",
     },
     "pending.denied.user": {
         "ar": "⛔ تم رفض طلب التفعيل الخاص بك.",
@@ -920,11 +1308,55 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ar": "⚠️ تعذّر تحميل الصور حالياً.",
         "en": "⚠️ Unable to load photos right now.",
         "ku": "⚠️ نەتوانرا ئێستا وێنەکان داونلۆد بکرێن.",
+        "ckb": "⚠️ نەتوانرا ئێستا وێنەکان داگرتە بکرێن.",
     },
     "report.photos.collecting": {
         "ar": "⏳ <b>{label}</b>\nيتم الآن جمع الصور لـ VIN <code>{vin}</code>...",
         "en": "⏳ <b>{label}</b>\nCollecting photos for VIN <code>{vin}</code>...",
         "ku": "⏳ <b>{label}</b>\nخەزنکردنی وێنەکان بۆ VIN <code>{vin}</code>...",
+        "ckb": "⏳ <b>{label}</b>\nکۆکردنەوەی وێنەکان بۆ VIN <code>{vin}</code>...",
+    },
+    "photos.label.hidden": {
+        "ar": "صور السيارة المخفية",
+        "en": "Hidden car photos",
+        "ku": "وێنەکانی نەهێنراوی ئۆتۆمبێل",
+        "ckb": "وێنەکانی نەهێنراوی ئۆتۆمبێل",
+    },
+    "photos.label.auction": {
+        "ar": "صور المزاد الحالي",
+        "en": "Current auction photos",
+        "ku": "وێنەکانی مزاودەی ئێستا",
+        "ckb": "وێنەکانی مزایدەی ئێستا",
+    },
+    "photos.label.accident": {
+        "ar": "صور حادث سابق",
+        "en": "Accident photos",
+        "ku": "وێنەکانی ڕووداو",
+        "ckb": "وێنەکانی ڕووداو",
+    },
+    "report.photos.empty.hidden": {
+        "ar": "⚠️ لا توجد صور السيارة المخفية متاحة حالياً.",
+        "en": "⚠️ No hidden car photos are available right now.",
+        "ku": "⚠️ هیچ وێنەی نەشاردراوی ئۆتۆمبێل نییە لە ئێستا.",
+        "ckb": "⚠️ هیچ وێنەی نەهێنراوی ئۆتۆمبێل نییە لە ئێستا.",
+    },
+    "report.photos.empty.auction": {
+        "ar": "⚠️ لا توجد صور مزاد حالياً.",
+        "en": "⚠️ No auction photos are available right now.",
+        "ku": "⚠️ هیچ وێنەی مزاودە نییە لە ئێستا.",
+        "ckb": "⚠️ هیچ وێنەی مزایدە نییە لە ئێستا.",
+    },
+    "report.photos.empty.accident": {
+        "ar": "⚠️ لا توجد صور حادث متاحة لهذا رقم الشاصي.",
+        "en": "⚠️ No accident photos are available for this VIN.",
+        "ku": "⚠️ هیچ وێنەی ڕووداو بۆ ئەم VIN ـە نییە.",
+        "ckb": "⚠️ هیچ وێنەی ڕووداو بۆ ئەم VIN ـە نییە.",
+    },
+    "report.photos.accident.error": {
+        "ar": "⚠️ حدث خطأ أثناء جلب صور الحادث.",
+        "en": "⚠️ Error while fetching accident photos.",
+        "ku": "⚠️ هەڵە ڕوویدا لە هێنانى وێنەکانى ڕووداو.",
+        "ckb": "⚠️ هەڵە ڕوویدا لە هێنانی وێنەکانی ڕووداو.",
     },
     "language.change.prompt": {
         "ar": "🌐 <b>تغيير لغة التقرير</b>\n\n━━━━━━━━━━━━━━━━━━━━\n<b>اللغة الحالية:</b> {current}\n\nاختر اللغة الجديدة:",
@@ -1732,202 +2164,241 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ar": "🧾 طلب تفعيل\n\nأرسل رقم هاتفك بصيغة +رمز_الدولة ثم الرقم (مثال: +962795378832).\nسنقوم بمراجعة الطلب وإعلامك في أقرب وقت.",
         "en": "🧾 Activation request\n\nSend your phone number as +country_code followed by the number (example: +962795378832).\nWe will review and get back to you soon.",
         "ku": "🧾 داوای چالاککردن\n\nژمارەی مۆبایل بنێرە بە شێوەی +کۆدی وڵات و ژمارەکە (نمونە: +962795378832).\nداواکاریەکە پشکنراوە و زوو وەڵام دەدرێت.",
+        "ckb": "🧾 داوای چالاککردن\n\nژمارەی مۆبایل بنێرە بە شێوەی +کۆدی وڵات و ژمارەکە (نمونە: +962795378832).\nداواکاریەکە دەبینرێت و بە نزیکترین کات وەڵام دەدرێت.",
     },
     "activation.preset.label": {
         "ar": "{title} | {days}يوم • {daily}/{monthly}",
         "en": "{title} | {days}d • {daily}/{monthly}",
         "ku": "{title} | {days} ڕۆژ • {daily}/{monthly}",
+        "ckb": "{title} | {days} ڕۆژ • {daily}/{monthly}",
     },
     "menu.header": {
         "ar": "🏠 القائمة الرئيسية",
         "en": "🏠 Main Menu",
         "ku": "🏠 لیستی سەرەکی",
+        "ckb": "🏠 لیستی سەرەکی",
     },
     "menu.telegram.prompt": {
         "ar": "اختر أحد الأزرار أدناه للمتابعة.",
         "en": "Pick one of the buttons below to continue.",
         "ku": "یەکێک لە دوگمەکان خوارەوە هەڵبژێرە بۆ بەردەوامبوون.",
+        "ckb": "یەکێک لە دوگمەکان خوارەوە هەڵبژێرە بۆ بەردەوامبوون.",
     },
     "menu.instructions": {
         "ar": "أرسل رقم الخيار للمتابعة:",
         "en": "Send the option number to continue:",
         "ku": "ژمارەی هەڵبژاردەکە بنێرە بۆ بەردەوامبوون:",
+        "ckb": "ژمارەی هەڵبژاردەکە بنێرە بۆ بەردەوامبوون:",
     },
     "menu.empty": {
         "ar": "🏠 القائمة الرئيسية\n\nلا تتوفر خيارات في الوقت الحالي.",
         "en": "🏠 Main menu\n\nNo options are available at the moment.",
         "ku": "🏠 لیستی سەرەکی\n\nلە ئێستادا هیچ هەڵبژاردەیەک نییە.",
+        "ckb": "🏠 لیستی سەرەکی\n\nلە ئێستادا هیچ هەڵبژاردەیەک نییە.",
     },
     "menu.selection_required": {
         "ar": "⚠️ يرجى اختيار خيار من القائمة بإرسال رقمه أو اسمه.",
         "en": "⚠️ Please pick an option by sending its number or name.",
         "ku": "⚠️ تکایە هەڵبژاردەیەک هەڵبژێرە بە ناردنی ژمارە یان ناوی.",
+        "ckb": "⚠️ تکایە هەڵبژاردەیەک هەڵبژێرە بە ناردنی ژمارە یان ناوی.",
     },
     "menu.selection_unknown": {
         "ar": "⚠️ لم يتم التعرف على الاختيار، أعد المحاولة.",
         "en": "⚠️ We couldn't understand that choice; please try again.",
         "ku": "⚠️ ئەو هەڵبژاردەیە نەزانیرا؛ تکایە دووبارە هەوڵبدە.",
+        "ckb": "⚠️ ئەو هەڵبژاردەیە نەزانیرا؛ تکایە جارێکی تر هەوڵبدە.",
     },
     "menu.unavailable": {
         "ar": "⚠️ هذا الخيار قيد التطوير حاليًا.",
         "en": "⚠️ This option is under development.",
         "ku": "⚠️ ئەم هەڵبژاردەیە لە ژێر گەشەپێداندایە.",
+        "ckb": "⚠️ ئەم هەڵبژاردەیە لە ژێر گەشەپێداندایە.",
     },
     "menu.admin_redirect": {
         "ar": "🔒 خيار {label} متاح من خلال لوحة Telegram الإدارية فقط.",
         "en": "🔒 The {label} option is available from the Telegram admin panel only.",
         "ku": "🔒 هەڵبژاردەی {label} تەنها لە پانێڵی بەڕێوەبەریی Telegram دەردەکەوێت.",
+        "ckb": "🔒 هەڵبژاردەی {label} تەنها لە پانێڵی بەڕێوەبەرایەتیی Telegram بەردەستە.",
     },
     "media.not_found": {
         "ar": "⚠️ لم يتم العثور على المرفق الذي أرسلته.",
         "en": "⚠️ We couldn't find the attachment you sent.",
         "ku": "⚠️ پاشکەوتەکەی ناردووت نەدۆزرایەوە.",
+        "ckb": "⚠️ پاشکەوتەکەی ناردووت نەدۆزرایەوە.",
     },
     "media.ack.default": {
         "ar": "📸 تم استلام المرفق بنجاح. سنخبرك في حال احتجنا إلى تفاصيل إضافية.",
         "en": "📸 Attachment received successfully. We'll let you know if more details are needed.",
         "ku": "📸 پاشکەوتەکە بەسەرکەوتووی گەیەندرا. ئەگەر وردەکاریی زیاتر پێویست بوو ئاگادارت دەکەین.",
+        "ckb": "📸 پاشکەوتەکە بەسەرکەوتووی گەیەندرا. ئەگەر وردەکاری زیاتر پێویست بوو ئاگادارت دەکەین.",
     },
     "media.ack.vin": {
         "ar": "📸 تم استلام المرفق بنجاح. سنقوم بربط الصورة بطلب تقريرك الحالي وإعلامك عند الانتهاء.",
         "en": "📸 Attachment received. We'll link it to your current VIN request and update you once it's complete.",
         "ku": "📸 پاشکەوتەکە گەیەندرا. پەیوەندیی دەدەین بە داوای VIN ـی ئێستا و ئاگادارت دەکەین کاتێک تەواوبێت.",
+        "ckb": "📸 پاشکەوتەکە گەیەندرا. دەیبەستین بە داوای VIN ـی ئێستا و ئاگادارت دەکەین کاتێک تەواوبێت.",
     },
     "keyboard.enabled": {
         "ar": "✅ تم تفعيل الزر بجانب المرفقات.",
         "en": "✅ The keyboard button next to attachments is now active.",
         "ku": "✅ دوگمەی تەختەکلیل لە نزیک هەڵگرتنەکان چالاک کرا.",
+        "ckb": "✅ دوگمەی تەختەکلیل لە لاگەڵ پاشکەوتەکان چالاک کرا.",
     },
     "photos.options.accident": {
         "ar": "💥 صور حادث سابق",
         "en": "💥 Previous accident photos",
         "ku": "💥 وێنەکانی ڕووداوی پێشوو",
+        "ckb": "💥 وێنەکانی ڕووداوی پێشووتر",
     },
     "photos.options.hidden": {
         "ar": "📷 صور السيارة المخفية",
         "en": "📷 Hidden vehicle photos",
         "ku": "📷 وێنەکانی ئۆتۆمبێلی شاردراو",
+        "ckb": "📷 وێنەکانی ئۆتۆمبێلی شاردراو",
     },
     "media.ack.support": {
         "ar": "📸 تم استلام المرفق بنجاح. فريق الدعم سيراجعها ويتواصل معك قريبًا.",
         "en": "📸 Attachment received. Our support team will review it and get back to you soon.",
         "ku": "📸 پاشکەوتەکە گەیەندرا. تیمی پشتگیری پشکنین دەکات و زوو پەیوەندیت پێوە دەکات.",
+        "ckb": "📸 پاشکەوتەکە گەیەندرا. تیمی پاڵپشت دەبینێتەوە و زوو پەیوەندیت دەکات.",
     },
     "limit.block.daily": {
         "ar": "📈 وصلت إلى الحد اليومي المسموح به.\nالاستخدام الحالي: {today_used}/{daily_limit}.",
         "en": "📈 You've reached the daily usage limit.\nCurrent usage: {today_used}/{daily_limit}.",
         "ku": "📈 گەیشتیتە سنووری ڕۆژانەی ڕێگەپێدراو.\nبەکارهێنان: {today_used}/{daily_limit}.",
+        "ckb": "📈 گەیشتیت بە سنووری ڕۆژانەی ڕێگەپێدراو.\nبەکارهێنانی ئێستا: {today_used}/{daily_limit}.",
     },
     "limit.block.monthly": {
         "ar": "📊 وصلت إلى الحد الشهري المسموح به.\nالاستخدام الحالي: {month_used}/{monthly_limit}.",
         "en": "📊 You've reached the monthly usage limit.\nCurrent usage: {month_used}/{monthly_limit}.",
         "ku": "📊 گەیشتیتە سنووری مانگانەی ڕێگەپێدراو.\nبەکارهێنان: {month_used}/{monthly_limit}.",
+        "ckb": "📊 گەیشتیت بە سنووری مانگانەی ڕێگەپێدراو.\nبەکارهێنانی ئێستا: {month_used}/{monthly_limit}.",
     },
     "limit.block.both": {
         "ar": "📈 وصلت إلى الحد اليومي و الشهري معًا.\nاليومي: {today_used}/{daily_limit}\nالشهري: {month_used}/{monthly_limit}.",
         "en": "📈 You've exhausted both your daily and monthly limits.\nDaily: {today_used}/{daily_limit}\nMonthly: {month_used}/{monthly_limit}.",
         "ku": "📈 هەردوو سنووری ڕۆژانە و مانگانەت تەواو کرد.\nڕۆژانە: {today_used}/{daily_limit}\nمانگانە: {month_used}/{monthly_limit}.",
+        "ckb": "📈 هەردوو سنووری ڕۆژانە و مانگانەت تەواو کرد.\nڕۆژانە: {today_used}/{daily_limit}\nمانگانە: {month_used}/{monthly_limit}.",
     },
     "limit.block.notice": {
         "ar": "تم إرسال طلب رفع الحد للإدارة وسيتم التواصل معك فور المراجعة.",
         "en": "We've notified the admins about raising your limit and will update you after they review it.",
         "ku": "داوای بەرزکردنەوە نێردرا بۆ بەڕێوبەران و دوای پشکنین ئاگادارت دەکەین.",
+        "ckb": "داوای بەرزکردنەوە نێردرا بۆ بەڕێوبەران و دوای پشکنین ئاگادارت دەکەین.",
     },
     "limit.reason.daily": {
         "ar": "اليومي",
         "en": "daily",
         "ku": "ڕۆژانە",
+        "ckb": "ڕۆژانە",
     },
     "limit.reason.monthly": {
         "ar": "الشهري",
         "en": "monthly",
         "ku": "مانگانە",
+        "ckb": "مانگانە",
     },
     "limit.reason.both": {
         "ar": "اليومي والشهري",
         "en": "daily and monthly",
         "ku": "ڕۆژانە و مانگانە",
+        "ckb": "ڕۆژانە و مانگانە",
     },
     "limit.request.user": {
         "ar": "✅ تم إرسال طلب رفع الحد للإدارة.\nالنوع: الحد {label}.\nسنقوم بمراجعة الطلب وإبلاغك فور حدوث أي تحديث.",
         "en": "✅ Your limit increase request was sent to the admins.\nType: {label} limit.\nWe'll review it and let you know once it changes.",
         "ku": "✅ داوای بەرزکردنەوەی سنوورەکەت نێردرا بۆ بەڕێوبەران.\nجۆر: سنووری {label}.\nپاش پشکنین ئاگاداریت دەکەینەوە کاتێک نوێکاری هەبێت.",
+        "ckb": "✅ داواکاری بەرزکردنەوەی سنوور نێردرا بۆ بەڕێوبەران.\nجۆر: سنووری {label}.\nپاش پشکنین ئاگادارت دەکەین ئەگەر گۆڕانکاری هەبوو.",
     },
     "limit.request.admin": {
         "ar": "📈 <b>طلب رفع حد</b>\n• المستخدم: <b>{user_name}</b> ({contact})\n• اليومي: {today_used}/{daily_limit}\n• الشهري: {month_used}/{monthly_limit}\n• النوع: <b>{reason}</b>",
         "en": "📈 <b>Limit increase request</b>\n• User: <b>{user_name}</b> ({contact})\n• Daily: {today_used}/{daily_limit}\n• Monthly: {month_used}/{monthly_limit}\n• Type: <b>{reason}</b>",
         "ku": "📈 <b>داوای بەرزکردنەوەی سنوور</b>\n• بەکارهێنەر: <b>{user_name}</b> ({contact})\n• ڕۆژانە: {today_used}/{daily_limit}\n• مانگانە: {month_used}/{monthly_limit}\n• جۆر: <b>{reason}</b>",
+        "ckb": "📈 <b>داوای بەرزکردنەوەی سنوور</b>\n• بەکارهێنەر: <b>{user_name}</b> ({contact})\n• ڕۆژانە: {today_used}/{daily_limit}\n• مانگانە: {month_used}/{monthly_limit}\n• جۆر: <b>{reason}</b>",
     },
     "vin.error": {
         "ar": "⚠️ حدث خطأ أثناء معالجة تقرير VIN. حاول لاحقاً.",
         "en": "⚠️ Something went wrong while processing the VIN report. Please try again later.",
         "ku": "⚠️ هەڵەیەک ڕوویدا لە کاتی چاککردنی ڕاپۆرتی VIN. تکایە دواتر هەوڵبدە.",
+        "ckb": "⚠️ هەڵەیەک ڕوویدا لە کاتی پڕۆسەی ڕاپۆرتی VIN. تکایە دواتر هەوڵبدە.",
     },
-    "menu.profile.label": {"ar": "👤 بياناتي", "en": "👤 My Info", "ku": "👤 زانیاریی من"},
+    "menu.profile.label": {"ar": "👤 بياناتي", "en": "👤 My Info", "ku": "👤 زانیاریی من", "ckb": "👤 زانیاریی من"},
     "menu.profile.description": {
         "ar": "عرض بيانات حسابك ورسائلك السابقة.",
         "en": "View your account details and recent history.",
         "ku": "وردەکاری هەژمارەکەت و مێژووە دواهەمەکانی ببینە.",
+        "ckb": "وردەکاری هەژمارەکەت و مێژووە دواهەمەکانی ببینە.",
     },
-    "menu.activation.label": {"ar": "🛂 طلب تفعيل", "en": "🛂 Activation Request", "ku": "🛂 داوای چالاککردن"},
+    "menu.activation.label": {"ar": "🛂 طلب تفعيل", "en": "🛂 Activation Request", "ku": "🛂 داوای چالاککردن", "ckb": "🛂 داوای چالاککردن"},
     "menu.activation.description": {
         "ar": "أرسل رقم هاتفك لوضعك في قائمة التفعيل.",
         "en": "Send your phone number to join the activation queue.",
         "ku": "ژمارەی مۆبایل بنێرە بۆ خستنە لیستی چالاککردن.",
+        "ckb": "ژمارەی مۆبایل بنێرە بۆ خستنە لیستی چالاککردن.",
     },
-    "menu.balance.label": {"ar": "💳 رصيدي", "en": "💳 My Balance", "ku": "💳 باڵانسم"},
+    "menu.balance.label": {"ar": "💳 رصيدي", "en": "💳 My Balance", "ku": "💳 باڵانسم", "ckb": "💳 باڵانسم"},
     "menu.balance.description": {
         "ar": "اِطلع على الرصيد وحدود التقارير.",
         "en": "Check your remaining credits and limits.",
         "ku": "باڵانس و سنوورەکانت بپشکنە.",
+        "ckb": "باڵانس و سنوورەکانت بپشکنە.",
     },
-    "menu.report.label": {"ar": "📄 تقرير جديد", "en": "📄 New Report", "ku": "📄 ڕاپۆرتی نوێ"},
+    "menu.report.label": {"ar": "📄 تقرير جديد", "en": "📄 New Report", "ku": "📄 ڕاپۆرتی نوێ", "ckb": "📄 ڕاپۆرتی نوێ"},
     "menu.report.description": {
         "ar": "إرشادات إرسال VIN للحصول على تقرير جديد.",
         "en": "Get instructions for submitting a VIN report.",
         "ku": "ڕێنمایی ناردنی VIN بۆ وەرگرتنی ڕاپۆرتی نوێ.",
+        "ckb": "ڕێنمایی ناردنی VIN بۆ بەدەستهێنانی ڕاپۆرتی نوێ.",
     },
-    "menu.help.label": {"ar": "🆘 المساعدة والتواصل", "en": "🆘 Help & Contact", "ku": "🆘 یارمەتیدان و پەیوەندی"},
+    "menu.help.label": {"ar": "🆘 المساعدة والتواصل", "en": "🆘 Help & Contact", "ku": "🆘 یارمەتیدان و پەیوەندی", "ckb": "🆘 یارمەتی و پەیوەندی"},
     "menu.help.description": {
         "ar": "طرق التواصل مع الدعم.",
         "en": "How to reach support.",
         "ku": "ڕێگەی پەیوەندی بە پشتگیری.",
+        "ckb": "چۆن پەیوەندیمان پێوە بکەیت.",
     },
-    "menu.language.label": {"ar": "🌐 لغة التقرير", "en": "🌐 Report Language", "ku": "🌐 زمانێکی ڕاپۆرت"},
+    "menu.language.label": {"ar": "🌐 لغة التقرير", "en": "🌐 Report Language", "ku": "🌐 زمانێکی ڕاپۆرت", "ckb": "🌐 زمانی ڕاپۆرت"},
     "menu.language.description": {
         "ar": "اختر لغة التقرير الافتراضية.",
         "en": "Pick your default report language.",
         "ku": "زمانی دەستنیشانکردنی ڕاپۆرت دیاری بکە.",
+        "ckb": "زمانی ڕاپۆرتی بنەڕەتی دیاری بکە.",
     },
     "main_menu.hint": {
         "ar": "أرسل أي رسالة للعودة إلى القائمة الرئيسية.",
         "en": "Send any message to return to the main menu.",
         "ku": "هەر پەیامێک بنێرە بۆ گەڕانەوە بۆ لیستی سەرەکی.",
+        "ckb": "هەر پەیامێک بنێرە بۆ گەڕانەوە بۆ لیستی سەرەکی.",
     },
-    "menu.users.label": {"ar": "👥 المستخدمون", "en": "👥 Users"},
+    "menu.users.label": {"ar": "👥 المستخدمون", "en": "👥 Users", "ckb": "👥 بەکارهێنەران"},
     "menu.users.description": {
         "ar": "لوحة إدارة المستخدمين (Telegram).",
         "en": "Telegram-only user management panel.",
+        "ckb": "پانێڵی بەڕێوەبردنی بەکارهێنەرانی Telegram.",
     },
-    "menu.stats.label": {"ar": "📊 إحصائيات", "en": "📊 Stats"},
+    "menu.stats.label": {"ar": "📊 إحصائيات", "en": "📊 Stats", "ckb": "📊 ئامار"},
     "menu.stats.description": {
         "ar": "عرض الإحصائيات الحية (Telegram).",
         "en": "Live stats (Telegram only).",
+        "ckb": "ئاماری ڕاستەوخۆ (تەنها Telegram).",
     },
-    "menu.pending.label": {"ar": "📝 قائمة المنتظرين", "en": "📝 Waiting List"},
+    "menu.pending.label": {"ar": "📝 قائمة المنتظرين", "en": "📝 Waiting List", "ckb": "📝 لیستی چاوەڕوان"},
     "menu.pending.description": {
         "ar": "طلبات التفعيل المعلقة (Telegram).",
         "en": "Pending activation requests (Telegram).",
+        "ckb": "داواکاریی چالاککردنی چاوەڕوان (Telegram).",
     },
-    "menu.settings.label": {"ar": "⚙️ إعدادات النظام", "en": "⚙️ System Settings"},
+    "menu.settings.label": {"ar": "⚙️ إعدادات النظام", "en": "⚙️ System Settings", "ckb": "⚙️ ڕێکخستنەکانی سیستەم"},
     "menu.settings.description": {
         "ar": "خيارات السوبر أدمن فقط.",
         "en": "Super admin options only.",
+        "ckb": "تەنها بۆ سوپەر ئەدمینەکان.",
     },
-    "menu.notifications.label": {"ar": "📢 إشعارات", "en": "📢 Notifications"},
+    "menu.notifications.label": {"ar": "📢 إشعارات", "en": "📢 Notifications", "ckb": "📢 ئاگادارکردنەوەکان"},
     "menu.notifications.description": {
         "ar": "أرسل إشعارات جماعية (Telegram).",
         "en": "Broadcast notifications (Telegram).",
+        "ckb": "ناردنی ئاگادارکردنەوەی گشتی (Telegram).",
     },
     "users.panel.header": {
         "ar": (
@@ -1946,6 +2417,12 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "👥 <b>لیستی بەکارهێنەرەکان</b>\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "هەموو ریزێک: مۆبایل • بەسەرچوون • دۆخی بەکارهێنەر • سڕینەوە.\n"
+            "دوگمەی گونجاو بەکاربەرە بۆ ئەو کردارە."
+        ),
+        "ckb": (
+            "👥 <b>لیستی بەکارهێنەران</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "هەر ریزێک: ژمارەی مۆبایل • بەسەرچوون • دۆخی بەکارهێنەر • سڕینەوە.\n"
             "دوگمەی گونجاو بەکاربەرە بۆ ئەو کردارە."
         ),
     },
@@ -2333,61 +2810,73 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ar": "📸 اختر نوع الصور:\n1️⃣ صور حادث سابق\n2️⃣ صور السيارة المخفية",
         "en": "📸 Choose photo type:\n1️⃣ Accident images\n2️⃣ Hidden car photos",
         "ku": "📸 جۆری وێنە هەڵبژێرە:\n1️⃣ وێنەکانی ڕووداو\n2️⃣ وێنەکانی ئۆتۆموبیڵی شاردراو",
+        "ckb": "📸 جۆری وێنە هەڵبژێرە:\n1️⃣ وێنەکانی ڕووداوی پێشووتر\n2️⃣ وێنەکانی ئۆتۆمبێلی شاردراو",
     },
     "wa.photos.option.accident": {
         "ar": "1. صور حادث سابق 💥",
         "en": "1. Accident photos 💥",
         "ku": "1. وێنەی ڕووداو 💥",
+        "ckb": "1. وێنەکانی ڕووداوی پێشووتر 💥",
     },
     "wa.photos.option.hidden": {
         "ar": "2. صور السيارة المخفية 📷",
         "en": "2. Hidden car photos 📷",
         "ku": "2. وێنەی ئۆتۆموبیڵی شاردراو 📷",
+        "ckb": "2. وێنەکانی ئۆتۆمبێلی شاردراو 📷",
     },
     "wa.progress.processing": {
         "ar": "🔍 *جاري معالجة الطلب...*",
         "en": "🔍 *Processing your request...*",
         "ku": "🔍 *داواکاریەکەت لە چارەسازیدایە...*",
+        "ckb": "🔍 *داواکاریەکەت لە پڕۆسەدایە...*",
     },
     "wa.progress.vin": {
         "ar": "🚗 *رقم الشاصي:* `{vin}`",
         "en": "🚗 *VIN:* `{vin}`",
         "ku": "🚗 *ژمارەی شاصی:* `{vin}`",
+        "ckb": "🚗 *ژمارەی شاسی:* `{vin}`",
     },
     "wa.progress.balance": {
         "ar": "💳 *الرصيد:* {balance}",
         "en": "💳 *Balance:* {balance}",
         "ku": "💳 *باڵانس:* {balance}",
+        "ckb": "💳 *باڵانس:* {balance}",
     },
     "wa.progress.expiry.remaining": {
         "ar": " - الانتهاء بعد {days} يوم",
         "en": " - expires in {days} day(s)",
         "ku": " - دەکاتەوە لە {days} ڕۆژدا",
+        "ckb": " - دەکۆتایەوە لە {days} ڕۆژدا",
     },
     "wa.progress.expiry.today": {
         "ar": " - ينتهي اليوم",
         "en": " - expires today",
         "ku": " - ئەمڕۆ دەکاتەوە",
+        "ckb": " - ئەمڕۆ دەکۆتایەوە",
     },
     "wa.progress.expiry.expired": {
         "ar": " - منتهي",
         "en": " - expired",
         "ku": " - بەسەرچووە",
+        "ckb": " - بەسەرچووە",
     },
     "wa.progress.wait": {
         "ar": "⏳ *يرجى الانتظار، جاري جلب التقرير...*",
         "en": "⏳ *Please wait, fetching the report...*",
         "ku": "⏳ *چاوەڕێ بکە، ڕاپۆرتەکە دەهێنرێت...*",
+        "ckb": "⏳ *چاوەڕێ بکە، ڕاپۆرتەکە دەهێنرێت...*",
     },
     "wa.photos.fetching": {
         "ar": "📸 جاري جلب الصور لـ VIN: {vin}",
         "en": "📸 Fetching photos for VIN: {vin}",
         "ku": "📸 وێنەکان بۆ VIN: {vin} دەهێنرێن", 
+        "ckb": "📸 وێنەکان بۆ VIN: {vin} دەهێنرێن",
     },
     "wa.photos.sent_count": {
         "ar": "✅ تم إرسال {count} صورة.",
         "en": "✅ Sent {count} image(s).",
         "ku": "✅ {count} وێنە نێردرا.",
+        "ckb": "✅ {count} وێنە نێردرا.",
     },
     "wa.language.updated": {
         "ar": "✅ تم تغيير لغة التقارير إلى العربية.",
@@ -2405,26 +2894,37 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ar": "⚠️ لا توجد صور حادث متاحة لهذا رقم الشاصي.",
         "en": "⚠️ No accident images available for this VIN.",
         "ku": "⚠️ وێنەی ڕووداو بۆ ئەم ژمارەی شاصیە بوونی نییە.",
+        "ckb": "⚠️ هیچ وێنەی ڕووداو بۆ ئەم ژمارەی شاسیە نییە.",
     },
     "wa.photos.none.generic": {
         "ar": "⚠️ لا توجد صور متاحة لهذا الرقم.",
         "en": "⚠️ No images available for this VIN.",
         "ku": "⚠️ هیچ وێنەیەک بوونی نییە بۆ ئەم شاصیە.",
+        "ckb": "⚠️ هیچ وێنەیەک بۆ ئەم شاسیە نییە.",
     },
     "wa.photos.fetch_error.accident": {
         "ar": "⚠️ حدث خطأ أثناء جلب صور الحادث.",
         "en": "⚠️ Error while fetching accident images.",
         "ku": "⚠️ هەڵە ڕوویدا لە هێنانى وێنەکانی ڕووداو.",
+        "ckb": "⚠️ هەڵە ڕوویدا لە هێنانی وێنەکانی ڕووداو.",
     },
     "wa.photos.fetch_error.generic": {
         "ar": "⚠️ حدث خطأ أثناء جلب الصور.",
         "en": "⚠️ Error while fetching images.",
         "ku": "⚠️ هەڵە ڕوویدا لە هێنانى وێنەکان.",
+        "ckb": "⚠️ هەڵە ڕوویدا لە هێنانی وێنەکان.",
     },
     "wa.photos.send_error": {
         "ar": "⚠️ تعذر إرسال الصور حالياً.",
         "en": "⚠️ Could not send images right now.",
         "ku": "⚠️ نەتوانرا ئێستا وێنەکان بنێردرێن.",
+        "ckb": "⚠️ نەتوانرا ئێستا وێنەکان بنێردرێن.",
+    },
+    "wa.footer.brand": {
+        "ar": "خدمات بوت كارفاكس",
+        "en": "Carfax Bot Services",
+        "ku": "خزمەتگوزاریی بۆتی کارفاکس",
+        "ckb": "خزمەتگوزاریی بۆتی کارفاکس",
     },
 }
 
@@ -2588,7 +3088,7 @@ async def handle_photo(
 ) -> BridgeResponse:
     """Process inbound media and record it for follow-up across platforms."""
 
-    response = BridgeResponse()
+    resp = BridgeResponse()
     # Normalize and persist user language up-front to avoid drift across sessions/platforms.
     language = normalize_language(user.language)
     user.language = language
@@ -2601,6 +3101,8 @@ async def handle_photo(
         _persist_user_language(user.user_id, language)
     except Exception:
         LOGGER.debug("Failed to persist user language", exc_info=True)
+
+    source = (message.media_url or "").strip()
     if not source:
         resp.messages.append(t("media.not_found", user.language))
         return await _localize_response(resp, user.language)
@@ -2927,10 +3429,11 @@ async def submit_activation_request(
     db_user["phone"] = phone
 
     if existing:
-        # Update existing request
+        # Update existing request and re-notify supers (user may be updating phone)
         existing["phone"] = phone
         existing["ts"] = now_str()
         resp.messages.append(t("activation.request_pending", user.language))
+        await _maybe_notify_supers(context, db_user, platform)
     else:
         # Create new request
         pending.append(
@@ -2984,6 +3487,7 @@ async def _handle_activation_submission(
         existing["phone"] = phone
         existing["ts"] = now_str()
         resp.messages.append(t("activation.request_pending", user.language))
+        await _maybe_notify_supers(context, db_user, message.platform)
     else:
         pending.append(
             {

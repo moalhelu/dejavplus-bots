@@ -129,15 +129,23 @@ def _build_vin_progress_header(
     else:
         daily_line = _bridge.t("progress.vin.daily.unlimited", lang, used=today_used)
 
+    # Clean HTML for WhatsApp markdown to avoid raw tags like <b> showing up
+    balance_txt = _clean_html_for_whatsapp(balance_txt)
+    daily_line = _clean_html_for_whatsapp(daily_line)
+
+    processing_label = _clean_html_for_whatsapp(_bridge.t("wa.progress.processing", lang))
+    vin_label = _clean_html_for_whatsapp(_bridge.t("wa.progress.vin", lang, vin=vin, preserve_latin=True))
+    balance_label = _clean_html_for_whatsapp(_bridge.t("wa.progress.balance", lang, balance=balance_txt))
+
     parts = [
-        _bridge.t("wa.progress.processing", lang),
-        _bridge.t("wa.progress.vin", lang, vin=vin, preserve_latin=True),
-        _bridge.t("wa.progress.balance", lang, balance=balance_txt),
+        processing_label,
+        vin_label,
+        balance_label,
         daily_line,
     ]
     if expiry_txt:
-        parts.append(f"📅 {expiry_txt}")
-    parts.append(_bridge.t("wa.progress.wait", lang))
+        parts.append(_clean_html_for_whatsapp(f"📅 {expiry_txt}"))
+    parts.append(_clean_html_for_whatsapp(_bridge.t("wa.progress.wait", lang)))
 
     return "\n\n".join([p for p in parts if p])
 
@@ -626,7 +634,7 @@ async def _send_report_options_menu(to: str, user_id: str, vin: str, client: Ult
         to,
         body=body_text,
         buttons=buttons,
-        footer="Carfax Bot Services",
+        footer=_bridge.t("wa.footer.brand", lang),
         client=client
     )
 
@@ -1136,11 +1144,14 @@ async def handle_incoming_whatsapp_message(
 
     vin_from_response: Optional[str] = None
     pdf_present = False
+    activation_prompt: Optional[str] = None
 
     for batch in response_batches:
         _extend_payloads(batch)
         if isinstance(batch, _bridge.BridgeResponse):
             actions = batch.actions or {}
+            if actions.get("await_activation_phone") and activation_prompt is None:
+                activation_prompt = _bridge.t("activation.prompt.cc", user_ctx.language)
             if not vin_from_response:
                 vin_from_response = actions.get("vin")
             photos_action = actions.get("photos")
@@ -1186,6 +1197,9 @@ async def handle_incoming_whatsapp_message(
             for doc in batch.documents:
                 if isinstance(doc, dict) and doc.get("type") == "pdf":
                     pdf_present = True
+
+    if activation_prompt:
+        text_payloads.insert(0, _clean_html_for_whatsapp(activation_prompt))
 
     # Add manual messages (e.g., language confirmation) collected outside bridge
     text_payloads.extend(manual_texts)

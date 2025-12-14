@@ -48,6 +48,12 @@ LOGGER = logging.getLogger(__name__)
 
 VIN_COMMAND_PREFIXES = ("/vin", "/report", "/carfax", "vin:", "report:")
 VIN_TOKEN_SPLIT_RE = re.compile(r"[\s,:;\n]+")
+
+# Capabilities question patterns for multi-language detection
+CAPABILITIES_PATTERNS = [
+    "ماذا يمكن", "ماذا تستطيع", "ماذا يمكنك", "what can you do", "what do you do", "چی دەکرێت"
+]
+
 PHONE_INPUT_RE = re.compile(r"^[+\d][\d\s()-]{6,}$")
 _VIN_CONTROL_RE = re.compile(r"[\u200c\u200d\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 _VIN_DIGIT_TRANSLATE = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
@@ -3182,11 +3188,8 @@ async def handle_text(
         resp = await _handle_activation_submission(user, message, phone_candidate, context)
         return await _localize_response(resp, user.language)
 
-    # Check for capabilities question
-    capabilities_patterns = [
-        "ماذا يمكن", "ماذا تستطيع", "ماذا يمكنك", "what can", "what do", "چی دەکرێت"
-    ]
-    if any(pattern in lowered for pattern in capabilities_patterns):
+    # Check for capabilities question using centralized patterns
+    if any(pattern in lowered for pattern in CAPABILITIES_PATTERNS):
         resp = BridgeResponse()
         resp.messages.append(t("help.capabilities", user.language))
         return await _localize_response(resp, user.language)

@@ -5554,8 +5554,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🚀 ابدأ الآن$"), start_button_handler))  # توافق مع النسخ السابقة
     app.add_handler(MessageHandler(filters.Regex("^🆘 المساعدة والتواصل$"), help_command))
     app.add_handler(MessageHandler(filters.Regex("^📄 تقرير جديد$"), new_report_command))
-    # Handler for "What can you do?" in multiple languages
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)(ماذا يمكن|ماذا تستطيع|what can|چی دەکرێت|ماذا يمكنك|what.*do)"), capabilities_command))
+    # Handler for "What can you do?" in multiple languages - matches specific question patterns
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)(ماذا يمكن|ماذا تستطيع|ماذا يمكنك|what can you do|what do you do|چی دەکرێت)"), capabilities_command))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(main_menu_cb, pattern=r"^(main_menu|ref):"))

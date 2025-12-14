@@ -1119,6 +1119,7 @@ def _remove_pending_request(db: Dict[str, Any], tg_id: Any, *, save: bool = Fals
     ]
 
     before = {key: len(db.get(key, []) or []) for key in queue_keys}
+    act_before = before.get("activation_requests", 0)
     removed = False
 
     for key in queue_keys:
@@ -1129,10 +1130,14 @@ def _remove_pending_request(db: Dict[str, Any], tg_id: Any, *, save: bool = Fals
         db[key] = filtered
 
     after = {key: len(db.get(key, []) or []) for key in queue_keys}
+    act_after = after.get("activation_requests", 0)
+
     logger.info(
         "pending_cleanup",
         extra={
             "tg_id": tg_str,
+            "act_before": act_before,
+            "act_after": act_after,
             "before": before,
             "after": after,
             "removed": removed,
@@ -1143,8 +1148,24 @@ def _remove_pending_request(db: Dict[str, Any], tg_id: Any, *, save: bool = Fals
 
     if save:
         _save_db(db)
-        logger.info("pending_cleanup_saved", extra={"db_path": DB_PATH, "removed": removed})
+        logger.info(
+            "pending_cleanup_saved",
+            extra={"db_path": DB_PATH, "removed": removed, "act_after": act_after},
+        )
 
+    return removed
+
+
+def _cleanup_pending_and_save(db: Dict[str, Any], tg_id: Any) -> bool:
+    """Force cleanup for a user and persist if anything was removed."""
+
+    removed = _remove_pending_request(db, tg_id, save=False)
+    if removed:
+        _save_db(db)
+        logger.info(
+            "pending_cleanup_forced",
+            extra={"tg_id": str(tg_id), "db_path": DB_PATH},
+        )
     return removed
 
 
@@ -2422,6 +2443,7 @@ async def pending_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["activation_date"] = today.strftime("%Y-%m-%d")
         _audit(u, admin_tg, "monthly_activate_from_pending", add_days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
         _save_db(db)
+        _cleanup_pending_and_save(db, target_tg)
         await _notify_user(
             context,
             target_tg,
@@ -2456,6 +2478,7 @@ async def pending_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
         _audit(u, admin_tg, "trial_activate", days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
         _save_db(db)
+        _cleanup_pending_and_save(db, target_tg)
         await _notify_user(
             context,
             target_tg,
@@ -3382,6 +3405,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 u["activation_date"] = today.strftime("%Y-%m-%d")
             _audit(u, admin_tg, "monthly_activate", add_days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _save_db(db)
+            _cleanup_pending_and_save(db, target_tg)
             await _notify_user(
                 context,
                 target_tg,
@@ -3412,6 +3436,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _audit(u, admin_tg, "trial_activate", days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _save_db(db)
+            _cleanup_pending_and_save(db, target_tg)
             await _notify_user(
                 context,
                 target_tg,
@@ -3440,6 +3465,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _audit(u, admin_tg, "enable30", days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _save_db(db)
+            _cleanup_pending_and_save(db, target_tg)
             await _notify_user(
                 context,
                 target_tg,
@@ -3483,6 +3509,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 u["activation_date"] = today.strftime("%Y-%m-%d")
             _audit(u, admin_tg, "renew30", add_days=days)
             _save_db(db)
+            _cleanup_pending_and_save(db, target_tg)
             await _notify_user(context, target_tg, f"♻️ تم تجديد {days} يوم. الانتهاء: <code>{u['expiry_date']}</code>")
             await _notify_supers(context, f"♻️ (Admin:{admin_tg}) جدد {days}يوم للمستخدم {_fmt_tg_with_phone(target_tg)}.")
             return await _render_usercard(update, context, target_tg)
@@ -4513,8 +4540,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     monthly_limit=effective_monthly,
                     extra_reports=extra_reports,
                 )
-                _remove_pending_request(db, target)
+                removed = _remove_pending_request(db, target)
                 _save_db(db)
+                if removed:
+                    _cleanup_pending_and_save(db, target)
                 await update.message.reply_text(_bridge.t("admin.activation.custom.done", lang), parse_mode=ParseMode.HTML)
                 bonus_line = (
                     f"\n• تمت إضافة <b>{extra_reports}</b> تقرير إلى حدك الشهري (الآن <b>{effective_monthly}</b>)."

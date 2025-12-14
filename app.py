@@ -27,6 +27,8 @@ from html import escape
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 
 logger = logging.getLogger(__name__)

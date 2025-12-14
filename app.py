@@ -1103,11 +1103,49 @@ async def _finalize_report_request(
     return snapshot
 
 
-def _remove_pending_request(db: Dict[str, Any], tg_id: str) -> None:
+def _remove_pending_request(db: Dict[str, Any], tg_id: Any, *, save: bool = False) -> bool:
+    """Remove pending activation requests for a user, normalizing ID and logging the cleanup."""
+
     tg_str = str(tg_id)
-    db["activation_requests"] = [
-        req for req in db.get("activation_requests", []) if str(req.get("tg_id")) != tg_str
+    queue_keys = [
+        key
+        for key in (
+            "activation_requests",
+            "pending_activation",
+            "pending_activations",
+            "pending",
+        )
+        if isinstance(db.get(key), list)
     ]
+
+    before = {key: len(db.get(key, []) or []) for key in queue_keys}
+    removed = False
+
+    for key in queue_keys:
+        original = db.get(key, []) or []
+        filtered = [req for req in original if str(req.get("tg_id")) != tg_str]
+        if len(filtered) != len(original):
+            removed = True
+        db[key] = filtered
+
+    after = {key: len(db.get(key, []) or []) for key in queue_keys}
+    logger.info(
+        "pending_cleanup",
+        extra={
+            "tg_id": tg_str,
+            "before": before,
+            "after": after,
+            "removed": removed,
+            "db_path": DB_PATH,
+            "save_requested": save,
+        },
+    )
+
+    if save:
+        _save_db(db)
+        logger.info("pending_cleanup_saved", extra={"db_path": DB_PATH, "removed": removed})
+
+    return removed
 
 
 def _prune_resolved_activation_requests(db: Dict[str, Any]) -> bool:

@@ -5554,6 +5554,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🚀 ابدأ الآن$"), start_button_handler))  # توافق مع النسخ السابقة
     app.add_handler(MessageHandler(filters.Regex("^🆘 المساعدة والتواصل$"), help_command))
     app.add_handler(MessageHandler(filters.Regex("^📄 تقرير جديد$"), new_report_command))
+    # Handler for "What can you do?" in multiple languages
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)(ماذا يمكن|ماذا تستطيع|what can|چی دەکرێت|ماذا يمكنك|what.*do)"), capabilities_command))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(main_menu_cb, pattern=r"^(main_menu|ref):"))
@@ -5568,6 +5570,7 @@ def main():
     app.add_handler(CallbackQueryHandler(broadcast_cb, pattern=r"^broadcast:"))
     app.add_handler(CallbackQueryHandler(help_back_cb, pattern=r"^help:back$"))
     app.add_handler(CallbackQueryHandler(help_faq_cb, pattern=r"^help:faq$"))
+    app.add_handler(CallbackQueryHandler(help_capabilities_cb, pattern=r"^help:capabilities$"))
     app.add_handler(CallbackQueryHandler(report_back_cb, pattern=r"^report:back$"))
     app.add_handler(CallbackQueryHandler(vin_info_cb, pattern=r"^vin:info$"))
     app.add_handler(CallbackQueryHandler(vin_sample_cb, pattern=r"^vin:sample$"))
@@ -5626,11 +5629,29 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(_bridge.t("help.button.website", lang), url="https://www.dejavuplus.com")
         ],
         [
+            InlineKeyboardButton(_bridge.t("help.button.capabilities", lang), callback_data="help:capabilities")
+        ],
+        [
             InlineKeyboardButton(_bridge.t("help.button.faq", lang), callback_data="help:faq"),
             InlineKeyboardButton(_bridge.t("action.back", lang), callback_data="main_menu:show")
         ]
     ])
     await _send_or_edit(update, context, text_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+async def capabilities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض قدرات البوت عند كتابة السؤال مباشرة"""
+    tg_id = str(update.effective_user.id)
+    db = _load_db()
+    u = _ensure_user(db, tg_id, update.effective_user.username)
+    lang = _get_user_report_lang(u)
+    
+    capabilities = _bridge.t("help.capabilities", lang)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(_bridge.t("button.new_report", lang), callback_data="report:prompt")],
+        [InlineKeyboardButton(_bridge.t("action.back", lang), callback_data="main_menu:show")]
+    ])
+    await _send_or_edit(update, context, capabilities, parse_mode=ParseMode.HTML, reply_markup=kb)
+
 # ===== Button-only Handlers =====
 async def new_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """رسالة طلب تقرير جديد بتصميم بصري محسّن"""
@@ -5700,6 +5721,21 @@ async def help_faq_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(faq, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception:
         await context.bot.send_message(chat_id=q.message.chat_id, text=faq, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+async def help_capabilities_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض قدرات البوت"""
+    q = update.callback_query
+    await q.answer()
+    lang = _get_user_report_lang(_ensure_user(_load_db(), str(q.from_user.id), q.from_user.username))
+    capabilities = _bridge.t("help.capabilities", lang)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(_bridge.t("button.new_report", lang), callback_data="report:prompt")],
+        [InlineKeyboardButton(_bridge.t("action.back", lang), callback_data="main_menu:show")]
+    ])
+    try:
+        await q.edit_message_text(capabilities, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        await context.bot.send_message(chat_id=q.message.chat_id, text=capabilities, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 async def report_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query

@@ -12,3 +12,6 @@ temp_static/*.pdf
 
 # Ignore misc logs
 pdf_errors.log
+
+.env
+

@@ -16,6 +16,7 @@ import aiohttp
 from bot_core.config import get_env
 from bot_core.services.pdf import html_to_pdf_bytes_chromium, html_to_pdf_weasyprint_async
 from bot_core.services.translation import inject_rtl, translate_html, _latin_ku_to_arabic  # type: ignore
+from bot_core.telemetry import atimed
 
 try:  # optional dependency (used for quick HTML translation fallback)
     from bs4 import BeautifulSoup  # type: ignore
@@ -137,7 +138,8 @@ async def generate_vin_report(vin: str, *, language: str = "en") -> ReportResult
     api_response = _cache_get(normalized_vin)
     if not api_response:
         prefer_non_pdf = lang_code != "en"
-        api_response = await _call_carfax_api(normalized_vin, prefer_non_pdf=prefer_non_pdf)
+        async with atimed("report.fetch", vin=normalized_vin, lang=lang_code, prefer_non_pdf=prefer_non_pdf):
+            api_response = await _call_carfax_api(normalized_vin, prefer_non_pdf=prefer_non_pdf)
         if api_response.get("ok"):
             _cache_set(normalized_vin, api_response)
     if not api_response.get("ok"):
@@ -166,7 +168,8 @@ async def generate_vin_report(vin: str, *, language: str = "en") -> ReportResult
         # If non-English but only PDF is available, treat as not ok to push fallback rendering.
         api_response = {"ok": False, "error": "pdf_only_non_translatable"}
 
-    pdf_bytes = await _render_pdf_from_response(api_response, normalized_vin, lang_code)
+    async with atimed("report.render_pdf", vin=normalized_vin, lang=lang_code):
+        pdf_bytes = await _render_pdf_from_response(api_response, normalized_vin, lang_code)
     if not pdf_bytes:
         return ReportResult(
             success=False,

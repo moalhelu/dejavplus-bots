@@ -30,6 +30,8 @@ import shutil
 import httpx
 from telegram import Bot
 
+from bot_core.telemetry import atimed, new_rid, set_rid
+
 from bot_core import bridge as _bridge
 from bot_core.clients.ultramsg import UltraMsgClient, UltraMsgCredentials, UltraMsgError
 from bot_core.config import get_report_default_lang, get_ultramsg_settings, is_super_admin
@@ -816,91 +818,94 @@ async def handle_incoming_whatsapp_message(
     *,
     event_type: Optional[str] = None,
 ) -> Dict[str, Any]:
-    # Debug trace for incoming state/text
-    LOGGER.debug("whatsapp inbound raw event=%s", event)
-    normalized_event_type = (event_type or str(event.get("event_type") or "")).strip().lower()
-    if normalized_event_type and normalized_event_type != "message_received":
-        LOGGER.debug("Skipping webhook: unsupported event_type=%s", normalized_event_type)
-        return {"status": "ignored", "reason": f"event_type:{normalized_event_type or 'unknown'}"}
+    # Correlation id for this webhook entry (propagates to child tasks via contextvars).
+    with set_rid(new_rid("wa-")):
+        async with atimed("wa.handle", event_type=(event_type or "")):
+            # Debug trace for incoming state/text
+            LOGGER.debug("whatsapp inbound raw event=%s", event)
+            normalized_event_type = (event_type or str(event.get("event_type") or "")).strip().lower()
+            if normalized_event_type and normalized_event_type != "message_received":
+                LOGGER.debug("Skipping webhook: unsupported event_type=%s", normalized_event_type)
+                return {"status": "ignored", "reason": f"event_type:{normalized_event_type or 'unknown'}"}
 
-    msg_category = str(event.get("type") or "").strip().lower()
+            msg_category = str(event.get("type") or "").strip().lower()
     
     # Handle interactive button replies
-    button_id = None
-    if msg_category == "interactive":
-        interactive = event.get("interactive") or {}
-        int_type = interactive.get("type")
-        if int_type == "button_reply":
-            button_reply = interactive.get("button_reply") or {}
-            button_id = button_reply.get("id")
-            LOGGER.info("🔘 Button clicked: %s", button_id)
-        elif int_type == "list_reply":
-            list_reply = interactive.get("list_reply") or {}
-            button_id = list_reply.get("id")
-            LOGGER.info("📜 List item selected: %s", button_id)
+            button_id = None
+            if msg_category == "interactive":
+                interactive = event.get("interactive") or {}
+                int_type = interactive.get("type")
+                if int_type == "button_reply":
+                    button_reply = interactive.get("button_reply") or {}
+                    button_id = button_reply.get("id")
+                    LOGGER.info("🔘 Button clicked: %s", button_id)
+                elif int_type == "list_reply":
+                    list_reply = interactive.get("list_reply") or {}
+                    button_id = list_reply.get("id")
+                    LOGGER.info("📜 List item selected: %s", button_id)
     
-    if msg_category and msg_category not in ("chat", "interactive"):
-        LOGGER.debug("Skipping webhook: unsupported message type=%s", msg_category)
-        return {"status": "ignored", "reason": f"type:{msg_category or 'unknown'}"}
+            if msg_category and msg_category not in ("chat", "interactive"):
+                LOGGER.debug("Skipping webhook: unsupported message type=%s", msg_category)
+                return {"status": "ignored", "reason": f"type:{msg_category or 'unknown'}"}
 
-    from_me_flag = event.get("fromMe")
-    if isinstance(from_me_flag, str):
-        from_me_flag = from_me_flag.strip().lower() == "true"
-    if from_me_flag:
-        LOGGER.debug("Skipping webhook: message originated from our account (jid=%s)", event.get("from"))
-        return {"status": "ignored", "reason": "from_me"}
+            from_me_flag = event.get("fromMe")
+            if isinstance(from_me_flag, str):
+                from_me_flag = from_me_flag.strip().lower() == "true"
+            if from_me_flag:
+                LOGGER.debug("Skipping webhook: message originated from our account (jid=%s)", event.get("from"))
+                return {"status": "ignored", "reason": "from_me"}
 
-    raw_sender = event.get("from") or event.get("chatId") or event.get("author")
-    if not raw_sender:
-        LOGGER.warning("Skipping webhook: no 'from' JID in payload: %s", event)
-        return {"status": "ignored", "reason": "missing_from"}
+            raw_sender = event.get("from") or event.get("chatId") or event.get("author")
+            if not raw_sender:
+                LOGGER.warning("Skipping webhook: no 'from' JID in payload: %s", event)
+                return {"status": "ignored", "reason": "missing_from"}
 
-    bridge_sender = _normalize_sender(raw_sender)
-    msisdn = _normalize_recipient(raw_sender) or bridge_sender
-    if not bridge_sender or not msisdn:
-        LOGGER.warning("Skipping webhook: unable to normalize sender JID=%s", raw_sender)
-        return {"status": "ignored", "reason": "invalid_sender"}
+            bridge_sender = _normalize_sender(raw_sender)
+            msisdn = _normalize_recipient(raw_sender) or bridge_sender
+            if not bridge_sender or not msisdn:
+                LOGGER.warning("Skipping webhook: unable to normalize sender JID=%s", raw_sender)
+                return {"status": "ignored", "reason": "invalid_sender"}
 
-    text_body = (event.get("body") or event.get("text") or "").strip()
-    LOGGER.debug("whatsapp inbound normalized text='%s'", text_body)
+            text_body = (event.get("body") or event.get("text") or "").strip()
+            LOGGER.debug("whatsapp inbound normalized text='%s'", text_body)
     
     # If it's a button click, we might not have body text, or we might want to use the ID
-    if button_id:
-        text_body = f"BUTTON:{button_id}"
+            if button_id:
+                text_body = f"BUTTON:{button_id}"
 
-    if not text_body and not button_id:
-        LOGGER.debug("Skipping webhook: empty body from %s", msisdn)
-        return {"status": "ignored", "reason": "empty_body"}
+            if not text_body and not button_id:
+                LOGGER.debug("Skipping webhook: empty body from %s", msisdn)
+                return {"status": "ignored", "reason": "empty_body"}
 
-    LOGGER.info("📩 Incoming WhatsApp from %s: %s", msisdn, text_body)
+            LOGGER.info("📩 Incoming WhatsApp from %s: %s", msisdn, text_body)
 
-    enriched_event = dict(event)
-    enriched_event.setdefault("sender", bridge_sender)
-    telegram_context = _get_notification_context()
+            enriched_event = dict(event)
+            enriched_event.setdefault("sender", bridge_sender)
+            telegram_context = _get_notification_context()
 
-    msg_type = _detect_message_type(enriched_event)
-    media_url = _detect_media_url(enriched_event)
-    user_ctx = _build_user_context(bridge_sender, enriched_event)
-    report_vin = None
-    if (user_ctx.state or "").startswith("report_options:"):
-        report_vin = (user_ctx.state or "").split(":", 1)[1] or None
-    LOGGER.debug("whatsapp inbound state=%s vin_state=%s", user_ctx.state, report_vin)
-    pre_reserved_credit = False
+            msg_type = _detect_message_type(enriched_event)
+            media_url = _detect_media_url(enriched_event)
+            user_ctx = _build_user_context(bridge_sender, enriched_event)
+            report_vin = None
+            if (user_ctx.state or "").startswith("report_options:"):
+                report_vin = (user_ctx.state or "").split(":", 1)[1] or None
+            LOGGER.debug("whatsapp inbound state=%s vin_state=%s", user_ctx.state, report_vin)
+            pre_reserved_credit = False
 
-    if (user_ctx.state or "").startswith("report_options"):
-        LOGGER.debug("whatsapp: entering photo-options handler (vin=%s text=%s)", report_vin, text_body)
+            if (user_ctx.state or "").startswith("report_options"):
+                LOGGER.debug("whatsapp: entering photo-options handler (vin=%s text=%s)", report_vin, text_body)
 
-    # Map text fallback to button_id (non-main-menu flows only; main menu handled via bridge menu items)
-    state_lower = (user_ctx.state or "").lower()
-    if state_lower == "language_choice":
-        LOGGER.debug("whatsapp: in language_choice flow, skip button text mapping")
-    elif not button_id and text_body and text_body.isdigit():
-        mapped_id = _map_text_to_button(text_body, user_ctx.state, is_super_admin(user_ctx.user_id))
-        if mapped_id:
-            button_id = mapped_id
-            LOGGER.info("🔀 Mapped text '%s' to button_id '%s' (state=%s)", text_body, button_id, user_ctx.state)
+            # Map text fallback to button_id (non-main-menu flows only; main menu handled via bridge menu items)
+            state_lower = (user_ctx.state or "").lower()
+            if state_lower == "language_choice":
+                LOGGER.debug("whatsapp: in language_choice flow, skip button text mapping")
+            elif not button_id and text_body and text_body.isdigit():
+                mapped_id = _map_text_to_button(text_body, user_ctx.state, is_super_admin(user_ctx.user_id))
+                if mapped_id:
+                    button_id = mapped_id
+                    LOGGER.info("🔀 Mapped text '%s' to button_id '%s' (state=%s)", text_body, button_id, user_ctx.state)
 
-    incoming = _bridge.IncomingMessage(
+            incoming = _bridge.IncomingMessage(
         platform="whatsapp",
         user_id=user_ctx.user_id,
         text=text_body or None,
@@ -909,14 +914,14 @@ async def handle_incoming_whatsapp_message(
         file_name=_detect_media_filename(enriched_event),
         mime_type=_detect_media_mime(enriched_event),
         raw=enriched_event,
-    )
+            )
 
-    response_batches: List[Any] = []
-    bridge_kwargs: Dict[str, Any] = {}
-    if telegram_context is not None:
-        bridge_kwargs["context"] = telegram_context
+            response_batches: List[Any] = []
+            bridge_kwargs: Dict[str, Any] = {}
+            if telegram_context is not None:
+                bridge_kwargs["context"] = telegram_context
 
-    # --- Unified handling using the bridge ---
+            # --- Unified handling using the bridge ---
 
     menu_selection_text: Optional[str] = None
 
@@ -1112,7 +1117,7 @@ async def handle_incoming_whatsapp_message(
         _apply_bridge_actions_to_state(bridge_sender, resp)
         response_batches.append(resp)
 
-    # --- Process Bridge Responses ---
+            # --- Process Bridge Responses ---
     text_payloads: List[str] = []
     documents: List[Dict[str, Any]] = []
     media_payloads: List[Dict[str, Any]] = []
@@ -1310,8 +1315,8 @@ async def handle_incoming_whatsapp_message(
     finally:
         _cleanup_temp_files(temp_files)
 
-    total_responses = len(text_payloads) + len(doc_tasks) + len(image_tasks)
-    return {"status": "ok", "responses": total_responses}
+            total_responses = len(text_payloads) + len(doc_tasks) + len(image_tasks)
+            return {"status": "ok", "responses": total_responses}
 
 
 def _cleanup_temp_files(files: List[str]) -> None:
@@ -1375,7 +1380,8 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
 
     LOGGER.info("Sending PDF document to %s (filename=%s)", msisdn, filename)
     try:
-        resp = await client.send_document(msisdn, **payload)
+        async with atimed("wa.ultramsg.send_document", to=msisdn, filename=filename):
+            resp = await client.send_document(msisdn, **payload)
         LOGGER.info("UltraMsg send_document response: %s", resp)
     except Exception as e:
         LOGGER.error("Failed to send document: %s", e, exc_info=True)
@@ -1402,7 +1408,8 @@ async def _relay_image_document(client: UltraMsgClient, msisdn: str, media: Dict
     if media.get("filename"):
         payload["filename"] = media["filename"]
 
-    await client.send_image(msisdn, **payload)
+    async with atimed("wa.ultramsg.send_image", to=msisdn):
+        await client.send_image(msisdn, **payload)
 
 
 async def send_whatsapp_text(
@@ -1425,7 +1432,8 @@ async def send_whatsapp_text(
 
     try:
         LOGGER.info("📤 Sending WhatsApp reply to %s", recipient)
-        response = await active_client.send_text(recipient, body, **extra)
+        async with atimed("wa.ultramsg.send_text", to=recipient, body_len=len(body) if body else 0):
+            response = await active_client.send_text(recipient, body, **extra)
         LOGGER.debug("UltraMsg send_text response: %s", response)
         return response
     except UltraMsgError:

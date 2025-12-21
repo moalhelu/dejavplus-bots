@@ -10,6 +10,7 @@ from threading import Lock
 from typing import Any, Dict, Optional, Final
 
 from bot_core.config import get_env
+from bot_core.telemetry import timed
 
 _DB_LOCK = Lock()
 # Default to 1 retained backup; env DB_BACKUP_RETENTION can override
@@ -38,28 +39,43 @@ def _db_path() -> str:
 
 def load_db() -> Dict[str, Any]:
     path = _db_path()
-    if not os.path.exists(path):
-        return _blank_db()
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        return _blank_db()
-    for key in ("users", "activation_requests", "settings"):
-        data.setdefault(key, _blank_db()[key])
-    _sanitize_settings(data.get("settings", {}))
-    return data
+    with timed("db.load", path=path):
+        if not os.path.exists(path):
+            return _blank_db()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            return _blank_db()
+        for key in ("users", "activation_requests", "settings"):
+            data.setdefault(key, _blank_db()[key])
+        _sanitize_settings(data.get("settings", {}))
+        return data
 
 
 def save_db(db: Dict[str, Any]) -> None:
     path = _db_path()
     tmp_path = path + ".tmp"
     with _DB_LOCK:
-        _sanitize_settings(db.setdefault("settings", {}))
-        _backup_existing_db(path)
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump(db, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
+        with timed("db.save", path=path):
+            _sanitize_settings(db.setdefault("settings", {}))
+            serialized = json.dumps(db, ensure_ascii=False, indent=2)
+
+            # Low-risk optimization: skip backup+atomic replace if the content didn't change.
+            # This reduces filesystem churn and backup spam for no-op updates.
+            try:
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as fh:
+                        existing = fh.read()
+                    if existing == serialized:
+                        return
+            except Exception:
+                # If we can't read/compare safely, fall back to the normal write path.
+                pass
+            _backup_existing_db(path)
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(serialized)
+            os.replace(tmp_path, path)
 
 
 def _default_user(tg_id: str, tg_username: Optional[str]) -> Dict[str, Any]:
@@ -159,28 +175,29 @@ def _backup_existing_db(path: str) -> None:
     src = Path(path)
     if not src.exists():
         return
-    backup_dir = src.parent / "backups"
-    try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        return
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    backup_name = f"{src.stem}-{timestamp}{src.suffix or '.json'}"
-    backup_path = backup_dir / backup_name
-    try:
-        shutil.copy2(src, backup_path)
-    except Exception:
-        return
-    pattern = f"{src.stem}-*{src.suffix or '.json'}"
-    backups = sorted(backup_dir.glob(pattern))
-    excess = len(backups) - _BACKUP_RETENTION
-    if excess <= 0:
-        return
-    for old in backups[:excess]:
+    with timed("db.backup", path=str(src)):
+        backup_dir = src.parent / "backups"
         try:
-            old.unlink()
+            backup_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
-            pass
+            return
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_name = f"{src.stem}-{timestamp}{src.suffix or '.json'}"
+        backup_path = backup_dir / backup_name
+        try:
+            shutil.copy2(src, backup_path)
+        except Exception:
+            return
+        pattern = f"{src.stem}-*{src.suffix or '.json'}"
+        backups = sorted(backup_dir.glob(pattern))
+        excess = len(backups) - _BACKUP_RETENTION
+        if excess <= 0:
+            return
+        for old in backups[:excess]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
 
 
 def audit(user: Dict[str, Any], admin_tg: str, operation: str, **extra: Any) -> None:

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Match, Optional, Tuple, cast
 import aiohttp
 
 from bot_core.config import get_env
+from bot_core.telemetry import atimed, log_timing
 
 try:  # optional dependency
     from bs4 import BeautifulSoup
@@ -339,6 +340,8 @@ async def translate_batch(texts: List[str], target: str = "ar") -> List[str]:
     if not texts:
         return []
 
+    start = time.perf_counter()
+
     cfg = get_env()
     defaults = cfg.translator_defaults
     target_lang = _normalize_target(target)
@@ -358,6 +361,14 @@ async def translate_batch(texts: List[str], target: str = "ar") -> List[str]:
         merged_hits = cached_hits
         if is_kurdish:
             merged_hits = {k: _ensure_kurdish_arabic(v) for k, v in cached_hits.items()}
+        log_timing(
+            "translate.batch",
+            (time.perf_counter() - start) * 1000.0,
+            target=target_lang,
+            total=len(texts),
+            missing=0,
+            method="cache",
+        )
         return [to_arabic_digits(merged_hits[t]) for t in texts]
 
     session = await _get_http_session(timeout=PROVIDER_TIMEOUT)
@@ -397,6 +408,14 @@ async def translate_batch(texts: List[str], target: str = "ar") -> List[str]:
         merged: Dict[str, str] = {**cached_hits, **dict(zip(missing, provider_result))}
         if is_kurdish:
             merged = {k: _ensure_kurdish_arabic(v) for k, v in merged.items()}
+        log_timing(
+            "translate.batch",
+            (time.perf_counter() - start) * 1000.0,
+            target=target_lang,
+            total=len(texts),
+            missing=len(missing),
+            method="providers_race",
+        )
         return [to_arabic_digits(merged[t]) for t in texts]
 
     # Google free fallback (batched, parallel-limited)
@@ -409,6 +428,14 @@ async def translate_batch(texts: List[str], target: str = "ar") -> List[str]:
             merged: Dict[str, str] = {**cached_hits, **dict(zip(missing, free))}
             if is_kurdish:
                 merged = {k: _ensure_kurdish_arabic(v) for k, v in merged.items()}
+            log_timing(
+                "translate.batch",
+                (time.perf_counter() - start) * 1000.0,
+                target=target_lang,
+                total=len(texts),
+                missing=len(missing),
+                method="google_free",
+            )
             return [to_arabic_digits(merged[t]) for t in texts]
     except Exception:
         pass
@@ -428,6 +455,14 @@ async def translate_batch(texts: List[str], target: str = "ar") -> List[str]:
             merged: Dict[str, str] = {**cached_hits, **dict(zip(missing, translated_missing))}
             if is_kurdish:
                 merged = {k: _ensure_kurdish_arabic(v) for k, v in merged.items()}
+            log_timing(
+                "translate.batch",
+                (time.perf_counter() - start) * 1000.0,
+                target=target_lang,
+                total=len(texts),
+                missing=len(missing),
+                method="googletrans",
+            )
             return [to_arabic_digits(merged[t]) for t in texts]
     except Exception:
         pass
@@ -436,6 +471,14 @@ async def translate_batch(texts: List[str], target: str = "ar") -> List[str]:
     merged: Dict[str, str] = {**cached_hits, **{m: m for m in missing}}
     if is_kurdish:
         merged = {k: _ensure_kurdish_arabic(v) for k, v in merged.items()}
+    log_timing(
+        "translate.batch",
+        (time.perf_counter() - start) * 1000.0,
+        target=target_lang,
+        total=len(texts),
+        missing=len(missing),
+        method="fallback_original",
+    )
     return [to_arabic_digits(merged[t]) for t in texts]
 
 
@@ -468,104 +511,105 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
     rtl = target_lang_raw in RTL_LANGS
     if BeautifulSoup is None:
         return inject_rtl(html_input, lang=target_lang) if rtl else html_input
-    try:
-        soup = BeautifulSoup(html_input, "html.parser")
-        text_nodes: List[Any] = []
-        for element in soup.find_all(text=True):
-            if element.parent and element.parent.name in ("script", "style", "noscript"):
-                continue
-            raw = str(element)
-            if _is_visible_text_node(raw):
-                text_nodes.append(element)
-
-        # Split very long text nodes to avoid provider limits (e.g., 4-5k chars).
-        def _segment(text: str, limit: int = 4000) -> List[str]:
-            if len(text) <= limit:
-                return [text]
-            parts: List[str] = []
-            current = []
-            current_len = 0
-            for chunk in re.split(r"(\.\s+|\n)", text):
-                if not chunk:
-                    continue
-                if current_len + len(chunk) > limit and current:
-                    parts.append("".join(current))
-                    current = []
-                    current_len = 0
-                current.append(chunk)
-                current_len += len(chunk)
-            if current:
-                parts.append("".join(current))
-            return parts or [text]
-
-        originals: List[str] = []
-        idx_map: dict[str, int] = {}
-        expanded_map: List[List[str]] = []  # segments per original
-        for node in text_nodes:
-            raw = str(node)
-            if raw not in idx_map:
-                idx_map[raw] = len(originals)
-                originals.append(raw)
-                expanded_map.append(_segment(raw))
-
-        # Flatten segments for batch translation
-        flat_segments: List[str] = [seg for segments in expanded_map for seg in segments]
+    async with atimed("translate.html", target=target_lang, html_len=len(html_input) if html_input else 0):
         try:
-            translated_segments = await asyncio.wait_for(
-                translate_batch(flat_segments, target=target_lang),
-                timeout=TRANSLATE_TOTAL_TIMEOUT,
-            )
-        except Exception:
-            translated_segments = []
-        if not translated_segments or len(translated_segments) != len(flat_segments):
-            translated_segments = flat_segments  # fallback to original
-
-        # Reconstruct per-original
-        rebuilt: List[str] = []
-        cursor = 0
-        for segments in expanded_map:
-            count = len(segments)
-            rebuilt.append("".join(translated_segments[cursor:cursor+count]))
-            cursor += count
-
-        no_change = rebuilt == originals
-
-        # If no change happened (provider failed silently), try batched Google free as last resort
-        if no_change and target_lang != "en":
-            try:
-                fallback_rebuilt = await _google_free_batch(originals, target_lang)
-                rebuilt = fallback_rebuilt if len(fallback_rebuilt) == len(originals) else originals
-            except Exception:
-                rebuilt = originals
-            no_change = rebuilt == originals
-
-        for node in text_nodes:
-            idx = idx_map.get(str(node))
-            if idx is not None:
-                node.replace_with(rebuilt[idx])
-
-        if is_kurdish:
-            _apply_kurdish_arabic_to_soup(soup)
-
-        for element in soup.find_all(text=True):
-            text_value = str(element) if element else ""
-            if re.search(r"\b[A-HJ-NPR-Z0-9]{17}\b", text_value):
-                try:
-                    vin_wrapper = soup.new_tag("span", attrs={"class": "vin"})
-                    element.wrap(vin_wrapper)
-                except Exception:
-                    pass
-
-        if ARABIC_INDIC_DIGITS:
+            soup = BeautifulSoup(html_input, "html.parser")
+            text_nodes: List[Any] = []
             for element in soup.find_all(text=True):
                 if element.parent and element.parent.name in ("script", "style", "noscript"):
                     continue
-                element.replace_with(to_arabic_digits(str(element)))
+                raw = str(element)
+                if _is_visible_text_node(raw):
+                    text_nodes.append(element)
 
-        result_html = str(soup)
-        return inject_rtl(result_html, lang=target_lang) if rtl else result_html
-    except Exception:
-        return inject_rtl(html_input, lang=target_lang) if rtl else html_input
+            # Split very long text nodes to avoid provider limits (e.g., 4-5k chars).
+            def _segment(text: str, limit: int = 4000) -> List[str]:
+                if len(text) <= limit:
+                    return [text]
+                parts: List[str] = []
+                current = []
+                current_len = 0
+                for chunk in re.split(r"(\.\s+|\n)", text):
+                    if not chunk:
+                        continue
+                    if current_len + len(chunk) > limit and current:
+                        parts.append("".join(current))
+                        current = []
+                        current_len = 0
+                    current.append(chunk)
+                    current_len += len(chunk)
+                if current:
+                    parts.append("".join(current))
+                return parts or [text]
+
+            originals: List[str] = []
+            idx_map: dict[str, int] = {}
+            expanded_map: List[List[str]] = []  # segments per original
+            for node in text_nodes:
+                raw = str(node)
+                if raw not in idx_map:
+                    idx_map[raw] = len(originals)
+                    originals.append(raw)
+                    expanded_map.append(_segment(raw))
+
+            # Flatten segments for batch translation
+            flat_segments: List[str] = [seg for segments in expanded_map for seg in segments]
+            try:
+                translated_segments = await asyncio.wait_for(
+                    translate_batch(flat_segments, target=target_lang),
+                    timeout=TRANSLATE_TOTAL_TIMEOUT,
+                )
+            except Exception:
+                translated_segments = []
+            if not translated_segments or len(translated_segments) != len(flat_segments):
+                translated_segments = flat_segments  # fallback to original
+
+            # Reconstruct per-original
+            rebuilt: List[str] = []
+            cursor = 0
+            for segments in expanded_map:
+                count = len(segments)
+                rebuilt.append("".join(translated_segments[cursor:cursor + count]))
+                cursor += count
+
+            no_change = rebuilt == originals
+
+            # If no change happened (provider failed silently), try batched Google free as last resort
+            if no_change and target_lang != "en":
+                try:
+                    fallback_rebuilt = await _google_free_batch(originals, target_lang)
+                    rebuilt = fallback_rebuilt if len(fallback_rebuilt) == len(originals) else originals
+                except Exception:
+                    rebuilt = originals
+                no_change = rebuilt == originals
+
+            for node in text_nodes:
+                idx = idx_map.get(str(node))
+                if idx is not None:
+                    node.replace_with(rebuilt[idx])
+
+            if is_kurdish:
+                _apply_kurdish_arabic_to_soup(soup)
+
+            for element in soup.find_all(text=True):
+                text_value = str(element) if element else ""
+                if re.search(r"\b[A-HJ-NPR-Z0-9]{17}\b", text_value):
+                    try:
+                        vin_wrapper = soup.new_tag("span", attrs={"class": "vin"})
+                        element.wrap(vin_wrapper)
+                    except Exception:
+                        pass
+
+            if ARABIC_INDIC_DIGITS:
+                for element in soup.find_all(text=True):
+                    if element.parent and element.parent.name in ("script", "style", "noscript"):
+                        continue
+                    element.replace_with(to_arabic_digits(str(element)))
+
+            result_html = str(soup)
+            return inject_rtl(result_html, lang=target_lang) if rtl else result_html
+        except Exception:
+            return inject_rtl(html_input, lang=target_lang) if rtl else html_input
 
 
 async def translate_html_to_ar(html_str: str) -> str:

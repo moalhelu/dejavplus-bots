@@ -15,3 +15,6 @@ pdf_errors.log
 
 .env
 
+# Ignore nested repo (should be separate project/submodule)
+dejavuplus-carfax-bots/
+

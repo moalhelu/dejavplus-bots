@@ -6,6 +6,8 @@ import asyncio
 import re
 from typing import Optional, List
 
+from bot_core.telemetry import atimed
+
 _PDF_PLAYWRIGHT = None
 _PDF_BROWSER = None
 _PDF_BROWSER_LOCK = asyncio.Lock()
@@ -29,8 +31,9 @@ def html_to_pdf_bytes_weasyprint(html_str: str) -> Optional[bytes]:
 
 
 async def html_to_pdf_weasyprint_async(html_str: str) -> Optional[bytes]:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, html_to_pdf_bytes_weasyprint, html_str)
+    async with atimed("pdf.weasyprint", html_len=len(html_str or "")):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, html_to_pdf_bytes_weasyprint, html_str)
 
 
 import traceback
@@ -138,27 +141,28 @@ async def _release_page(page) -> None:
 
 async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Optional[str] = None) -> Optional[bytes]:
     try:
-        async with _PDF_RENDER_SEM:
-            page = await _acquire_page()
-            try:
-                if url:
-                    await page.goto(url, wait_until="networkidle", timeout=60000)
-                elif html_str:
-                    clean = re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)
-                    if "<head" in clean.lower() and "<base" not in clean.lower():
-                        clean = re.sub(r"(?i)<head([^>]*)>", r"<head\1><base href='https://www.carfax.com/'>", clean, count=1)
-                    await page.set_content(clean, wait_until="networkidle", timeout=60000)
-                else:
-                    return None
+        async with atimed("pdf.chromium", html_len=len(html_str or "") if html_str else 0, has_url=bool(url)):
+            async with _PDF_RENDER_SEM:
+                page = await _acquire_page()
+                try:
+                    if url:
+                        await page.goto(url, wait_until="networkidle", timeout=60000)
+                    elif html_str:
+                        clean = re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)
+                        if "<head" in clean.lower() and "<base" not in clean.lower():
+                            clean = re.sub(r"(?i)<head([^>]*)>", r"<head\1><base href='https://www.carfax.com/'>", clean, count=1)
+                        await page.set_content(clean, wait_until="networkidle", timeout=60000)
+                    else:
+                        return None
 
-                pdf_bytes = await page.pdf(
-                    format="A4",
-                    print_background=True,
-                    margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
-                )
-                return pdf_bytes
-            finally:
-                await _release_page(page)
+                    pdf_bytes = await page.pdf(
+                        format="A4",
+                        print_background=True,
+                        margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+                    )
+                    return pdf_bytes
+                finally:
+                    await _release_page(page)
     except Exception as e:
         await _reset_browser()
         with open("pdf_errors.log", "a", encoding="utf-8") as f:

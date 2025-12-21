@@ -52,6 +52,7 @@ from bot_core.storage import (
     refund_credit,
 )
 from bot_core.utils.vin import is_valid_vin, make_progress_bar
+from bot_core.telemetry import atimed, new_rid, set_rid
 
 load_dotenv(override=True)
 
@@ -1375,7 +1376,14 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
 
     LOGGER.info("Sending PDF document to %s (filename=%s)", msisdn, filename)
     try:
-        resp = await client.send_document(msisdn, **payload)
+        async with atimed(
+            "wa.ultramsg.send_document",
+            filename=filename,
+            has_url=bool(url_value),
+            base64_len=len(base64_payload or ""),
+            caption_len=len(caption or ""),
+        ):
+            resp = await client.send_document(msisdn, **payload)
         LOGGER.info("UltraMsg send_document response: %s", resp)
     except Exception as e:
         LOGGER.error("Failed to send document: %s", e, exc_info=True)
@@ -1402,7 +1410,13 @@ async def _relay_image_document(client: UltraMsgClient, msisdn: str, media: Dict
     if media.get("filename"):
         payload["filename"] = media["filename"]
 
-    await client.send_image(msisdn, **payload)
+    async with atimed(
+        "wa.ultramsg.send_image",
+        has_url=bool(url_value),
+        base64_len=len(base64_payload or ""),
+        filename=payload.get("filename"),
+    ):
+        await client.send_image(msisdn, **payload)
 
 
 async def send_whatsapp_text(
@@ -1425,7 +1439,13 @@ async def send_whatsapp_text(
 
     try:
         LOGGER.info("📤 Sending WhatsApp reply to %s", recipient)
-        response = await active_client.send_text(recipient, body, **extra)
+        async with atimed(
+            "wa.ultramsg.send_text",
+            to_len=len(recipient),
+            body_len=len(body or ""),
+            preview_url=bool(preview_url),
+        ):
+            response = await active_client.send_text(recipient, body, **extra)
         LOGGER.debug("UltraMsg send_text response: %s", response)
         return response
     except UltraMsgError:
@@ -1481,10 +1501,13 @@ async def whatsapp_health() -> Dict[str, str]:
 
 async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient, event_type: str) -> None:
     """Wrapper to handle background processing safely."""
-    try:
-        await handle_incoming_whatsapp_message(entry, client, event_type=event_type)
-    except Exception:
-        LOGGER.exception("Background processing failed for WhatsApp message")
+    rid = new_rid("wa-")
+    with set_rid(rid):
+        async with atimed("wa.handle", event_type=event_type or ""):
+            try:
+                await handle_incoming_whatsapp_message(entry, client, event_type=event_type)
+            except Exception:
+                LOGGER.exception("Background processing failed for WhatsApp message")
 
 
 @app.post("/whatsapp/webhook")

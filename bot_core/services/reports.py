@@ -204,6 +204,8 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
         headers["Authorization"] = f"Bearer {token}"
     if prefer_non_pdf:
         headers["Accept"] = "application/json, text/html;q=0.9, */*;q=0.5"
+    else:
+        headers["Accept"] = "application/pdf, application/json;q=0.9, text/html;q=0.8, */*;q=0.5"
     if not api_url:
         return {"ok": False, "error": "API_URL غير مضبوط في .env"}
 

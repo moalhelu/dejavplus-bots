@@ -8,6 +8,22 @@ from typing import Optional, List
 
 from bot_core.telemetry import atimed
 
+
+def _get_pdf_wait_until() -> str:
+    value = (os.getenv("PDF_WAIT_UNTIL", "networkidle") or "").strip().lower()
+    if value in {"load", "domcontentloaded", "networkidle"}:
+        return value
+    return "networkidle"
+
+
+def _get_pdf_timeout_ms() -> int:
+    raw = (os.getenv("PDF_TIMEOUT_MS", "60000") or "").strip()
+    try:
+        timeout_ms = int(raw)
+    except Exception:
+        return 60000
+    return max(1_000, min(timeout_ms, 300_000))
+
 _PDF_PLAYWRIGHT = None
 _PDF_BROWSER = None
 _PDF_BROWSER_LOCK = asyncio.Lock()
@@ -145,13 +161,15 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
             async with _PDF_RENDER_SEM:
                 page = await _acquire_page()
                 try:
+                    wait_until = _get_pdf_wait_until()
+                    timeout_ms = _get_pdf_timeout_ms()
                     if url:
-                        await page.goto(url, wait_until="networkidle", timeout=60000)
+                        await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
                     elif html_str:
                         clean = re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)
                         if "<head" in clean.lower() and "<base" not in clean.lower():
                             clean = re.sub(r"(?i)<head([^>]*)>", r"<head\1><base href='https://www.carfax.com/'>", clean, count=1)
-                        await page.set_content(clean, wait_until="networkidle", timeout=60000)
+                        await page.set_content(clean, wait_until=wait_until, timeout=timeout_ms)
                     else:
                         return None
 

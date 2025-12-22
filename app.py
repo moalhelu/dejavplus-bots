@@ -3363,6 +3363,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not u.get("activation_date"):
                 u["activation_date"] = today.strftime("%Y-%m-%d")
             _audit(u, admin_tg, "monthly_activate", add_days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
+            _remove_pending_request(db, target_tg)
             _save_db(db)
             await _notify_user(
                 context,
@@ -3392,6 +3393,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["expiry_date"] = (today + timedelta(days=days)).strftime("%Y-%m-%d")
             _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _audit(u, admin_tg, "trial_activate", days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
+            _remove_pending_request(db, target_tg)
             _save_db(db)
             await _notify_user(
                 context,
@@ -3419,6 +3421,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["expiry_date"] = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
             _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _audit(u, admin_tg, "enable30", days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
+            _remove_pending_request(db, target_tg)
             _save_db(db)
             await _notify_user(
                 context,
@@ -3461,6 +3464,7 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not u.get("activation_date"):
                 u["activation_date"] = today.strftime("%Y-%m-%d")
             _audit(u, admin_tg, "renew30", add_days=days)
+            _remove_pending_request(db, target_tg)
             _save_db(db)
             await _notify_user(context, target_tg, f"♻️ تم تجديد {days} يوم. الانتهاء: <code>{u['expiry_date']}</code>")
             await _notify_supers(context, f"♻️ (Admin:{admin_tg}) جدد {days}يوم للمستخدم {_fmt_tg_with_phone(target_tg)}.")
@@ -5874,6 +5878,13 @@ async def report_prompt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _users_keyboard(db: Dict[str, Any], page: int = 0, per_page: int = 8, lang: Optional[str] = None) -> InlineKeyboardMarkup:
     lang_code = _normalize_report_lang_code(lang)
     users = list(db.get("users", {}).values())
+    # Hide super-admin accounts from the users list UI.
+    try:
+        super_ids = set(map(str, _env_super_admins())) | set(map(str, _db_super_admins(db)))
+    except Exception:
+        super_ids = set()
+    if super_ids:
+        users = [u for u in users if str(u.get("tg_id") or "") not in super_ids]
     users.sort(
         key=lambda x: (
             not x.get("is_active", False),

@@ -748,7 +748,6 @@ async def check_and_send_auto_notifications(
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🧪 تجربة (1,25,25)", callback_data=f"ucard:trial:{tg_raw}")],
                 [InlineKeyboardButton("🟢 شهري (30,25,500)", callback_data=f"ucard:monthly:{tg_raw}")],
-                [InlineKeyboardButton("♻️ تجديد 30 يوم", callback_data=f"ucard:renew30:{tg_raw}")],
                 [InlineKeyboardButton("🔎 فتح البطاقة", callback_data=f"ucard:open:{tg_raw}")],
             ])
             msg = (

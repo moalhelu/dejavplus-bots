@@ -65,10 +65,10 @@ async def close_http_session() -> None:
 def _rtl_css_block(lang_code: str = "ar") -> str:
     lang = (lang_code or "ar").lower()
     if lang in {"ku", "ckb"}:
-        font_stack = "\"Rabar\",\"Noto Sans Arabic\",\"Noto Sans\",\"Arial\",\"Tahoma\",sans-serif"
+        font_stack = "\"Arial\",\"Tahoma\",sans-serif"
         line_height = "1.9"
     else:
-        font_stack = "\"Amiri\",\"Noto Naskh Arabic\",\"DejaVu Sans\",\"Arial\",\"Tahoma\",sans-serif"
+        font_stack = "\"Arial\",\"Tahoma\",sans-serif"
         line_height = "1.7"
     return (
         "\n<style>\n"

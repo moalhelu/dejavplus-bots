@@ -3650,7 +3650,6 @@ async def _maybe_notify_supers(context: Any, user: Dict[str, Any], platform: Opt
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🧪 تجربة (1,25,25)", callback_data=f"ucard:trial:{tg_id}")],
                 [InlineKeyboardButton("🟢 شهري (30,25,500)", callback_data=f"ucard:monthly:{tg_id}")],
-                [InlineKeyboardButton("♻️ تجديد 30 يوم", callback_data=f"ucard:renew30:{tg_id}")],
                 [InlineKeyboardButton("🔎 فتح البطاقة", callback_data=f"ucard:open:{tg_id}")],
             ])
         except Exception:

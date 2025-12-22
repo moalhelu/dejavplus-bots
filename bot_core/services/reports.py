@@ -46,6 +46,30 @@ def _carfax_parallel_primary_enabled() -> bool:
     return (os.getenv("CARFAX_PARALLEL_PRIMARY", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _prefer_http_fetch_for_en_enabled() -> bool:
+    return (os.getenv("PREFER_HTTP_FETCH_FOR_EN", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _html_looks_renderable(html: str) -> bool:
+    """Heuristic to decide whether a raw HTTP HTML response is worth rendering.
+
+    If it looks incomplete (JS-required splash / too small), we fall back to Playwright URL.
+    """
+
+    if not html:
+        return False
+    low = html.lower()
+    # Very small HTML often means a redirect/splash or JS boot page.
+    if len(html) < 8_000:
+        return False
+    # Common JS-required placeholders.
+    if "enable javascript" in low or "please enable javascript" in low:
+        return False
+    if "checking your browser" in low or "cloudflare" in low and "challenge" in low:
+        return False
+    return True
+
+
 def _t(key: str, lang: str, _fallback: Optional[str] = None, **kwargs: Any) -> str:
     """Lazy translation helper to avoid hardcoded strings."""
 
@@ -405,7 +429,19 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
         else:
             pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
     else:
-        pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
+        # Optional fast path for single-user English: fetch HTML over HTTP and render without Playwright URL.
+        if _prefer_http_fetch_for_en_enabled():
+            try:
+                async with atimed("report.fetch_html", vin=vin, lang=language, mode="http"):
+                    html = await _fetch_page_html(url)
+            except Exception:
+                html = None
+            if html and _html_looks_renderable(html):
+                pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language)
+            else:
+                pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
+        else:
+            pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
 
     if not pdf_bytes and html:
         pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html)

@@ -477,6 +477,18 @@ async def _render_pdf_from_html(html: Optional[str], needs_translation: bool, la
     # Enforce RTL wrapper for Arabic/Kurdish even if translation fell back to original
     if (language or "en").lower() in {"ar", "ku", "ckb"}:
         translated = inject_rtl(translated, lang=language)
+
+    lang_code = (language or "en").lower()
+
+    # For English (no translation), Chromium is typically faster and avoids WeasyPrint
+    # fetching many external assets referenced by the HTML.
+    if lang_code == "en" and not needs_translation:
+        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=translated)
+        if not pdf_bytes:
+            pdf_bytes = await html_to_pdf_weasyprint_async(translated)
+        return pdf_bytes
+
+    # Default: keep WeasyPrint first for translated/RTL paths, with Chromium fallback.
     pdf_bytes = await html_to_pdf_weasyprint_async(translated)
     if not pdf_bytes:
         pdf_bytes = await html_to_pdf_bytes_chromium(html_str=translated)

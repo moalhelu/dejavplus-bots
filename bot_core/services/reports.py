@@ -38,6 +38,13 @@ _HTTP_SESSION_LOCK = asyncio.Lock()
 _CARFAX_SEM = asyncio.Semaphore(15)
 _CARFAX_TIMEOUT = float(os.getenv("CARFAX_HTTP_TIMEOUT", "20") or 20)
 
+_INFLIGHT_REPORTS: Dict[tuple[str, str], asyncio.Task["ReportResult"]] = {}
+_INFLIGHT_LOCK = asyncio.Lock()
+
+
+def _carfax_parallel_primary_enabled() -> bool:
+    return (os.getenv("CARFAX_PARALLEL_PRIMARY", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _t(key: str, lang: str, _fallback: Optional[str] = None, **kwargs: Any) -> str:
     """Lazy translation helper to avoid hardcoded strings."""
@@ -130,6 +137,32 @@ async def generate_vin_report(vin: str, *, language: str = "en") -> ReportResult
     normalized_vin = normalize_vin(vin)
     if not normalized_vin:
         return ReportResult(success=False, user_message=_t("report.invalid_vin", lang_code, "❌ رقم VIN غير صالح."), errors=["invalid_vin"])
+
+    cached_pdf = _pdf_cache_get(normalized_vin, lang_code)
+    if cached_pdf:
+        return cached_pdf
+
+    # Prevent duplicate work for the same VIN+language when multiple requests arrive concurrently.
+    inflight_key = (normalized_vin, lang_code)
+    async with _INFLIGHT_LOCK:
+        existing = _INFLIGHT_REPORTS.get(inflight_key)
+        if existing and not existing.done():
+            return await asyncio.shield(existing)
+
+        task = asyncio.create_task(_generate_vin_report_inner(normalized_vin, lang_code))
+        _INFLIGHT_REPORTS[inflight_key] = task
+
+    try:
+        return await asyncio.shield(task)
+    finally:
+        async with _INFLIGHT_LOCK:
+            cur = _INFLIGHT_REPORTS.get(inflight_key)
+            if cur is task:
+                _INFLIGHT_REPORTS.pop(inflight_key, None)
+
+
+async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> ReportResult:
+    """Inner implementation for generate_vin_report (supports in-flight de-dupe)."""
 
     cached_pdf = _pdf_cache_get(normalized_vin, lang_code)
     if cached_pdf:
@@ -237,23 +270,23 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
         txt = await resp.text()
         return {"ok": True, "text": txt}
 
-    async with _CARFAX_SEM:
+    async def _try_get() -> Optional[Dict[str, Any]]:
         try:
             async with session.get(f"{base}/{vin}", headers=headers) as resp:
                 parsed = await _handle(resp)
-                if parsed.get("ok"):
-                    return parsed
+                return parsed if parsed.get("ok") else None
         except Exception:
-            pass
+            return None
 
+    async def _try_post_vin() -> Optional[Dict[str, Any]]:
         try:
             async with session.post(f"{base}/vin", json=payload, headers=headers) as resp:
                 parsed = await _handle(resp)
-                if parsed.get("ok"):
-                    return parsed
+                return parsed if parsed.get("ok") else None
         except Exception:
-            pass
+            return None
 
+    async def _try_post_base() -> Dict[str, Any]:
         try:
             async with session.post(base, json=payload, headers=headers) as resp:
                 parsed = await _handle(resp)
@@ -262,6 +295,39 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
                 return {"ok": False, "error": f"HTTP {parsed.get('status')}", "detail": parsed.get("err_text", "")}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    async with _CARFAX_SEM:
+        if _carfax_parallel_primary_enabled():
+            tasks = [asyncio.create_task(_try_get()), asyncio.create_task(_try_post_vin())]
+            try:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for d in done:
+                    result = d.result()
+                    if result and result.get("ok"):
+                        for p in pending:
+                            p.cancel()
+                        return result
+                # If first completed was not ok, await the other one too.
+                for p in pending:
+                    try:
+                        other = await p
+                        if other and other.get("ok"):
+                            return other
+                    except Exception:
+                        pass
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+            return await _try_post_base()
+
+        parsed = await _try_get()
+        if parsed:
+            return parsed
+        parsed = await _try_post_vin()
+        if parsed:
+            return parsed
+        return await _try_post_base()
 
 
 def _extract_html_or_url_from_json(data: Any) -> Dict[str, Optional[str]]:

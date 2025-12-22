@@ -15,6 +15,7 @@ import logging
 import os
 import time
 import uuid
+import json
 from contextlib import contextmanager, asynccontextmanager
 from contextvars import ContextVar
 from typing import Any, Dict, Iterator, AsyncIterator, Optional
@@ -71,7 +72,12 @@ def log_timing(event: str, duration_ms: float, **fields: Any) -> None:
     if rid:
         payload["rid"] = rid
     payload.update(_clean_fields(fields))
-    _TIMING_LOGGER.info("timing", extra=payload)
+    # Log JSON so it works with default logging formatters (extra fields are often not shown).
+    try:
+        _TIMING_LOGGER.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        # Worst-case: still emit something
+        _TIMING_LOGGER.info("timing %s", payload)
 
 
 @contextmanager

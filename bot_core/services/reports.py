@@ -441,18 +441,37 @@ def _extract_html_or_url_from_json(data: Any) -> Dict[str, Optional[str]]:
     html: Optional[str] = None
 
     html_tag_re = re.compile(
-        r"<\s*(?:!doctype|html|head|body|div|span|table|tr|td|th|style|script|meta|link|section|article|header|footer|p|h1|h2|h3|img)\b",
+        r"<\s*(?:!doctype|html|head|body|div|span|table|tr|td|th|meta|link|section|article|header|footer|p|h1|h2|h3|img)\b",
         flags=re.I,
     )
     url_re = re.compile(r"https?://[^\s\"'<>]+", flags=re.I)
 
+    def _looks_like_json_text(value: str) -> bool:
+        if not value:
+            return False
+        s = value.strip()
+        # Common JSON starts; we also check for key-value patterns.
+        if s.startswith("{") or s.startswith("["):
+            if re.search(r"\"[^\"]+\"\s*:\s*", s):
+                return True
+        # JSON-ish fragments embedded in larger strings.
+        if re.search(r"\"registry\"\s*:\s*\"", s) and re.search(r"\"attributes\"\s*:\s*\{", s):
+            return True
+        return False
+
     def _looks_like_html(value: str) -> bool:
         if not value:
+            return False
+        if _looks_like_json_text(value):
             return False
         low = value.lower()
         if "<html" in low or "<!doctype" in low:
             return True
-        if "<" in value and ">" in value and html_tag_re.search(value):
+        # Be conservative: accept fragments only when they look like real report markup.
+        # This avoids accidentally treating JSON/config blobs as HTML.
+        if len(value) >= 2000 and "<body" in low and "</" in low and html_tag_re.search(value):
+            return True
+        if len(value) >= 8000 and "<table" in low and "</" in low and html_tag_re.search(value):
             return True
         return False
 
@@ -460,6 +479,8 @@ def _extract_html_or_url_from_json(data: Any) -> Dict[str, Optional[str]]:
         if not value:
             return None
         cur = value.strip()
+        if _looks_like_json_text(cur):
+            return None
         if _looks_like_html(cur):
             return cur
 
@@ -484,6 +505,9 @@ def _extract_html_or_url_from_json(data: Any) -> Dict[str, Optional[str]]:
                     progressed = True
             except Exception:
                 pass
+
+            if _looks_like_json_text(cur):
+                return None
 
             if _looks_like_html(cur):
                 return cur
@@ -669,27 +693,37 @@ async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language
             pdf_bytes = await _render_pdf_from_url(text_payload, needs_translation, language, vin)
         else:
             decoded_html: Optional[str] = None
-            # Some upstreams return HTML as escaped text (e.g. '&lt;div&gt;...') or
-            # unicode-escaped ('\\u003cdiv\\u003e...'). If we wrap that into <pre>
-            # we end up printing raw markup instead of rendering a real report.
-            if text_payload and ("&lt;" in text_payload or "\\u003c" in text_payload or "<" in text_payload):
-                html_tag_re = re.compile(
-                    r"<\s*(?:!doctype|html|head|body|div|span|table|tr|td|th|style|script|meta|link|section|article|header|footer|p|h1|h2|h3|img)\b",
-                    flags=re.I,
-                )
 
-                def _looks_like_html_text(s: str) -> bool:
-                    if not s:
-                        return False
-                    low = s.lower()
-                    if "<html" in low or "<!doctype" in low:
+            def _looks_like_json_text(s: str) -> bool:
+                if not s:
+                    return False
+                t = s.strip()
+                if t.startswith("{") or t.startswith("["):
+                    if re.search(r"\"[^\"]+\"\s*:\s*", t):
                         return True
-                    return "<" in s and ">" in s and bool(html_tag_re.search(s))
+                if re.search(r"\"registry\"\s*:\s*\"", t) and re.search(r"\"attributes\"\s*:\s*\{", t):
+                    return True
+                return False
 
+            def _looks_like_html_text(s: str) -> bool:
+                if not s:
+                    return False
+                if _looks_like_json_text(s):
+                    return False
+                low = s.lower()
+                if "<html" in low or "<!doctype" in low:
+                    return True
+                # Conservative: only accept large fragments that clearly contain body/table markup.
+                if len(s) >= 2000 and "<body" in low and "</" in low and ("<table" in low or "<div" in low):
+                    return True
+                return False
+
+            # Some upstreams return HTML as escaped text (e.g. '&lt;html...') or
+            # unicode-escaped ('\\u003chtml...'). Only treat it as HTML if it
+            # decodes into a real HTML document or a large, clear fragment.
+            if text_payload and ("&lt;" in text_payload or "\\u003c" in text_payload):
                 cur = text_payload.strip()
-                if _looks_like_html_text(cur):
-                    decoded_html = cur
-                else:
+                if not _looks_like_json_text(cur):
                     for _ in range(4):
                         progressed = False
                         if "\\u003c" in cur or "\\u003e" in cur or "\\u00" in cur:
@@ -710,15 +744,14 @@ async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language
                         if _looks_like_html_text(cur):
                             decoded_html = cur
                             break
+                        if _looks_like_json_text(cur):
+                            decoded_html = None
+                            break
                         if not progressed:
                             break
 
             if decoded_html:
-                low = decoded_html.lower().lstrip()
-                if low.startswith("<html") or low.startswith("<!doctype"):
-                    html = decoded_html
-                else:
-                    html = f"<!doctype html><html><head><meta charset='utf-8'></head><body>{decoded_html}</body></html>"
+                html = decoded_html
             else:
                 html = text_payload if text_payload.lower().startswith("<html") else (
                     f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3><pre style='white-space:pre-wrap'>{escape(text_payload)}</pre></body></html>"

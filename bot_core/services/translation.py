@@ -392,8 +392,10 @@ async def translate_html_google_free(html_str: str, target: str = "ar") -> str:
         return ""
 
     async with atimed("translate.html.google_free", target=target_lang, html_len=len(html_input), is_kurdish=is_kurdish):
-        if is_kurdish:
-            html_input = _latin_ku_to_arabic(html_input)
+        # IMPORTANT: do NOT transliterate the whole HTML string for Kurdish.
+        # Doing so corrupts tag/attribute/class names (e.g. <div class=...>),
+        # breaks CSS selectors, and results in "dense text" / many pages.
+        # Kurdish script enforcement is handled safely on text nodes later.
         if target_lang == "en":
             return html_input
 
@@ -639,9 +641,9 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
     if not html_input:
         return ""
     async with atimed("translate.html", target=target_lang, html_len=len(html_input), is_kurdish=is_kurdish):
-        # Convert Latin-script Kurdish to Arabic-script before processing
-        if is_kurdish:
-            html_input = _latin_ku_to_arabic(html_input)
+        # IMPORTANT: do NOT transliterate the whole HTML string for Kurdish.
+        # Doing so corrupts tag/attribute/class names and breaks the report layout.
+        # Kurdish script enforcement is handled on extracted text segments / soup nodes.
         if target_lang == "en":
             return html_input
         rtl = target_lang_raw in RTL_LANGS

@@ -702,6 +702,55 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
             if not translated_segments or len(translated_segments) != len(flat_segments):
                 translated_segments = flat_segments  # fallback to original
 
+            # Arabic-only: if translation is *partial* (some segments remain unchanged and still
+            # contain Latin letters), do a very small, capped Google-free fallback for those
+            # specific segments. This improves coverage without translating everything twice.
+            if target_lang_raw == "ar":
+                try:
+                    unchanged_idx: List[int] = []
+                    for i, (src, out) in enumerate(zip(flat_segments, translated_segments)):
+                        if out != src:
+                            continue
+                        # Only attempt fallback for segments that look like English labels.
+                        if not re.search(r"[A-Za-z]", src):
+                            continue
+                        if len(src.strip()) < 2:
+                            continue
+                        if len(src) > 300:
+                            continue
+                        unchanged_idx.append(i)
+
+                    # Only do fallback when it likely matters (avoid overhead on good translations).
+                    if unchanged_idx and (len(unchanged_idx) / max(1, len(flat_segments))) >= 0.08:
+                        max_items = 160
+                        idx_slice = unchanged_idx[:max_items]
+                        src_slice = [flat_segments[i] for i in idx_slice]
+                        # Deduplicate to save requests.
+                        uniq_map: Dict[str, List[int]] = {}
+                        for pos, s in zip(idx_slice, src_slice):
+                            uniq_map.setdefault(s, []).append(pos)
+                        uniq_texts = list(uniq_map.keys())
+
+                        fallback_timeout = min(1.5, max(0.8, FREE_GOOGLE_TIMEOUT))
+                        fallback_out: List[str] = []
+                        try:
+                            fallback_out = await asyncio.wait_for(
+                                _google_free_batch(uniq_texts, target_lang),
+                                timeout=fallback_timeout,
+                            )
+                        except Exception:
+                            fallback_out = []
+
+                        if fallback_out and len(fallback_out) == len(uniq_texts):
+                            # Apply fallback only when it actually changed the text.
+                            for src_text, tr_text in zip(uniq_texts, fallback_out):
+                                if not tr_text or tr_text == src_text:
+                                    continue
+                                for idx in uniq_map.get(src_text, []):
+                                    translated_segments[idx] = tr_text
+                except Exception:
+                    pass
+
             # Reconstruct per-original
             rebuilt: List[str] = []
             cursor = 0

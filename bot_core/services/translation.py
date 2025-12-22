@@ -73,11 +73,13 @@ def _rtl_css_block(lang_code: str = "ar") -> str:
     return (
         "\n<style>\n"
         "  html, body { direction: rtl; unicode-bidi: isolate-override; }\n"
-        f"  body {{ font-family: {font_stack}; line-height: {line_height}; font-size: 15px; word-break: break-word; }}\n"
+        # Force the RTL font stack even if upstream HTML provides its own CSS.
+        f"  body {{ font-family: {font_stack} !important; line-height: {line_height}; font-size: 15px; word-break: break-word; }}\n"
+        f"  body * {{ font-family: {font_stack} !important; }}\n"
         "  table { direction: rtl; width: 100%; border-collapse: collapse; }\n"
         "  td, th { text-align: right; vertical-align: top; padding: 4px; }\n"
         "  img { max-width: 100%; height: auto; }\n"
-        "  .ltr, .vin, .code { direction: ltr; unicode-bidi: embed; font-family: \"DejaVu Sans Mono\",\"Consolas\",monospace; }\n"
+        "  .ltr, .vin, .code { direction: ltr; unicode-bidi: embed; font-family: \"DejaVu Sans Mono\",\"Consolas\",monospace !important; }\n"
         "</style>\n"
     )
 
@@ -720,8 +722,13 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
                             continue
                         unchanged_idx.append(i)
 
-                    # Only do fallback when it likely matters (avoid overhead on good translations).
-                    if unchanged_idx and (len(unchanged_idx) / max(1, len(flat_segments))) >= 0.08:
+                    # Do fallback when it likely matters, but also cover the common case where only
+                    # a small number of English labels remain (user-visible) without adding much latency.
+                    unchanged_ratio = len(unchanged_idx) / max(1, len(flat_segments))
+                    should_fallback = bool(unchanged_idx) and (
+                        len(unchanged_idx) <= 25 or unchanged_ratio >= 0.08
+                    )
+                    if should_fallback:
                         max_items = 160
                         idx_slice = unchanged_idx[:max_items]
                         src_slice = [flat_segments[i] for i in idx_slice]
@@ -731,7 +738,11 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
                             uniq_map.setdefault(s, []).append(pos)
                         uniq_texts = list(uniq_map.keys())
 
-                        fallback_timeout = min(1.5, max(0.8, FREE_GOOGLE_TIMEOUT))
+                        # Keep this bounded so it doesn't hurt the <10s target.
+                        if len(uniq_texts) <= 20:
+                            fallback_timeout = min(0.9, max(0.6, FREE_GOOGLE_TIMEOUT))
+                        else:
+                            fallback_timeout = min(1.5, max(0.8, FREE_GOOGLE_TIMEOUT))
                         fallback_out: List[str] = []
                         try:
                             fallback_out = await asyncio.wait_for(

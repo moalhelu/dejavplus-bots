@@ -118,21 +118,40 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
         result_url = scraper.search_vin(vin)
         if not result_url:
             return []
-        report_url, report_content = scraper.get_free_report(result_url, vin)
-        if not report_content:
-            return []
-        _, images = scraper.extract_car_data_and_images(report_content, vin)
+        # Fetch the vehicle page HTML (often contains the Sale Record container)
+        vehicle_content: str = ""
+        try:
+            r = scraper.session.get(result_url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 20.0))
+            if getattr(r, "text", None):
+                vehicle_content = r.text
+        except Exception:
+            vehicle_content = ""
+
+        report_content: str = ""
+        try:
+            report_url, report_html = scraper.get_free_report(result_url, vin)
+            report_content = report_html or ""
+        except Exception:
+            report_content = ""
+
+        images: List[str] = []
+        # Prefer report HTML first; fallback to vehicle page.
+        if report_content:
+            _, images = scraper.extract_car_data_and_images(report_content, vin)
+        if not images and vehicle_content:
+            _, images = scraper.extract_car_data_and_images(vehicle_content, vin)
         if not images:
+            LOGGER.info("badvin: no images found vin=%s", vin)
             return []
-        # Badvin typically lists newest sale records first; reverse to favor the oldest record images.
-        oldest_first = list(reversed(images))
         deduped: List[str] = []
-        for url in oldest_first:
+        for url in images:
             if isinstance(url, str) and url.strip() and url.strip().lower().startswith(("http://", "https://")):
                 if url not in deduped:
                     deduped.append(url)
             if len(deduped) >= 20:
                 break
+        if deduped:
+            LOGGER.info("badvin: extracted=%s vin=%s", len(deduped), vin)
         return deduped
     except Exception:
         return []

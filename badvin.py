@@ -424,19 +424,56 @@ class BadvinScraper:
                 if candidates:
                     prepared_records = []
                     for idx, ts, gallery, node in candidates:
-                        photos_local = []
+                        photos_local: list[str] = []
+                        photos_seen: set[str] = set()
+
                         def _push_local(url: str):
                             if not url:
                                 return
                             url = url.strip()
                             full = urljoin(self.base_url, url)
-                            if self.is_car_image(full):
+                            if self.is_car_image(full) and full not in photos_seen:
+                                photos_seen.add(full)
                                 photos_local.append(full)
+
+                        def _extract_urls_from_chunk(html_chunk: str) -> None:
+                            if not html_chunk:
+                                return
+                            # Absolute URLs
+                            for m in re.findall(
+                                r"https?://[^\s\"'<>]+\.(?:jpe?g|png|webp)(?:\?[^\s\"'<>]+)?",
+                                html_chunk,
+                                flags=re.IGNORECASE,
+                            ):
+                                _push_local(m)
+                            # Relative URLs
+                            for m in re.findall(
+                                r"/[^\s\"'<>]+\.(?:jpe?g|png|webp)(?:\?[^\s\"'<>]+)?",
+                                html_chunk,
+                                flags=re.IGNORECASE,
+                            ):
+                                _push_local(m)
                         for a in gallery.find_all("a", href=True):
                             _push_local(a.get("href"))
                         for img in gallery.find_all("img"):
                             _push_local(img.get("src"))
                             _push_local(img.get("data-src"))
+
+                        # Some BadVin galleries keep URLs in styles/scripts (lazy loaders).
+                        for tag in gallery.find_all(True):
+                            style = tag.get("style")
+                            if style and "url(" in style:
+                                _extract_urls_from_chunk(style)
+                            for attr in ("data-src", "data-original", "data-lazy", "data-bg", "data-background"):
+                                val = tag.get(attr)
+                                if val:
+                                    _push_local(val)
+
+                        try:
+                            _extract_urls_from_chunk(str(gallery))
+                        except Exception:
+                            pass
+
                         raw_date = _raw_date(gallery) or _raw_date(node)
                         record_summaries.append((idx, ts, len(photos_local), raw_date))
                         prepared_records.append({"idx": idx, "timestamp": ts, "raw_date": raw_date, "photos": photos_local})

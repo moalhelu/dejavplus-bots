@@ -47,7 +47,9 @@ def _carfax_parallel_primary_enabled() -> bool:
 
 
 def _prefer_http_fetch_for_en_enabled() -> bool:
-    return (os.getenv("PREFER_HTTP_FETCH_FOR_EN", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
+    # Default enabled because it's a safe fast-path: short HTTP timeout, renderability
+    # heuristics, and fallback to Chromium URL rendering.
+    return (os.getenv("PREFER_HTTP_FETCH_FOR_EN", "1") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _html_looks_renderable(html: str) -> bool:

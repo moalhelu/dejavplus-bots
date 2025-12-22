@@ -25,7 +25,9 @@ def _pdf_wait_until_was_explicitly_set() -> bool:
 
 
 def _get_pdf_timeout_ms() -> int:
-    raw = (os.getenv("PDF_TIMEOUT_MS", "60000") or "").strip()
+    # Default lowered to avoid very long stalls when waiting for networkidle.
+    # If the page is "good enough", we still generate a PDF even if wait_until times out.
+    raw = (os.getenv("PDF_TIMEOUT_MS", "30000") or "").strip()
     try:
         timeout_ms = int(raw)
     except Exception:
@@ -363,6 +365,11 @@ async def _release_page(page) -> None:
 
 async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Optional[str] = None) -> Optional[bytes]:
     try:
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
+        except Exception:  # pragma: no cover
+            PlaywrightTimeoutError = Exception  # type: ignore[assignment]
+
         wait_until = _get_pdf_wait_until()
         timeout_ms = _get_pdf_timeout_ms()
         block_types = sorted(_get_pdf_block_resource_types())
@@ -395,7 +402,12 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
                                     return pdf_bytes
                             except Exception:
                                 pass
-                        await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                        try:
+                            await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                        except PlaywrightTimeoutError:
+                            # If we timed out waiting for the chosen load state (often networkidle),
+                            # the DOM may still be sufficiently rendered for printing.
+                            pass
                     elif html_str:
                         clean = re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)
                         if "<head" in clean.lower() and "<base" not in clean.lower():
@@ -412,7 +424,12 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
                                     return pdf_bytes
                             except Exception:
                                 pass
-                        await page.set_content(clean, wait_until=wait_until, timeout=timeout_ms)
+                        try:
+                            await page.set_content(clean, wait_until=wait_until, timeout=timeout_ms)
+                        except PlaywrightTimeoutError:
+                            # Same idea as goto(): don't fail the whole render just because
+                            # a load-state condition didn't settle.
+                            pass
                     else:
                         return None
 
@@ -441,6 +458,11 @@ async def fetch_page_html_chromium(url: str) -> Optional[str]:
     if not url:
         return None
     try:
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
+        except Exception:  # pragma: no cover
+            PlaywrightTimeoutError = Exception  # type: ignore[assignment]
+
         wait_until = _get_pdf_wait_until()
         timeout_ms = _get_pdf_timeout_ms()
         block_types = sorted(_get_pdf_block_resource_types())
@@ -455,7 +477,10 @@ async def fetch_page_html_chromium(url: str) -> Optional[str]:
                 page = await _acquire_page()
                 try:
                     await _ensure_page_configured(page)
-                    await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                    try:
+                        await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                    except PlaywrightTimeoutError:
+                        pass
                     return await page.content()
                 finally:
                     await _release_page(page)

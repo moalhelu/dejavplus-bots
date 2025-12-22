@@ -9,7 +9,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from html import escape
+from html import escape, unescape
 from typing import Any, Dict, List, Optional, cast
 
 import aiohttp
@@ -399,34 +399,64 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
 
 
 def _extract_html_or_url_from_json(data: Any) -> Dict[str, Optional[str]]:
+    """Extract a report URL/HTML from arbitrary JSON-ish structures.
+
+    Some upstream APIs embed the report HTML as an HTML-escaped string (e.g. `&lt;html...`).
+    We detect and unescape that so the PDF renderer sees real HTML (template) instead of
+    a JSON dump.
+    """
+
     url_keys = ("url", "html_url", "report_url", "viewerUrl", "reportLink")
     html_keys = ("html", "htmlContent", "report", "content", "body", "data")
-    url = None
-    html = None
-    if isinstance(data, dict):
-        mapping: Dict[str, Any] = cast(Dict[str, Any], data)
-        for key in url_keys:
-            value = mapping.get(key)
-            if isinstance(value, str) and value.startswith(("http://", "https://")):
-                url = value
-                break
-        if not url:
-            for key in html_keys:
-                value = mapping.get(key)
-                if isinstance(value, str) and ("<html" in value.lower() or "<!doctype" in value.lower()):
-                    html = value
-                    break
-        if not (url or html):
+
+    url: Optional[str] = None
+    html: Optional[str] = None
+
+    def _maybe_decode_html(value: str) -> Optional[str]:
+        if not value:
+            return None
+        low = value.lower()
+        if "<html" in low or "<!doctype" in low:
+            return value
+        if "&lt;html" in low or "&lt;!doctype" in low:
+            decoded = unescape(value)
+            dlow = decoded.lower()
+            if "<html" in dlow or "<!doctype" in dlow:
+                return decoded
+        return None
+
+    def _walk(node: Any) -> None:
+        nonlocal url, html
+        if node is None:
+            return
+        if isinstance(node, dict):
+            mapping: Dict[str, Any] = cast(Dict[str, Any], node)
+            if url is None:
+                for key in url_keys:
+                    value = mapping.get(key)
+                    if isinstance(value, str) and value.startswith(("http://", "https://")):
+                        url = value
+                        break
+            if html is None:
+                for key in html_keys:
+                    value = mapping.get(key)
+                    if isinstance(value, str):
+                        decoded = _maybe_decode_html(value)
+                        if decoded:
+                            html = decoded
+                            break
             for value in mapping.values():
+                if url is not None and html is not None:
+                    return
                 if isinstance(value, (dict, list)):
-                    nested = _extract_html_or_url_from_json(value)
-                    if nested.get("url") or nested.get("html"):
-                        return nested
-    elif isinstance(data, list):
-        for item in cast(List[Any], data):
-            nested = _extract_html_or_url_from_json(item)
-            if nested.get("url") or nested.get("html"):
-                return nested
+                    _walk(value)
+        elif isinstance(node, list):
+            for item in cast(List[Any], node):
+                if url is not None and html is not None:
+                    return
+                _walk(item)
+
+    _walk(data)
     return {"url": url, "html": html}
 
 
@@ -445,7 +475,8 @@ async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language
             if not html:
                 formatted = json.dumps(json_payload, ensure_ascii=False, indent=2)
                 html = f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3><pre style='white-space:pre-wrap'>{escape(formatted)}</pre></body></html>"
-            pdf_bytes = await _render_pdf_from_html(html, needs_translation, language)
+            # If the JSON included embedded HTML but no URL, base_url remains None.
+            pdf_bytes = await _render_pdf_from_html(html, needs_translation, language, base_url=extracted_url)
     elif response.get("text"):
         text_payload = str(response["text"]).strip()
         if text_payload.startswith(("http://", "https://")):

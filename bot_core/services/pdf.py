@@ -5,6 +5,7 @@ import os
 import asyncio
 import re
 import mimetypes
+from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from typing import Optional, List
@@ -46,6 +47,33 @@ def _pdf_fast_first_timeout_ms() -> int:
     except Exception:
         timeout_ms = 12000
     return max(1_000, min(timeout_ms, 60_000))
+
+
+def _pdf_fast_first_wait_until() -> str:
+    value = (os.getenv("PDF_FAST_FIRST_WAIT_UNTIL", "load") or "").strip().lower()
+    if value in {"load", "domcontentloaded", "networkidle"}:
+        return value
+    return "load"
+
+
+def _html_base_url_default() -> str:
+    return (os.getenv("PDF_HTML_BASE_URL", "https://www.carfax.com/") or "https://www.carfax.com/").strip()
+
+
+def _compute_base_href(base_url: Optional[str]) -> str:
+    raw = (base_url or "").strip() or _html_base_url_default()
+    try:
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return _html_base_url_default()
+
+        # Use the directory of the path so relative assets resolve correctly.
+        path = parsed.path or "/"
+        if not path.endswith("/"):
+            path = path.rsplit("/", 1)[0] + "/"
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+    except Exception:
+        return _html_base_url_default()
 
 
 def _pdf_bytes_looks_ok(pdf_bytes: Optional[bytes]) -> bool:
@@ -363,7 +391,12 @@ async def _release_page(page) -> None:
         pass
 
 
-async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Optional[str] = None) -> Optional[bytes]:
+async def html_to_pdf_bytes_chromium(
+    html_str: Optional[str] = None,
+    url: Optional[str] = None,
+    *,
+    base_url: Optional[str] = None,
+) -> Optional[bytes]:
     try:
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
@@ -375,6 +408,7 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
         block_types = sorted(_get_pdf_block_resource_types())
         fast_first = _pdf_fast_first_enabled() and not _pdf_wait_until_was_explicitly_set()
         fast_first_timeout_ms = min(_pdf_fast_first_timeout_ms(), timeout_ms)
+        fast_first_wait_until = _pdf_fast_first_wait_until()
         async with atimed(
             "pdf.chromium",
             html_len=len(html_str or "") if html_str else 0,
@@ -392,7 +426,7 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
                     if url:
                         if fast_first:
                             try:
-                                await page.goto(url, wait_until="domcontentloaded", timeout=fast_first_timeout_ms)
+                                await page.goto(url, wait_until=fast_first_wait_until, timeout=fast_first_timeout_ms)
                                 pdf_bytes = await page.pdf(
                                     format="A4",
                                     print_background=True,
@@ -411,10 +445,16 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
                     elif html_str:
                         clean = re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)
                         if "<head" in clean.lower() and "<base" not in clean.lower():
-                            clean = re.sub(r"(?i)<head([^>]*)>", r"<head\1><base href='https://www.carfax.com/'>", clean, count=1)
+                            base_href = _compute_base_href(base_url)
+                            clean = re.sub(
+                                r"(?i)<head([^>]*)>",
+                                rf"<head\1><base href='{base_href}'>",
+                                clean,
+                                count=1,
+                            )
                         if fast_first:
                             try:
-                                await page.set_content(clean, wait_until="domcontentloaded", timeout=fast_first_timeout_ms)
+                                await page.set_content(clean, wait_until=fast_first_wait_until, timeout=fast_first_timeout_ms)
                                 pdf_bytes = await page.pdf(
                                     format="A4",
                                     print_background=True,

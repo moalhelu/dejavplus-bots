@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, cast
 import aiohttp
 
 from bot_core.config import get_env
-from bot_core.services.pdf import html_to_pdf_bytes_chromium, html_to_pdf_weasyprint_async, fetch_page_html_chromium
+from bot_core.services.pdf import html_to_pdf_bytes_chromium, fetch_page_html_chromium
 from bot_core.services.translation import inject_rtl, translate_html, _latin_ku_to_arabic  # type: ignore
 from bot_core.telemetry import atimed
 
@@ -450,13 +450,25 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
     pdf_bytes = None
 
     if needs_translation:
-        html = await _fetch_page_html(url)
+        # Chromium-only: fetch rendered HTML via Chromium (keeps styling + logo),
+        # translate + inject RTL, then print to PDF.
+        try:
+            html = await fetch_page_html_chromium(url)
+        except Exception:
+            html = None
+        if not html:
+            try:
+                html = await _fetch_page_html_http_only(url)
+            except Exception:
+                html = None
+
         if html:
             html = await _maybe_translate_html(html, language)
-            pdf_bytes = await html_to_pdf_weasyprint_async(html)
-            if not pdf_bytes:
-                pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html)
-        else:
+            if (language or "en").lower() in {"ar", "ku", "ckb"}:
+                html = inject_rtl(html, lang=language)
+                pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html, base_url=url)
+        if not pdf_bytes:
+            # Last-resort: print the original URL without translation.
             pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
     else:
         lang_code = (language or "en").lower()
@@ -473,7 +485,7 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 except Exception:
                     html = None
                 if html and _html_looks_renderable(html):
-                    return await html_to_pdf_bytes_chromium(html_str=html)
+                    return await html_to_pdf_bytes_chromium(html_str=html, base_url=url)
                 return None
 
             async def _url_render() -> Optional[bytes]:
@@ -526,7 +538,7 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 except Exception:
                     html = None
                 if html and _html_looks_renderable(html):
-                    pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html)
+                    pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html, base_url=url)
                     if not pdf_bytes:
                         pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language)
                 else:
@@ -535,14 +547,14 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
 
     if not pdf_bytes and html:
-        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html)
+        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html, base_url=url)
     if not pdf_bytes:
         fallback = (
             f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3>"
             f"<a href='{escape(url)}'>{escape(url)}</a></body></html>"
         )
         fallback = await _maybe_translate_html(fallback, language) if needs_translation else fallback
-        pdf_bytes = await html_to_pdf_weasyprint_async(fallback) or await html_to_pdf_bytes_chromium(html_str=fallback)
+        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=fallback, base_url=url)
     return pdf_bytes
 
 
@@ -553,22 +565,8 @@ async def _render_pdf_from_html(html: Optional[str], needs_translation: bool, la
     # Enforce RTL wrapper for Arabic/Kurdish even if translation fell back to original
     if (language or "en").lower() in {"ar", "ku", "ckb"}:
         translated = inject_rtl(translated, lang=language)
-
-    lang_code = (language or "en").lower()
-
-    # For English (no translation), Chromium is typically faster and avoids WeasyPrint
-    # fetching many external assets referenced by the HTML.
-    if lang_code == "en" and not needs_translation:
-        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=translated)
-        if not pdf_bytes:
-            pdf_bytes = await html_to_pdf_weasyprint_async(translated)
-        return pdf_bytes
-
-    # Default: keep WeasyPrint first for translated/RTL paths, with Chromium fallback.
-    pdf_bytes = await html_to_pdf_weasyprint_async(translated)
-    if not pdf_bytes:
-        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=translated)
-    return pdf_bytes
+    # Chromium-only: WeasyPrint disabled per requirement.
+    return await html_to_pdf_bytes_chromium(html_str=translated)
 
 
 async def _maybe_translate_html(html: Optional[str], lang: str) -> str:

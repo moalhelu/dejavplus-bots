@@ -74,7 +74,6 @@ from bot_core.services.translation import (
 )
 from bot_core.services.pdf import (
     html_to_pdf_bytes_chromium as _html_to_pdf_bytes_chromium,
-    html_to_pdf_weasyprint_async as _html_to_pdf_weasyprint_async,
 )
 from bot_core.services.notifications import (
     check_and_send_auto_notifications,

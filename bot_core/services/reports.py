@@ -444,7 +444,13 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
             except Exception:
                 html = None
             if html and _html_looks_renderable(html):
-                pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language)
+                # IMPORTANT: For English, prefer Chromium for HTML rendering.
+                # WeasyPrint will attempt to fetch many external assets referenced by the HTML
+                # (and can be slow / noisy with warnings). Chromium path is typically faster,
+                # supports our PDF_BLOCK_RESOURCE_TYPES knob, and has a safe fallback.
+                pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html)
+                if not pdf_bytes:
+                    pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language)
             else:
                 pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
         else:

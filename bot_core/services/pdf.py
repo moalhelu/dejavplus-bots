@@ -366,7 +366,7 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
         wait_until = _get_pdf_wait_until()
         timeout_ms = _get_pdf_timeout_ms()
         block_types = sorted(_get_pdf_block_resource_types())
-        fast_first = bool(url) and _pdf_fast_first_enabled() and not _pdf_wait_until_was_explicitly_set()
+        fast_first = _pdf_fast_first_enabled() and not _pdf_wait_until_was_explicitly_set()
         fast_first_timeout_ms = min(_pdf_fast_first_timeout_ms(), timeout_ms)
         async with atimed(
             "pdf.chromium",
@@ -400,6 +400,18 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
                         clean = re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)
                         if "<head" in clean.lower() and "<base" not in clean.lower():
                             clean = re.sub(r"(?i)<head([^>]*)>", r"<head\1><base href='https://www.carfax.com/'>", clean, count=1)
+                        if fast_first:
+                            try:
+                                await page.set_content(clean, wait_until="domcontentloaded", timeout=fast_first_timeout_ms)
+                                pdf_bytes = await page.pdf(
+                                    format="A4",
+                                    print_background=True,
+                                    margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+                                )
+                                if _pdf_bytes_looks_ok(pdf_bytes):
+                                    return pdf_bytes
+                            except Exception:
+                                pass
                         await page.set_content(clean, wait_until=wait_until, timeout=timeout_ms)
                     else:
                         return None

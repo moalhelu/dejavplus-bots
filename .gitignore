@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 
 # Ignore database backups
+db.json
 backups/db-*.json
 
 # Ignore generated PDFs

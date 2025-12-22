@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import aiohttp
-import codecs
 import json
 import os
 import re
@@ -402,180 +401,60 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
 def _extract_html_or_url_from_json(data: Any) -> Dict[str, Optional[str]]:
     """Extract a report URL/HTML from arbitrary JSON-ish structures.
 
-    Root cause of "raw code-like" PDFs:
-    - Upstream sometimes returns the *HTML template* inside JSON as an escaped string
-      (e.g. '&lt;div&gt;...'), or even double-escaped ('&amp;lt;div&amp;gt;...'),
-      or unicode-escaped ('\\u003cdiv\\u003e...').
-    - If we fail to detect that, we fall back to `_json_to_html_report`, which escapes
-      strings and thus prints the markup literally.
-
-    This extractor now:
-    - Decodes escaped HTML (multi-pass)
-    - Scans deeply for the best HTML candidate
-    - Also finds URL strings even when keys don't match our known list
+    Some upstream APIs embed the report HTML as an HTML-escaped string (e.g. `&lt;html...`).
+    We detect and unescape that so the PDF renderer sees real HTML (template) instead of
+    a JSON dump.
     """
 
-    url_keys = (
-        "url",
-        "html_url",
-        "report_url",
-        "viewerUrl",
-        "reportLink",
-        "reportUrl",
-        "viewer_url",
-        "link",
-    )
-    html_keys = (
-        "html",
-        "htmlContent",
-        "report",
-        "reportHtml",
-        "reportHTML",
-        "content",
-        "body",
-        "data",
-        "payload",
-    )
+    url_keys = ("url", "html_url", "report_url", "viewerUrl", "reportLink")
+    html_keys = ("html", "htmlContent", "report", "content", "body", "data")
 
     url: Optional[str] = None
     html: Optional[str] = None
 
-    html_tag_re = re.compile(
-        r"<\s*(?:!doctype|html|head|body|div|span|table|tr|td|th|style|script|meta|link|section|article|header|footer|p|h1|h2|h3|img)\b",
-        flags=re.I,
-    )
-    url_re = re.compile(r"https?://[^\s\"'<>]+", flags=re.I)
-
-    def _looks_like_html(value: str) -> bool:
-        if not value:
-            return False
-        low = value.lower()
-        if "<html" in low or "<!doctype" in low:
-            return True
-        if "<" in value and ">" in value and html_tag_re.search(value):
-            return True
-        return False
-
-    def _decode_embedded_html(value: str) -> Optional[str]:
+    def _maybe_decode_html(value: str) -> Optional[str]:
         if not value:
             return None
-        cur = value.strip()
-        if _looks_like_html(cur):
-            return cur
-
-        for _ in range(4):
-            progressed = False
-
-            # Decode unicode-escape sequences that appear literally (e.g. '\\u003c').
-            if "\\u003c" in cur or "\\u003e" in cur or "\\u00" in cur:
-                try:
-                    decoded = codecs.decode(cur, "unicode_escape")
-                    if decoded != cur:
-                        cur = decoded
-                        progressed = True
-                except Exception:
-                    pass
-
-            # Decode HTML entities (handles '&lt;' and double-escaped '&amp;lt;').
-            try:
-                decoded2 = unescape(cur)
-                if decoded2 != cur:
-                    cur = decoded2
-                    progressed = True
-            except Exception:
-                pass
-
-            if _looks_like_html(cur):
-                return cur
-            if not progressed:
-                break
+        low = value.lower()
+        if "<html" in low or "<!doctype" in low:
+            return value
+        if "&lt;html" in low or "&lt;!doctype" in low:
+            decoded = unescape(value)
+            dlow = decoded.lower()
+            if "<html" in dlow or "<!doctype" in dlow:
+                return decoded
         return None
 
-    def _score_html(candidate: str) -> int:
-        if not candidate:
-            return 0
-        low = candidate.lower()
-        score = len(candidate)
-        if "<html" in low or "<!doctype" in low:
-            score += 5000
-        score += min(4000, candidate.count("<") * 20)
-        return score
-
-    def _walk(node: Any, depth: int = 0) -> None:
+    def _walk(node: Any) -> None:
         nonlocal url, html
-        if node is None or depth > 14:
+        if node is None:
             return
-
         if isinstance(node, dict):
             mapping: Dict[str, Any] = cast(Dict[str, Any], node)
-
             if url is None:
                 for key in url_keys:
-                    v = mapping.get(key)
-                    if isinstance(v, str) and v.startswith(("http://", "https://")):
-                        url = v
+                    value = mapping.get(key)
+                    if isinstance(value, str) and value.startswith(("http://", "https://")):
+                        url = value
                         break
-
             if html is None:
                 for key in html_keys:
-                    v = mapping.get(key)
-                    if isinstance(v, str):
-                        decoded = _decode_embedded_html(v)
+                    value = mapping.get(key)
+                    if isinstance(value, str):
+                        decoded = _maybe_decode_html(value)
                         if decoded:
                             html = decoded
                             break
-
-            # Generic URL scan
-            if url is None:
-                for v in mapping.values():
-                    if isinstance(v, str):
-                        m = url_re.search(v)
-                        if m:
-                            url = m.group(0)
-                            break
-
-            # Best HTML scan: choose the largest/most-likely HTML string
-            if html is None:
-                best_score = 0
-                best_html: Optional[str] = None
-                for v in mapping.values():
-                    if isinstance(v, str):
-                        decoded = _decode_embedded_html(v)
-                        if decoded:
-                            s = _score_html(decoded)
-                            if s > best_score:
-                                best_score = s
-                                best_html = decoded
-                    elif isinstance(v, (dict, list)):
-                        _walk(v, depth + 1)
-                        if html is not None:
-                            break
-                if html is None and best_html is not None:
-                    html = best_html
-                    return
-
-            for v in mapping.values():
+            for value in mapping.values():
                 if url is not None and html is not None:
                     return
-                if isinstance(v, (dict, list)):
-                    _walk(v, depth + 1)
-
+                if isinstance(value, (dict, list)):
+                    _walk(value)
         elif isinstance(node, list):
             for item in cast(List[Any], node):
                 if url is not None and html is not None:
                     return
-                if isinstance(item, str):
-                    if url is None:
-                        m = url_re.search(item)
-                        if m:
-                            url = m.group(0)
-                    if html is None:
-                        decoded = _decode_embedded_html(item)
-                        if decoded:
-                            html = decoded
-                            return
-                elif isinstance(item, (dict, list)):
-                    _walk(item, depth + 1)
+                _walk(item)
 
     _walk(data)
     return {"url": url, "html": html}
@@ -668,61 +547,9 @@ async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language
         if text_payload.startswith(("http://", "https://")):
             pdf_bytes = await _render_pdf_from_url(text_payload, needs_translation, language, vin)
         else:
-            decoded_html: Optional[str] = None
-            # Some upstreams return HTML as escaped text (e.g. '&lt;div&gt;...') or
-            # unicode-escaped ('\\u003cdiv\\u003e...'). If we wrap that into <pre>
-            # we end up printing raw markup instead of rendering a real report.
-            if text_payload and ("&lt;" in text_payload or "\\u003c" in text_payload or "<" in text_payload):
-                html_tag_re = re.compile(
-                    r"<\s*(?:!doctype|html|head|body|div|span|table|tr|td|th|style|script|meta|link|section|article|header|footer|p|h1|h2|h3|img)\b",
-                    flags=re.I,
-                )
-
-                def _looks_like_html_text(s: str) -> bool:
-                    if not s:
-                        return False
-                    low = s.lower()
-                    if "<html" in low or "<!doctype" in low:
-                        return True
-                    return "<" in s and ">" in s and bool(html_tag_re.search(s))
-
-                cur = text_payload.strip()
-                if _looks_like_html_text(cur):
-                    decoded_html = cur
-                else:
-                    for _ in range(4):
-                        progressed = False
-                        if "\\u003c" in cur or "\\u003e" in cur or "\\u00" in cur:
-                            try:
-                                uni = codecs.decode(cur, "unicode_escape")
-                                if uni != cur:
-                                    cur = uni
-                                    progressed = True
-                            except Exception:
-                                pass
-                        try:
-                            ent = unescape(cur)
-                            if ent != cur:
-                                cur = ent
-                                progressed = True
-                        except Exception:
-                            pass
-                        if _looks_like_html_text(cur):
-                            decoded_html = cur
-                            break
-                        if not progressed:
-                            break
-
-            if decoded_html:
-                low = decoded_html.lower().lstrip()
-                if low.startswith("<html") or low.startswith("<!doctype"):
-                    html = decoded_html
-                else:
-                    html = f"<!doctype html><html><head><meta charset='utf-8'></head><body>{decoded_html}</body></html>"
-            else:
-                html = text_payload if text_payload.lower().startswith("<html") else (
-                    f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3><pre style='white-space:pre-wrap'>{escape(text_payload)}</pre></body></html>"
-                )
+            html = text_payload if text_payload.lower().startswith("<html") else (
+                f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3><pre style='white-space:pre-wrap'>{escape(text_payload)}</pre></body></html>"
+            )
             pdf_bytes = await _render_pdf_from_html(html, needs_translation, language)
 
     return pdf_bytes

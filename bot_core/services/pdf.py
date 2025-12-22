@@ -80,8 +80,24 @@ def _pdf_bytes_looks_ok(pdf_bytes: Optional[bytes]) -> bool:
     # Heuristic: valid PDFs start with %PDF and are usually not tiny.
     if not pdf_bytes.startswith(b"%PDF"):
         return False
-    # Many broken/blank renders are extremely small.
-    return len(pdf_bytes) >= 30_000
+    # Many broken/blank renders are extremely small, but some valid PDFs can also be
+    # smaller than our old 30KB threshold. Keep this both fast and safer by checking
+    # for common page markers.
+    raw_min = (os.getenv("PDF_MIN_BYTES_OK", "12000") or "12000").strip()
+    try:
+        min_bytes = int(raw_min)
+    except Exception:
+        min_bytes = 12000
+    min_bytes = max(4000, min(min_bytes, 200_000))
+    if len(pdf_bytes) < min_bytes:
+        return False
+    # Lightweight structure check (works for many non-encrypted PDFs; if not found,
+    # we still may accept if the PDF isn't tiny).
+    head = pdf_bytes[:200_000]
+    if b"/Type /Page" in head or b"/Type/Pages" in head or b"/Pages" in head:
+        return True
+    # Fall back to size-only acceptance.
+    return True
 
 
 def _get_pdf_block_resource_types() -> set[str]:

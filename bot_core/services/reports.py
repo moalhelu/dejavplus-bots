@@ -78,7 +78,18 @@ def _pdf_bytes_looks_ok(pdf_bytes: Optional[bytes]) -> bool:
         return False
     if not pdf_bytes.startswith(b"%PDF"):
         return False
-    return len(pdf_bytes) >= 30_000
+    raw_min = (os.getenv("PDF_MIN_BYTES_OK", "12000") or "12000").strip()
+    try:
+        min_bytes = int(raw_min)
+    except Exception:
+        min_bytes = 12000
+    min_bytes = max(4000, min(min_bytes, 200_000))
+    if len(pdf_bytes) < min_bytes:
+        return False
+    head = pdf_bytes[:200_000]
+    if b"/Type /Page" in head or b"/Type/Pages" in head or b"/Pages" in head:
+        return True
+    return True
 
 
 def _en_hedged_render_enabled() -> bool:

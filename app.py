@@ -61,6 +61,7 @@ from bot_core.storage import (
 )
 from bot_core.services.images import (
     get_badvin_images as _get_badvin_images,
+    get_badvin_images_media as _get_badvin_images_media,
     get_apicar_current_images as _get_apicar_current_images,
     get_apicar_history_images as _get_apicar_history_images,
     get_apicar_accident_images as _get_apicar_accident_images,
@@ -5327,32 +5328,103 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     send_timeout = float(os.getenv("TELEGRAM_PHOTOS_SEND_TIMEOUT", "15") or 15.0)
     max_photos = max(1, min(10, int(os.getenv("TELEGRAM_PHOTOS_MAX", "10") or 10)))
 
-    try:
-        if action == "accident":
-            logger.info("telegram: fetching accident images via apicar vin=%s", vin)
-        urls = await asyncio.wait_for(info["loader"](vin), timeout=loader_timeout)
-    except asyncio.TimeoutError:
-        err_msg = _accident_error(user_lang) if action == "accident" else info["empty"]
-        if not await _status_update(err_msg):
+    # BadVin images are frequently protected behind cookies; fetch bytes via authenticated session.
+    if action == "badvin":
+        try:
+            media_items = await asyncio.wait_for(
+                _get_badvin_images_media(vin, limit=max_photos),
+                timeout=max(loader_timeout, 20.0),
+            )
+        except Exception:
+            media_items = []
+
+        if not media_items:
+            no_images_msg = info["empty"]
+            if not await _status_update(no_images_msg):
+                try:
+                    await asyncio.wait_for(
+                        context.bot.send_message(chat_id=chat_id, text=no_images_msg, parse_mode=ParseMode.HTML),
+                        timeout=status_timeout,
+                    )
+                except Exception:
+                    pass
+            return
+
+        sent_any = False
+        # Telegram media-group max is 10.
+        for i in range(0, len(media_items), 10):
+            chunk = media_items[i : i + 10]
+            media: List[InputMediaPhoto] = []
+            for filename, data in chunk:
+                bio = BytesIO(data)
+                bio.name = filename or "photo.jpg"
+                media.append(InputMediaPhoto(bio))
+            if not media:
+                continue
             try:
-                await asyncio.wait_for(
-                    context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode=ParseMode.HTML),
-                    timeout=status_timeout,
-                )
+                for attempt in range(3):
+                    try:
+                        await asyncio.wait_for(
+                            context.bot.send_media_group(chat_id=chat_id, media=media),
+                            timeout=send_timeout,
+                        )
+                        sent_any = True
+                        break
+                    except Exception:
+                        await asyncio.sleep(0.6 * (attempt + 1))
             except Exception:
                 pass
-        return
-    except Exception:
-        err_msg = _accident_error(user_lang) if action == "accident" else info["empty"]
-        if not await _status_update(err_msg):
-            try:
-                await asyncio.wait_for(
-                    context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode=ParseMode.HTML),
-                    timeout=status_timeout,
-                )
-            except Exception:
-                pass
-        return
+
+            if not sent_any:
+                # Fallback: send individually.
+                for item in media:
+                    try:
+                        await asyncio.wait_for(
+                            context.bot.send_photo(chat_id=chat_id, photo=item.media),
+                            timeout=send_timeout,
+                        )
+                        sent_any = True
+                    except Exception:
+                        continue
+
+        if not sent_any:
+            fail_msg = _bridge.t("report.photos.error", user_lang)
+            if not await _status_update(fail_msg):
+                try:
+                    await asyncio.wait_for(
+                        context.bot.send_message(chat_id=chat_id, text=fail_msg, parse_mode=ParseMode.HTML),
+                        timeout=status_timeout,
+                    )
+                except Exception:
+                    pass
+            return
+    else:
+        try:
+            if action == "accident":
+                logger.info("telegram: fetching accident images via apicar vin=%s", vin)
+            urls = await asyncio.wait_for(info["loader"](vin), timeout=loader_timeout)
+        except asyncio.TimeoutError:
+            err_msg = _accident_error(user_lang) if action == "accident" else info["empty"]
+            if not await _status_update(err_msg):
+                try:
+                    await asyncio.wait_for(
+                        context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode=ParseMode.HTML),
+                        timeout=status_timeout,
+                    )
+                except Exception:
+                    pass
+            return
+        except Exception:
+            err_msg = _accident_error(user_lang) if action == "accident" else info["empty"]
+            if not await _status_update(err_msg):
+                try:
+                    await asyncio.wait_for(
+                        context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode=ParseMode.HTML),
+                        timeout=status_timeout,
+                    )
+                except Exception:
+                    pass
+            return
 
     urls = _select_images(urls)
     if not urls:

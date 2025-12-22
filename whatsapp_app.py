@@ -35,6 +35,7 @@ from bot_core.clients.ultramsg import UltraMsgClient, UltraMsgCredentials, Ultra
 from bot_core.config import get_report_default_lang, get_ultramsg_settings, is_super_admin
 from bot_core.services.images import (
     get_badvin_images,
+    get_badvin_images_media,
     get_apicar_current_images,
     get_apicar_history_images,
     get_apicar_accident_images,
@@ -761,6 +762,71 @@ async def _send_photo_batch(
     return {"status": "ok", "images": 0, "failed": len(failed_urls) or len(cleaned)}
 
 
+async def _send_photo_batch_media(
+    msisdn: str,
+    user_ctx: _bridge.UserContext,
+    vin: str,
+    media_items: List[tuple[str, bytes]],
+    client: UltraMsgClient,
+    *,
+    choice: str,
+) -> Dict[str, Any]:
+    cleaned = media_items[:10]
+    LOGGER.info(
+        "whatsapp: photos(media) fetched choice=%s vin=%s total=%s",
+        choice,
+        vin,
+        len(cleaned),
+    )
+
+    if not cleaned:
+        await send_whatsapp_text(
+            msisdn,
+            _photo_no_images_message(user_ctx.language, choice),
+            client=client,
+        )
+        await _send_report_options_prompt(msisdn, client, vin)
+        return {"status": "ok", "images": 0, "empty": True}
+
+    sent = 0
+    for filename, data in cleaned:
+        payload: Dict[str, Any] = {}
+
+        async def _retry(coro_factory, *, attempts: int = 3, base_sleep: float = 0.6):
+            last_exc: Optional[Exception] = None
+            for attempt in range(attempts):
+                try:
+                    return await coro_factory()
+                except Exception as exc:  # pragma: no cover
+                    last_exc = exc
+                    await asyncio.sleep(base_sleep * (attempt + 1))
+            if last_exc:
+                raise last_exc
+
+        try:
+            b64 = base64.b64encode(data).decode("ascii")
+            await _retry(lambda: client.send_image(msisdn, image_base64=b64, filename=(filename or None), **payload))
+            sent += 1
+        except Exception as exc:  # pragma: no cover
+            LOGGER.warning(
+                "whatsapp: failed to send badvin image_base64 vin=%s choice=%s file=%s error=%s",
+                vin,
+                choice,
+                filename,
+                exc,
+            )
+        await asyncio.sleep(0.15)
+
+    if sent > 0:
+        await send_whatsapp_text(msisdn, _bridge.t("wa.photos.sent_count", user_ctx.language, count=sent), client=client)
+        await _send_report_options_prompt(msisdn, client, vin)
+        return {"status": "ok", "images": sent}
+
+    await send_whatsapp_text(msisdn, _photo_send_error_message(user_ctx.language), client=client)
+    await _send_report_options_prompt(msisdn, client, vin)
+    return {"status": "ok", "images": 0}
+
+
 async def _handle_report_option_choice(
     msisdn: str,
     user_ctx: _bridge.UserContext,
@@ -770,9 +836,20 @@ async def _handle_report_option_choice(
 ) -> Dict[str, Any]:
     """Fetch and send the chosen photo bundle (badvin/accident/auction)."""
 
+    if choice == "wa_opt_badvin":
+        LOGGER.info("whatsapp: report photos choice=%s vin=%s user=%s", choice, vin, user_ctx.user_id)
+        await send_whatsapp_text(msisdn, _bridge.t("wa.photos.fetching", user_ctx.language, vin=vin), client=client)
+        try:
+            media_items = await get_badvin_images_media(vin, limit=10)
+        except Exception as exc:  # pragma: no cover
+            LOGGER.warning("Failed to fetch badvin media vin=%s: %s", vin, exc)
+            await send_whatsapp_text(msisdn, _photo_fetch_error_message(user_ctx.language, choice), client=client)
+            await _send_report_options_prompt(msisdn, client, vin)
+            return {"status": "error", "reason": "fetch_failed"}
+        return await _send_photo_batch_media(msisdn, user_ctx, vin, media_items or [], client, choice=choice)
+
     fetchers = {
         "wa_opt_accident": get_apicar_accident_images,
-        "wa_opt_badvin": get_badvin_images,
     }
     fetcher = fetchers.get(choice)
     if not fetcher:

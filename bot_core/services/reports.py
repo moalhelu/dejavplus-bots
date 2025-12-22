@@ -460,6 +460,72 @@ def _extract_html_or_url_from_json(data: Any) -> Dict[str, Optional[str]]:
     return {"url": url, "html": html}
 
 
+def _json_to_html_report(payload: Any, vin: str) -> str:
+    """Render JSON-ish payload into a readable HTML report.
+
+    This is used only when the upstream API returns JSON without a report URL/HTML.
+    It's intentionally simple and stable so it prints well to PDF.
+    """
+
+    def _is_primitive(value: Any) -> bool:
+        return value is None or isinstance(value, (str, int, float, bool))
+
+    def _render_primitive(value: Any) -> str:
+        if value is None:
+            return "<em>null</em>"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return escape(str(value))
+        text = str(value)
+        low = text.lower().strip()
+        if low.startswith(("http://", "https://")):
+            safe = escape(text)
+            return f"<a href='{safe}'>{safe}</a>"
+        if len(text) > 200:
+            return f"<div style='white-space:pre-wrap'>{escape(text)}</div>"
+        return escape(text)
+
+    def _render(value: Any, depth: int = 0) -> str:
+        if _is_primitive(value):
+            return _render_primitive(value)
+        if isinstance(value, list):
+            if not value:
+                return "<em>[]</em>"
+            items = "".join(f"<li>{_render(v, depth + 1)}</li>" for v in value)
+            return f"<ol style='margin:0; padding-inline-start: 1.2em'>{items}</ol>"
+        if isinstance(value, dict):
+            if not value:
+                return "<em>{{}}</em>"
+            rows = []
+            for k, v in cast(Dict[str, Any], value).items():
+                key = escape(str(k))
+                rows.append(
+                    "<tr>"
+                    f"<th style='text-align:start; vertical-align:top; padding:6px; border:1px solid #ddd; width:28%'>{key}</th>"
+                    f"<td style='vertical-align:top; padding:6px; border:1px solid #ddd'>{_render(v, depth + 1)}</td>"
+                    "</tr>"
+                )
+            body = "".join(rows)
+            return (
+                "<table style='width:100%; border-collapse:collapse; table-layout:fixed'>"
+                f"<tbody>{body}</tbody></table>"
+            )
+        return _render_primitive(str(value))
+
+    content = _render(payload)
+    return (
+        "<html><head><meta charset='utf-8'>"
+        "<style>"
+        "body{font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.5}"
+        "h3{margin:0 0 10px 0}"
+        "table{word-break:break-word}"
+        "</style>"
+        "</head>"
+        f"<body><h3>CarFax – {escape(vin)}</h3>{content}</body></html>"
+    )
+
+
 async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language: str) -> Optional[bytes]:
     pdf_bytes: Optional[bytes] = None
     needs_translation = _needs_translation(language)
@@ -473,8 +539,7 @@ async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language
         else:
             html = extracted.get("html")
             if not html:
-                formatted = json.dumps(json_payload, ensure_ascii=False, indent=2)
-                html = f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3><pre style='white-space:pre-wrap'>{escape(formatted)}</pre></body></html>"
+                html = _json_to_html_report(json_payload, vin)
             # If the JSON included embedded HTML but no URL, base_url remains None.
             pdf_bytes = await _render_pdf_from_html(html, needs_translation, language, base_url=extracted_url)
     elif response.get("text"):

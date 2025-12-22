@@ -1491,10 +1491,16 @@ def _render_usercard_text(u: Dict[str, Any], lang: Optional[str] = None) -> str:
 # =================== Carfax API ===================
 
 async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, stop_event: asyncio.Event):
-    p = 0
     try:
-        while not stop_event.is_set():
-            p = min(99, p + 3)
+        # Deterministic 10-second progress (0% -> 100%), updating 10% per second.
+        # The initial message is sent at 0% by the caller.
+        for p in range(10, 101, 10):
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+
             bar = _make_progress_bar(p)
             try:
                 await context.bot.edit_message_text(
@@ -1518,7 +1524,6 @@ async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, me
                     )
                 except Exception:
                     pass
-            await asyncio.sleep(0.8)
     finally:
         # Nothing to return; the loop exits naturally once stop_event is set.
         pass

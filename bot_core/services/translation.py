@@ -21,6 +21,23 @@ ARABIC_INDIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 ARABIC_INDIC_DIGITS = False  # forced off per user request
 KURDISH_LANGS = {"ku", "ckb"}
 RTL_LANGS = {"ar", "ku", "ckb"}
+
+
+def _lang_family(lang_code: str) -> str:
+    """Return the primary language subtag (e.g., 'ar-IQ' -> 'ar')."""
+
+    lc = (lang_code or "").strip().lower()
+    if not lc:
+        return ""
+    return re.split(r"[-_]", lc, maxsplit=1)[0]
+
+
+def _is_rtl_lang(lang_code: str) -> bool:
+    return _lang_family(lang_code) in RTL_LANGS
+
+
+def _is_kurdish_lang(lang_code: str) -> bool:
+    return _lang_family(lang_code) in KURDISH_LANGS
 # Budget targets (seconds) — tightened to fail fast and fall back quicker for non-English
 TRANSLATE_TOTAL_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_TOTAL_TIMEOUT", "6") or 6)
 PROVIDER_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_PROVIDER_TIMEOUT", "1.5") or 1.5)
@@ -63,16 +80,15 @@ async def close_http_session() -> None:
 
 
 def _rtl_css_block(lang_code: str = "ar") -> str:
-    lang = (lang_code or "ar").lower()
-    if lang in {"ku", "ckb"}:
-        font_stack = "\"Arial\",\"Tahoma\",sans-serif"
-        line_height = "1.9"
-    else:
-        font_stack = "\"Arial\",\"Tahoma\",sans-serif"
-        line_height = "1.7"
+    lang = _lang_family(lang_code or "ar")
+    # Use a local-only font stack. If 'Omar Athkar' is installed on the host,
+    # Chromium will pick it instantly; otherwise it falls back without delay.
+    font_stack = "\"Omar Athkar\",\"Arial\",\"Tahoma\",sans-serif"
+    line_height = "1.9" if lang in {"ku", "ckb"} else "1.7"
     return (
         "\n<style>\n"
-        "  html, body { direction: rtl; unicode-bidi: isolate-override; }\n"
+        "  @font-face { font-family: \"Omar Athkar\"; src: local(\"Omar Athkar\"), local(\"OmarAthkar\"); font-display: swap; }\n"
+        "  html, body { direction: rtl !important; unicode-bidi: isolate-override; }\n"
         # Force the RTL font stack even if upstream HTML provides its own CSS.
         f"  body {{ font-family: {font_stack} !important; line-height: {line_height}; font-size: 15px; word-break: break-word; }}\n"
         f"  body * {{ font-family: {font_stack} !important; }}\n"
@@ -85,8 +101,9 @@ def _rtl_css_block(lang_code: str = "ar") -> str:
 
 
 def inject_rtl(html_str: str, lang: str = "ar") -> str:
-    lang_code = (lang or "ar").lower()
-    if lang_code not in RTL_LANGS:
+    lang_code_raw = (lang or "ar").lower()
+    lang_code = _lang_family(lang_code_raw) or "ar"
+    if not _is_rtl_lang(lang_code_raw):
         return html_str or ""
     try:
         html = html_str or ""
@@ -159,13 +176,13 @@ def _apply_kurdish_arabic_to_soup(soup: Any) -> None:
 
 def _normalize_target(target: str) -> str:
     t = (target or "ar").lower()
-    if t in KURDISH_LANGS:
+    if _is_kurdish_lang(t):
         return KU_TARGET
     return t
 
 
 def _preprocess_kurdish_texts(texts: list[str], target: str) -> list[str]:
-    if (target or "").lower() not in KURDISH_LANGS:
+    if not _is_kurdish_lang((target or "").lower()):
         return texts
     return [_latin_ku_to_arabic(t) for t in texts]
 
@@ -388,7 +405,7 @@ async def translate_html_google_free(html_str: str, target: str = "ar") -> str:
 
     target_lang_raw = (target or "en").lower()
     target_lang = _normalize_target(target_lang_raw)
-    is_kurdish = target_lang_raw in KURDISH_LANGS
+    is_kurdish = _is_kurdish_lang(target_lang_raw)
     html_input = html_str or ""
     if not html_input:
         return ""
@@ -401,7 +418,7 @@ async def translate_html_google_free(html_str: str, target: str = "ar") -> str:
         if target_lang == "en":
             return html_input
 
-        rtl = target_lang_raw in RTL_LANGS
+        rtl = _is_rtl_lang(target_lang_raw)
         if BeautifulSoup is None:
             return inject_rtl(html_input, lang=target_lang) if rtl else html_input
 
@@ -523,7 +540,7 @@ async def translate_batch(texts: List[str], target: str = "ar") -> List[str]:
     cfg = get_env()
     defaults = cfg.translator_defaults
     target_lang = _normalize_target(target)
-    is_kurdish = (target or "").lower() in KURDISH_LANGS or target_lang in {"ku", KU_TARGET}
+    is_kurdish = _is_kurdish_lang((target or "").lower()) or target_lang in {"ku", KU_TARGET}
     texts = _preprocess_kurdish_texts(texts, target)
 
     async with atimed("translate.batch", target=target_lang, n=len(texts), is_kurdish=is_kurdish):
@@ -638,7 +655,7 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
 
     target_lang_raw = (target or "en").lower()
     target_lang = _normalize_target(target_lang_raw)
-    is_kurdish = target_lang_raw in KURDISH_LANGS
+    is_kurdish = _is_kurdish_lang(target_lang_raw)
     html_input = html_str or ""
     if not html_input:
         return ""
@@ -648,7 +665,7 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
         # Kurdish script enforcement is handled on extracted text segments / soup nodes.
         if target_lang == "en":
             return html_input
-        rtl = target_lang_raw in RTL_LANGS
+        rtl = _is_rtl_lang(target_lang_raw)
         if BeautifulSoup is None:
             return inject_rtl(html_input, lang=target_lang) if rtl else html_input
 

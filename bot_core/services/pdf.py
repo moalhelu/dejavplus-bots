@@ -16,6 +16,11 @@ def _get_pdf_wait_until() -> str:
     return "networkidle"
 
 
+def _pdf_wait_until_was_explicitly_set() -> bool:
+    # If user explicitly set PDF_WAIT_UNTIL, we should not override it.
+    return os.getenv("PDF_WAIT_UNTIL") is not None
+
+
 def _get_pdf_timeout_ms() -> int:
     raw = (os.getenv("PDF_TIMEOUT_MS", "60000") or "").strip()
     try:
@@ -23,6 +28,29 @@ def _get_pdf_timeout_ms() -> int:
     except Exception:
         return 60000
     return max(1_000, min(timeout_ms, 300_000))
+
+
+def _pdf_fast_first_enabled() -> bool:
+    return (os.getenv("PDF_FAST_FIRST", "1") or "").strip().lower() not in {"0", "false", "off"}
+
+
+def _pdf_fast_first_timeout_ms() -> int:
+    raw = (os.getenv("PDF_FAST_FIRST_TIMEOUT_MS", "12000") or "").strip()
+    try:
+        timeout_ms = int(raw)
+    except Exception:
+        timeout_ms = 12000
+    return max(1_000, min(timeout_ms, 60_000))
+
+
+def _pdf_bytes_looks_ok(pdf_bytes: Optional[bytes]) -> bool:
+    if not pdf_bytes:
+        return False
+    # Heuristic: valid PDFs start with %PDF and are usually not tiny.
+    if not pdf_bytes.startswith(b"%PDF"):
+        return False
+    # Many broken/blank renders are extremely small.
+    return len(pdf_bytes) >= 30_000
 
 
 def _get_pdf_block_resource_types() -> set[str]:
@@ -270,6 +298,8 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
         wait_until = _get_pdf_wait_until()
         timeout_ms = _get_pdf_timeout_ms()
         block_types = sorted(_get_pdf_block_resource_types())
+        fast_first = bool(url) and _pdf_fast_first_enabled() and not _pdf_wait_until_was_explicitly_set()
+        fast_first_timeout_ms = min(_pdf_fast_first_timeout_ms(), timeout_ms)
         async with atimed(
             "pdf.chromium",
             html_len=len(html_str or "") if html_str else 0,
@@ -277,12 +307,26 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
             wait_until=wait_until,
             timeout_ms=timeout_ms,
             block_types=",".join(block_types),
+            fast_first=fast_first,
+            fast_first_timeout_ms=fast_first_timeout_ms,
         ):
             async with _PDF_RENDER_SEM:
                 page = await _acquire_page()
                 try:
                     await _ensure_page_configured(page)
                     if url:
+                        if fast_first:
+                            try:
+                                await page.goto(url, wait_until="domcontentloaded", timeout=fast_first_timeout_ms)
+                                pdf_bytes = await page.pdf(
+                                    format="A4",
+                                    print_background=True,
+                                    margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+                                )
+                                if _pdf_bytes_looks_ok(pdf_bytes):
+                                    return pdf_bytes
+                            except Exception:
+                                pass
                         await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
                     elif html_str:
                         clean = re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)

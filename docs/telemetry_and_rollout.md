@@ -27,7 +27,6 @@ Events are emitted via logger name `dejavu.timing`.
   - `report.fetch` (vin, lang, prefer_non_pdf)
   - `report.render_pdf` (vin, lang)
 - PDF
-  - `pdf.weasyprint` (html_len)
   - `pdf.chromium` (mode, html_len)
 - Translation
   - `translate.batch` (target, total, missing, method)
@@ -61,7 +60,7 @@ This reduces unnecessary filesystem writes and backup spam when a flow calls `sa
 - Look for p50/p95 spikes in:
   - `report.fetch` vs `report.render_pdf`
   - `translate.*`
-  - `pdf.chromium` vs `pdf.weasyprint`
+  - `pdf.chromium`
   - `wa.ultramsg.send_*`
   - `db.save` / `db.backup`
 

@@ -80,19 +80,18 @@ python whatsapp_app.py
 - التخزين الافتراضي ملفي بالكامل (`db.json`). احرص على نسخه احتياطيًا أو استبداله بباك-إندكك الحقيقي عن طريق تعديل طبقة التخزين في `bot_core/storage.py`.
 - يتم إنشاء نسخ احتياطية تلقائيًا داخل مجلد `backups/` مع الحفاظ على آخر `DB_BACKUP_RETENTION` نسخة.
 - جميع الأسرار (TOKEN / Badvin) تضبط من `.env` فقط ولا يمكن تعديلها من داخل البوت. حدّث الملف ثم استخدم زر إعادة تحميل `.env`.
-- توليد PDF يستخدم Playwright أولاً، ثم WeasyPrint/WKHTMLTOPDF كبدائل.
+- توليد PDF يعتمد على Playwright/Chromium فقط.
 - لتشغيل الاختبارات يمكنك استخدام `pytest tests/test_all.py`.
 
 ## إعدادات اللوجز (Share-friendly)
 
-تم توحيد إعدادات اللوجز عبر `bot_core/logging_setup.py` لتقليل الضجيج (خصوصًا Telegram وWeasyPrint) وجعل مشاركة اللوجز أسهل.
+تم توحيد إعدادات اللوجز عبر `bot_core/logging_setup.py` لتقليل الضجيج (خصوصًا Telegram) وجعل مشاركة اللوجز أسهل.
 
 ضع التالي في ملف `.env` للحصول على لوجز نظيفة:
 ```
 LOG_PRESET=clean
 LOG_LEVEL=INFO
 SHOW_THIRD_PARTY_LOGS=0
-WEASYPRINT_LOG_ASSET_ERRORS=0
 ```
 
 للتشخيص التفصيلي عند الحاجة:
@@ -179,7 +178,7 @@ ENABLE_TIMING_LOGS=1
 3. استدعاء API الخارجي (`_call_carfax_api`) مع مهلة وإعادة المحاولة.
 4. المسارات المحتملة:
 	- `pdf_bytes` حاضر → إرسال الملف فورًا.
-	- `json/html/url` → تحويل HTML مع Playwright (ويدعم الترجمة للغات RTL)؛ في حال الفشل يستخدم WeasyPrint.
+	- `json/html/url` → تحويل HTML مع Playwright (ويدعم الترجمة للغات RTL).
 5. بعد التسليم: عرض أزرار صور BadVin/Apicar حسب الخدمات المفعلة.
 6. كل حدث (نجاح، فشل، استرداد رصيد) يسجل في لوحة السوبر.
 
@@ -227,7 +226,8 @@ ENABLE_TIMING_LOGS=1
 3. (اختياري) تثبيت Playwright Chromium لـ PDF عالي الجودة.
 4. التشغيل المحلي: `python app.py`.
 5. التشغيل الإنتاجي: استخدم `start.ps1` أو خدمة Windows/لينكس مع مراقبة السجلات.
-6. اختبار الوحدة: `pytest` (يتطلب Playwright/WeasyPrint فقط إذا أردت اختبار مسارات PDF عمليًا).
+6. اختبار الوحدة: `pytest` (تثبيت Playwright مفيد إذا أردت اختبار مسارات PDF عمليًا).
+
 
 ### 12. مراقبة الجودة والاختبارات
 - `tests/test_vin_utils.py` يؤكد أدوات VIN (التطبيع/التحقق).

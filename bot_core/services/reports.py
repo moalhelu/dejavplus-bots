@@ -93,6 +93,19 @@ def _en_hedge_delay_ms() -> int:
     return max(0, min(val, 5_000))
 
 
+def _translate_hedge_enabled() -> bool:
+    return (os.getenv("TRANSLATE_HEDGE", "1") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _translate_hedge_delay_ms() -> int:
+    raw = (os.getenv("TRANSLATE_HEDGE_DELAY_MS", "250") or "").strip()
+    try:
+        val = int(raw)
+    except Exception:
+        val = 250
+    return max(0, min(val, 3_000))
+
+
 def _t(key: str, lang: str, _fallback: Optional[str] = None, **kwargs: Any) -> str:
     """Lazy translation helper to avoid hardcoded strings."""
 
@@ -452,13 +465,49 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
     if needs_translation:
         # Chromium-only: fetch rendered HTML via Chromium (keeps styling + logo),
         # translate + inject RTL, then print to PDF.
+        async def _chromium_fast() -> Optional[str]:
+            try:
+                return await fetch_page_html_chromium(
+                    url,
+                    wait_until=_translated_fetch_wait_until(),
+                    timeout_ms=_translated_fetch_timeout_ms(),
+                )
+            except Exception:
+                return None
+
+        async def _http_only() -> Optional[str]:
+            try:
+                return await _fetch_page_html_http_only(url)
+            except Exception:
+                return None
+
+        # Run both; take the first usable HTML.
+        t1 = asyncio.create_task(_chromium_fast())
+        t2 = asyncio.create_task(_http_only())
         try:
-            html = await fetch_page_html_chromium(url)
-        except Exception:
-            html = None
+            pending = {t1, t2}
+            while pending and not html:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        candidate = task.result()
+                    except Exception:
+                        candidate = None
+                    if candidate and "<html" in candidate.lower():
+                        html = candidate
+                        for p in pending:
+                            p.cancel()
+                        pending = set()
+                        break
+        finally:
+            for t in (t1, t2):
+                if not t.done():
+                    t.cancel()
+
+        # If still empty, fall back to full Chromium fetch (default wait_until).
         if not html:
             try:
-                html = await _fetch_page_html_http_only(url)
+                html = await fetch_page_html_chromium(url)
             except Exception:
                 html = None
 
@@ -540,7 +589,7 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 if html and _html_looks_renderable(html):
                     pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html, base_url=url)
                     if not pdf_bytes:
-                        pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language)
+                        pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language, base_url=url)
                 else:
                     pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
             else:
@@ -558,15 +607,20 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
     return pdf_bytes
 
 
-async def _render_pdf_from_html(html: Optional[str], needs_translation: bool, language: str) -> Optional[bytes]:
+async def _render_pdf_from_html(
+    html: Optional[str],
+    needs_translation: bool,
+    language: str,
+    base_url: Optional[str] = None,
+) -> Optional[bytes]:
     if not html:
         return None
     translated = await _maybe_translate_html(html, language) if needs_translation else html
     # Enforce RTL wrapper for Arabic/Kurdish even if translation fell back to original
     if (language or "en").lower() in {"ar", "ku", "ckb"}:
         translated = inject_rtl(translated, lang=language)
-    # Chromium-only: WeasyPrint disabled per requirement.
-    return await html_to_pdf_bytes_chromium(html_str=translated)
+    # Chromium-only renderer.
+    return await html_to_pdf_bytes_chromium(html_str=translated, base_url=base_url)
 
 
 async def _maybe_translate_html(html: Optional[str], lang: str) -> str:
@@ -575,14 +629,59 @@ async def _maybe_translate_html(html: Optional[str], lang: str) -> str:
     lang_code = (lang or "en").lower()
     if lang_code == "en":
         return html
+
+    timeout_s = float(os.getenv("TRANSLATE_TIMEOUT_SEC", "6.0") or 6.0)
+
+    # Hedge translation to reduce tail latency: start the primary translator and
+    # a fast Google fallback (slightly delayed) in parallel, then take the first
+    # successful result.
+    if _translate_hedge_enabled():
+        async def _primary() -> Optional[str]:
+            try:
+                return await asyncio.wait_for(translate_html(html, lang_code), timeout=timeout_s)
+            except Exception:
+                return None
+
+        async def _quick() -> Optional[str]:
+            delay_ms = _translate_hedge_delay_ms()
+            if delay_ms:
+                try:
+                    await asyncio.sleep(delay_ms / 1000.0)
+                except Exception:
+                    pass
+            try:
+                out = await _quick_translate_html_google(html, lang_code, timeout=min(5.0, max(1.0, timeout_s)))
+                return out if out else None
+            except Exception:
+                return None
+
+        primary_task = asyncio.create_task(_primary())
+        quick_task = asyncio.create_task(_quick())
+        try:
+            pending = {primary_task, quick_task}
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        result = task.result()
+                    except Exception:
+                        result = None
+                    if result and result.strip():
+                        for p in pending:
+                            p.cancel()
+                        return result
+            # Nothing succeeded
+            return inject_rtl(html, lang=lang_code)
+        finally:
+            for t in (primary_task, quick_task):
+                if not t.done():
+                    t.cancel()
+
+    # Non-hedged legacy behavior
     try:
-        timeout_s = float(os.getenv("TRANSLATE_TIMEOUT_SEC", "8.0") or 8.0)
         return await asyncio.wait_for(translate_html(html, lang_code), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        quick = await _quick_translate_html_google(html, lang_code)
-        return quick if quick else inject_rtl(html, lang=lang_code)
     except Exception:
-        quick = await _quick_translate_html_google(html, lang_code)
+        quick = await _quick_translate_html_google(html, lang_code, timeout=min(5.0, max(1.0, timeout_s)))
         return quick if quick else inject_rtl(html, lang=lang_code)
 
 
@@ -622,6 +721,19 @@ async def _fetch_page_html_http_only(url: str) -> Optional[str]:
 
 def _needs_translation(language: str) -> bool:
     return (language or "en").lower() in {"ar", "ku", "ckb"}
+
+
+def _translated_fetch_wait_until() -> str:
+    return (os.getenv("TRANSLATED_FETCH_WAIT_UNTIL", "load") or "load").strip().lower()
+
+
+def _translated_fetch_timeout_ms() -> int:
+    raw = (os.getenv("TRANSLATED_FETCH_TIMEOUT_MS", "8000") or "").strip()
+    try:
+        val = int(raw)
+    except Exception:
+        val = 8000
+    return max(2_000, min(val, 30_000))
 
 
 async def _quick_translate_html_google(html: str, lang: str, *, timeout: float = 5.0) -> str:

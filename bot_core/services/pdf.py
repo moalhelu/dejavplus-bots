@@ -1,13 +1,11 @@
-"""PDF generation helpers (WeasyPrint / Playwright)."""
+"""PDF generation helpers (Playwright/Chromium)."""
 from __future__ import annotations
 
 import os
 import asyncio
 import re
-import mimetypes
+import traceback
 from urllib.parse import urlparse
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 from typing import Optional, List
 
 from bot_core.telemetry import atimed
@@ -156,91 +154,6 @@ _PDF_PAGE_MAX = 8
 _PDF_PREWARM_ENABLED = os.getenv("ENABLE_PDF_PREWARM", "1").lower() not in {"0", "false", "off"}
 _PDF_PREWARM_PAGES = int(os.getenv("PDF_PREWARM_PAGES", "1") or 1)
 
-
-def html_to_pdf_bytes_weasyprint(html_str: str) -> Optional[bytes]:
-    try:
-        from weasyprint import HTML, CSS  # type: ignore
-    except Exception:
-        return None
-    try:
-        css = CSS(string="@page { size: A4; margin: 10mm; } body{font-family:Arial,Helvetica,sans-serif}")
-
-        def _weasyprint_fast_fetch_enabled() -> bool:
-            return (os.getenv("WEASYPRINT_FAST_FETCH", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
-
-        def _weasyprint_url_timeout_s() -> float:
-            raw = (os.getenv("WEASYPRINT_URL_TIMEOUT_S", "5") or "").strip()
-            try:
-                val = float(raw)
-            except Exception:
-                val = 5.0
-            return max(0.5, min(val, 30.0))
-
-        def _weasyprint_block_resource_types() -> set[str]:
-            raw = (os.getenv("WEASYPRINT_BLOCK_RESOURCE_TYPES", "") or "").strip().lower()
-            if not raw:
-                return set()
-            parts = [p.strip() for p in raw.split(",") if p.strip()]
-            allowed = {"image", "font", "media"}
-            return {p for p in parts if p in allowed}
-
-        def _guess_type_from_url(url: str) -> str:
-            low = (url or "").lower()
-            mime, _ = mimetypes.guess_type(low)
-            return (mime or "application/octet-stream").lower()
-
-        def _is_blocked(url: str, mime_type: str, blocked: set[str]) -> bool:
-            if not blocked:
-                return False
-            mt = (mime_type or "").lower()
-            if "image" in blocked and mt.startswith("image/"):
-                return True
-            if "font" in blocked and ("font" in mt or mt in {"application/font-woff", "application/font-woff2", "application/vnd.ms-fontobject"}):
-                return True
-            if "media" in blocked and (mt.startswith("video/") or mt.startswith("audio/")):
-                return True
-            # Heuristic by extension for some common cases when mime is generic.
-            low = (url or "").lower()
-            if "image" in blocked and low.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")):
-                return True
-            if "font" in blocked and low.endswith((".woff", ".woff2", ".ttf", ".otf", ".eot")):
-                return True
-            if "media" in blocked and low.endswith((".mp4", ".webm", ".mp3", ".wav", ".ogg")):
-                return True
-            return False
-
-        def _fast_url_fetcher(url: str):  # type: ignore[no-untyped-def]
-            blocked = _weasyprint_block_resource_types()
-            mime_type = _guess_type_from_url(url)
-            if _is_blocked(url, mime_type, blocked):
-                return {"string": b"", "mime_type": mime_type}
-
-            timeout_s = _weasyprint_url_timeout_s()
-            try:
-                req = Request(url, headers={"User-Agent": "dejavuplus-bots/weasyprint"})
-                with urlopen(req, timeout=timeout_s) as resp:
-                    data = resp.read()
-                    ct = (resp.headers.get("Content-Type") or mime_type).split(";")[0].strip().lower()
-                    return {"string": data, "mime_type": ct}
-            except (HTTPError, URLError, TimeoutError, ValueError):
-                # Fail soft: empty resource (WeasyPrint will render without it).
-                return {"string": b"", "mime_type": mime_type}
-
-        if _weasyprint_fast_fetch_enabled():
-            return HTML(string=html_str, base_url=".", url_fetcher=_fast_url_fetcher).write_pdf(stylesheets=[css])
-
-        return HTML(string=html_str, base_url=".").write_pdf(stylesheets=[css])
-    except Exception:
-        return None
-
-
-async def html_to_pdf_weasyprint_async(html_str: str) -> Optional[bytes]:
-    async with atimed("pdf.weasyprint", html_len=len(html_str or "")):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, html_to_pdf_bytes_weasyprint, html_str)
-
-
-import traceback
 
 async def _ensure_browser():
     """Re-use a single Chromium instance to avoid cold starts per PDF."""
@@ -489,7 +402,12 @@ async def html_to_pdf_bytes_chromium(
         return None
 
 
-async def fetch_page_html_chromium(url: str) -> Optional[str]:
+async def fetch_page_html_chromium(
+    url: str,
+    *,
+    wait_until: Optional[str] = None,
+    timeout_ms: Optional[int] = None,
+) -> Optional[str]:
     """Fetch fully-rendered page HTML using the shared Chromium instance.
 
     This avoids the per-call Playwright cold start used by older fallback code.
@@ -503,8 +421,12 @@ async def fetch_page_html_chromium(url: str) -> Optional[str]:
         except Exception:  # pragma: no cover
             PlaywrightTimeoutError = Exception  # type: ignore[assignment]
 
-        wait_until = _get_pdf_wait_until()
-        timeout_ms = _get_pdf_timeout_ms()
+        wait_until = (wait_until or _get_pdf_wait_until()).strip().lower()
+        if wait_until not in {"load", "domcontentloaded", "networkidle"}:
+            wait_until = _get_pdf_wait_until()
+
+        timeout_ms = int(timeout_ms) if timeout_ms is not None else _get_pdf_timeout_ms()
+        timeout_ms = max(1_000, min(timeout_ms, 300_000))
         block_types = sorted(_get_pdf_block_resource_types())
         async with atimed(
             "pdf.chromium.fetch_html",

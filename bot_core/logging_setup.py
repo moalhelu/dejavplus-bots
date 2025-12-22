@@ -12,13 +12,11 @@ class _CleanLogFilter(logging.Filter):
     Controlled by env:
     - LOG_PRESET=clean|verbose (default: clean)
     - SHOW_THIRD_PARTY_LOGS=1 to allow third-party INFO/DEBUG
-    - WEASYPRINT_LOG_ASSET_ERRORS=1 to keep "Failed to load image" errors
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._show_third_party = (os.getenv("SHOW_THIRD_PARTY_LOGS", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
-        self._keep_weasy_asset_errors = (os.getenv("WEASYPRINT_LOG_ASSET_ERRORS", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
 
         # Loggers we almost always want to suppress unless warning/error.
         self._third_party_prefixes: tuple[str, ...] = (
@@ -38,16 +36,6 @@ class _CleanLogFilter(logging.Filter):
 
         # Keep our own logs always.
         if name.startswith("dejavu") or name.startswith("bot_core") or name == "__main__":
-            return True
-
-        # WeasyPrint is extremely noisy (CSS warnings). Keep real errors but drop
-        # asset 404 errors by default (they are usually non-fatal and spammy).
-        if name.startswith("weasyprint"):
-            msg = record.getMessage()
-            if record.levelno < logging.ERROR:
-                return False
-            if ("Failed to load image" in msg or "Failed to load" in msg) and not self._keep_weasy_asset_errors:
-                return False
             return True
 
         # Third-party logs: in clean mode, keep only warnings/errors (unless explicitly enabled).
@@ -117,11 +105,6 @@ def configure_logging() -> None:
     access_default = "INFO" if verbose else "WARNING"
     logging.getLogger("uvicorn.access").setLevel(_parse_level(os.getenv("UVICORN_ACCESS_LOG_LEVEL", access_default), logging.WARNING))
 
-    # WeasyPrint is extremely noisy; keep only errors by default in clean preset.
-    if not verbose:
-        logging.getLogger("weasyprint").setLevel(logging.ERROR)
-
-
 def get_recommended_clean_log_env() -> dict[str, str]:
     """Convenience helper for documentation/debug."""
 
@@ -130,5 +113,4 @@ def get_recommended_clean_log_env() -> dict[str, str]:
         "LOG_LEVEL": "INFO",
         "TELEGRAM_LOG_LEVEL": "WARNING",
         "SHOW_THIRD_PARTY_LOGS": "0",
-        "WEASYPRINT_LOG_ASSET_ERRORS": "0",
     }

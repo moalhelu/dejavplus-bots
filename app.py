@@ -8,14 +8,16 @@ import copy
 import json
 import logging
 
-# Verbose logging to capture Telegram API errors and VIN traces
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s:%(lineno)d | %(message)s",
-)
-logging.getLogger("telegram").setLevel(logging.DEBUG)
-logging.getLogger("telegram.ext").setLevel(logging.DEBUG)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except Exception:
+    pass
+
+from bot_core.logging_setup import configure_logging
+
+# Centralized, share-friendly logs (set LOG_PRESET=verbose to restore noisy debug).
+configure_logging()
 
 import mimetypes
 import os
@@ -32,12 +34,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 
 logger = logging.getLogger(__name__)
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
-except Exception:
-    pass
 
 from bot_core.auth import (
     env_super_admins as _env_super_admins,

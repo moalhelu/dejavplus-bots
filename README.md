@@ -83,6 +83,30 @@ python whatsapp_app.py
 - توليد PDF يستخدم Playwright أولاً، ثم WeasyPrint/WKHTMLTOPDF كبدائل.
 - لتشغيل الاختبارات يمكنك استخدام `pytest tests/test_all.py`.
 
+## إعدادات اللوجز (Share-friendly)
+
+تم توحيد إعدادات اللوجز عبر `bot_core/logging_setup.py` لتقليل الضجيج (خصوصًا Telegram وWeasyPrint) وجعل مشاركة اللوجز أسهل.
+
+ضع التالي في ملف `.env` للحصول على لوجز نظيفة:
+```
+LOG_PRESET=clean
+LOG_LEVEL=INFO
+SHOW_THIRD_PARTY_LOGS=0
+WEASYPRINT_LOG_ASSET_ERRORS=0
+```
+
+للتشخيص التفصيلي عند الحاجة:
+```
+LOG_PRESET=verbose
+SHOW_THIRD_PARTY_LOGS=1
+TELEGRAM_LOG_LEVEL=INFO
+```
+
+ملاحظة: لوجز القياسات (timings) تخرج عبر `dejavu.timing` عند تفعيل:
+```
+ENABLE_TIMING_LOGS=1
+```
+
 ## تكامل واتساب (UltraMsg)
 
 1. فعّل حساب UltraMsg وأنشئ Instance من لوحة التحكم ثم احصل على `instance_id` و `token`.

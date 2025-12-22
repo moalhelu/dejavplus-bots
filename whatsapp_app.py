@@ -54,7 +54,12 @@ from bot_core.storage import (
 from bot_core.utils.vin import is_valid_vin, make_progress_bar
 from bot_core.telemetry import atimed, new_rid, set_rid
 
+from bot_core.logging_setup import configure_logging
+
 load_dotenv(override=True)
+
+# Centralized, share-friendly logs (set LOG_PRESET=verbose to restore noisy debug).
+configure_logging()
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1570,5 +1575,4 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     run()

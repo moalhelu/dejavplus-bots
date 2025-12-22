@@ -296,27 +296,34 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
 
     async def _try_get() -> Optional[Dict[str, Any]]:
         try:
-            async with session.get(f"{base}/{vin}", headers=headers) as resp:
-                parsed = await _handle(resp)
-                return parsed if parsed.get("ok") else None
+            async with atimed("carfax.http", method="GET", route="/{vin}"):
+                async with session.get(f"{base}/{vin}", headers=headers) as resp:
+                    parsed = await _handle(resp)
+                    if parsed.get("ok"):
+                        return parsed
+                    return None
         except Exception:
             return None
 
     async def _try_post_vin() -> Optional[Dict[str, Any]]:
         try:
-            async with session.post(f"{base}/vin", json=payload, headers=headers) as resp:
-                parsed = await _handle(resp)
-                return parsed if parsed.get("ok") else None
+            async with atimed("carfax.http", method="POST", route="/vin"):
+                async with session.post(f"{base}/vin", json=payload, headers=headers) as resp:
+                    parsed = await _handle(resp)
+                    if parsed.get("ok"):
+                        return parsed
+                    return None
         except Exception:
             return None
 
     async def _try_post_base() -> Dict[str, Any]:
         try:
-            async with session.post(base, json=payload, headers=headers) as resp:
-                parsed = await _handle(resp)
-                if parsed.get("ok"):
-                    return parsed
-                return {"ok": False, "error": f"HTTP {parsed.get('status')}", "detail": parsed.get("err_text", "")}
+            async with atimed("carfax.http", method="POST", route="/"):
+                async with session.post(base, json=payload, headers=headers) as resp:
+                    parsed = await _handle(resp)
+                    if parsed.get("ok"):
+                        return parsed
+                    return {"ok": False, "error": f"HTTP {parsed.get('status')}", "detail": parsed.get("err_text", "")}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -433,7 +440,7 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
         if _prefer_http_fetch_for_en_enabled():
             try:
                 async with atimed("report.fetch_html", vin=vin, lang=language, mode="http"):
-                    html = await _fetch_page_html(url)
+                    html = await _fetch_page_html_http_only(url)
             except Exception:
                 html = None
             if html and _html_looks_renderable(html):
@@ -488,18 +495,35 @@ async def _maybe_translate_html(html: Optional[str], lang: str) -> str:
 async def _fetch_page_html(url: str) -> Optional[str]:
     # Try lightweight HTTP fetch first to avoid launching Playwright.
     try:
-        session = await _get_http_session()
-        async with session.get(url, timeout=_CARFAX_TIMEOUT) as resp:
-            ctype = (resp.headers.get("Content-Type", "") or "").lower()
-            if resp.status in (200, 201) and "text/html" in ctype:
-                text = await resp.text()
-                if "<html" in text.lower():
-                    return text
+        html = await _fetch_page_html_http_only(url)
+        if html:
+            return html
     except Exception:
         pass
 
     # Fallback to Chromium (shared) only if HTTP fetch failed or returned non-HTML.
     return await fetch_page_html_chromium(url)
+
+
+async def _fetch_page_html_http_only(url: str) -> Optional[str]:
+    """Fetch HTML via aiohttp only (never falls back to Playwright).
+
+    Used for the English fast path where the whole point is to avoid Playwright URL waits.
+    """
+
+    if not url:
+        return None
+    session = await _get_http_session()
+    # Keep this relatively small so it can be a fast path.
+    timeout_s = float(os.getenv("CARFAX_HTML_HTTP_TIMEOUT", "6") or 6)
+    timeout_s = max(2.0, min(timeout_s, float(_CARFAX_TIMEOUT)))
+    async with session.get(url, timeout=timeout_s) as resp:
+        ctype = (resp.headers.get("Content-Type", "") or "").lower()
+        if resp.status in (200, 201) and "text/html" in ctype:
+            text = await resp.text()
+            if "<html" in text.lower():
+                return text
+    return None
 
 
 def _needs_translation(language: str) -> bool:

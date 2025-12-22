@@ -5585,6 +5585,16 @@ async def _post_shutdown_cleanup(app: Application) -> None:
     except Exception:
         pass
 
+
+async def _post_init_warmup(app: Application) -> None:
+    # Prewarm Chromium so the first report doesn't pay Playwright cold-start.
+    try:
+        from bot_core.services.pdf import prewarm_pdf_engine
+
+        asyncio.create_task(prewarm_pdf_engine())
+    except Exception:
+        pass
+
     try:
         await _close_reports_session()
     except Exception:
@@ -5604,6 +5614,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .post_init(_post_init_warmup)
         .post_shutdown(_post_shutdown_cleanup)
         .build()
     )

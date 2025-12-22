@@ -93,6 +93,7 @@ _PDF_PAGE_POOL: List[object] = []
 _PDF_PAGE_LOCK = asyncio.Lock()
 _PDF_PAGE_MAX = 8
 _PDF_PREWARM_ENABLED = os.getenv("ENABLE_PDF_PREWARM", "1").lower() not in {"0", "false", "off"}
+_PDF_PREWARM_PAGES = int(os.getenv("PDF_PREWARM_PAGES", "1") or 1)
 
 
 def html_to_pdf_bytes_weasyprint(html_str: str) -> Optional[bytes]:
@@ -137,6 +138,7 @@ async def _ensure_browser():
                     page = await _PDF_BROWSER.new_page()
                     try:
                         await page.goto("about:blank")
+                        await _ensure_page_configured(page)
                         async with _PDF_PAGE_LOCK:
                             if len(_PDF_PAGE_POOL) < _PDF_PAGE_MAX:
                                 _PDF_PAGE_POOL.append(page)
@@ -155,6 +157,53 @@ async def _ensure_browser():
             f.write(f"Browser Init Error: {repr(exc)}\n")
         _PDF_BROWSER = None
         return None
+
+
+async def prewarm_pdf_engine() -> None:
+    """Eagerly initialize the shared Chromium browser + a small page pool.
+
+    Intended to run at service startup (Telegram/WhatsApp) to avoid the first
+    user request paying the Playwright cold-start cost.
+    """
+
+    if not _PDF_PREWARM_ENABLED:
+        return
+    try:
+        pages = max(1, min(int(_PDF_PREWARM_PAGES), _PDF_PAGE_MAX))
+    except Exception:
+        pages = 1
+
+    try:
+        async with atimed("pdf.prewarm", pages=pages):
+            browser = await _ensure_browser()
+            if browser is None:
+                return
+            # Ensure we have at least N warmed pages ready.
+            created: List[object] = []
+            try:
+                async with _PDF_PAGE_LOCK:
+                    needed = max(0, pages - len(_PDF_PAGE_POOL))
+                for _ in range(needed):
+                    try:
+                        page = await browser.new_page()
+                        await page.goto("about:blank")
+                        await _ensure_page_configured(page)
+                        created.append(page)
+                    except Exception:
+                        break
+
+                if created:
+                    async with _PDF_PAGE_LOCK:
+                        while created and len(_PDF_PAGE_POOL) < _PDF_PAGE_MAX:
+                            _PDF_PAGE_POOL.append(created.pop())
+            finally:
+                for page in created:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+    except Exception:
+        return
 
 
 async def _reset_browser() -> None:

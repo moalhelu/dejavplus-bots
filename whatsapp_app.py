@@ -1482,6 +1482,14 @@ async def _on_startup() -> None:
     
     _get_ultramsg_client()
     LOGGER.info("WhatsApp webhook server ready on %s:%s", WHATSAPP_HOST, WHATSAPP_PORT)
+
+    # Prewarm Chromium so the first report doesn't pay Playwright cold-start.
+    try:
+        from bot_core.services.pdf import prewarm_pdf_engine
+
+        asyncio.create_task(prewarm_pdf_engine())
+    except Exception:
+        pass
     
     # Try to detect public URL
     public_url = os.getenv("WHATSAPP_PUBLIC_URL")

@@ -24,6 +24,67 @@ def _get_pdf_timeout_ms() -> int:
         return 60000
     return max(1_000, min(timeout_ms, 300_000))
 
+
+def _get_pdf_block_resource_types() -> set[str]:
+    """Optional Playwright resource blocking.
+
+    Example: PDF_BLOCK_RESOURCE_TYPES=image,font,media
+    Defaults to no blocking.
+    """
+
+    raw = (os.getenv("PDF_BLOCK_RESOURCE_TYPES", "") or "").strip().lower()
+    if not raw:
+        return set()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    allowed = {"image", "media", "font"}
+    return {p for p in parts if p in allowed}
+
+
+async def _ensure_page_configured(page) -> None:
+    """Configure a pooled Playwright page once (idempotent)."""
+
+    if not page:
+        return
+    try:
+        if getattr(page, "_dv_pdf_configured", False):
+            return
+    except Exception:
+        # If we can't set attributes, just fall through and try config.
+        pass
+
+    block_types = _get_pdf_block_resource_types()
+    if not block_types:
+        try:
+            setattr(page, "_dv_pdf_configured", True)
+        except Exception:
+            pass
+        return
+
+    async def _route_handler(route, request) -> None:  # pragma: no cover
+        try:
+            rtype = (getattr(request, "resource_type", "") or "").lower()
+            if rtype in block_types:
+                await route.abort()
+                return
+        except Exception:
+            # On any handler failure, continue request to avoid breaking the page.
+            pass
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+
+    try:
+        await page.route("**/*", _route_handler)
+    except Exception:
+        # If routing isn't available (or already routed), keep going without blocking.
+        pass
+
+    try:
+        setattr(page, "_dv_pdf_configured", True)
+    except Exception:
+        pass
+
 _PDF_PLAYWRIGHT = None
 _PDF_BROWSER = None
 _PDF_BROWSER_LOCK = asyncio.Lock()
@@ -157,12 +218,21 @@ async def _release_page(page) -> None:
 
 async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Optional[str] = None) -> Optional[bytes]:
     try:
-        async with atimed("pdf.chromium", html_len=len(html_str or "") if html_str else 0, has_url=bool(url)):
+        wait_until = _get_pdf_wait_until()
+        timeout_ms = _get_pdf_timeout_ms()
+        block_types = sorted(_get_pdf_block_resource_types())
+        async with atimed(
+            "pdf.chromium",
+            html_len=len(html_str or "") if html_str else 0,
+            has_url=bool(url),
+            wait_until=wait_until,
+            timeout_ms=timeout_ms,
+            block_types=",".join(block_types),
+        ):
             async with _PDF_RENDER_SEM:
                 page = await _acquire_page()
                 try:
-                    wait_until = _get_pdf_wait_until()
-                    timeout_ms = _get_pdf_timeout_ms()
+                    await _ensure_page_configured(page)
                     if url:
                         await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
                     elif html_str:
@@ -198,12 +268,20 @@ async def fetch_page_html_chromium(url: str) -> Optional[str]:
     if not url:
         return None
     try:
-        async with atimed("pdf.chromium.fetch_html", has_url=True):
+        wait_until = _get_pdf_wait_until()
+        timeout_ms = _get_pdf_timeout_ms()
+        block_types = sorted(_get_pdf_block_resource_types())
+        async with atimed(
+            "pdf.chromium.fetch_html",
+            has_url=True,
+            wait_until=wait_until,
+            timeout_ms=timeout_ms,
+            block_types=",".join(block_types),
+        ):
             async with _PDF_RENDER_SEM:
                 page = await _acquire_page()
                 try:
-                    wait_until = _get_pdf_wait_until()
-                    timeout_ms = _get_pdf_timeout_ms()
+                    await _ensure_page_configured(page)
                     await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
                     return await page.content()
                 finally:

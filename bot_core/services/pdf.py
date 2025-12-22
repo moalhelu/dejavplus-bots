@@ -187,3 +187,26 @@ async def html_to_pdf_bytes_chromium(html_str: Optional[str] = None, url: Option
             f.write(f"Runtime Error: {repr(e)}\n")
             f.write(traceback.format_exc() + "\n")
         return None
+
+
+async def fetch_page_html_chromium(url: str) -> Optional[str]:
+    """Fetch fully-rendered page HTML using the shared Chromium instance.
+
+    This avoids the per-call Playwright cold start used by older fallback code.
+    """
+
+    if not url:
+        return None
+    try:
+        async with atimed("pdf.chromium.fetch_html", has_url=True):
+            async with _PDF_RENDER_SEM:
+                page = await _acquire_page()
+                try:
+                    wait_until = _get_pdf_wait_until()
+                    timeout_ms = _get_pdf_timeout_ms()
+                    await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                    return await page.content()
+                finally:
+                    await _release_page(page)
+    except Exception:
+        return None

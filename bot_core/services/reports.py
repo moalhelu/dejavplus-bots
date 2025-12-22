@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, cast
 import aiohttp
 
 from bot_core.config import get_env
-from bot_core.services.pdf import html_to_pdf_bytes_chromium, html_to_pdf_weasyprint_async
+from bot_core.services.pdf import html_to_pdf_bytes_chromium, html_to_pdf_weasyprint_async, fetch_page_html_chromium
 from bot_core.services.translation import inject_rtl, translate_html, _latin_ku_to_arabic  # type: ignore
 from bot_core.telemetry import atimed
 
@@ -396,19 +396,8 @@ async def _fetch_page_html(url: str) -> Optional[str]:
     except Exception:
         pass
 
-    # Fallback to Playwright only if HTTP fetch failed or returned non-HTML.
-    try:
-        from playwright.async_api import async_playwright
-
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch()
-            page = await browser.new_page()
-            await page.goto(url, wait_until="networkidle")
-            content = await page.content()
-            await browser.close()
-            return content
-    except Exception:
-        return None
+    # Fallback to Chromium (shared) only if HTTP fetch failed or returned non-HTML.
+    return await fetch_page_html_chromium(url)
 
 
 def _needs_translation(language: str) -> bool:

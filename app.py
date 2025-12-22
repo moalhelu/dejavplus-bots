@@ -381,6 +381,12 @@ async def _send_bridge_responses(
     if not responses or not update:
         return
 
+    try:
+        from bot_core.telemetry import atimed, new_rid, set_rid
+        set_rid(new_rid(prefix="tg-"))
+    except Exception:
+        atimed = None  # type: ignore
+
     payloads: List[str]
     documents: List[Dict[str, Any]] = []
     media_payloads: List[Dict[str, Any]] = []
@@ -401,9 +407,17 @@ async def _send_bridge_responses(
 
     async def _send_text(body: str) -> None:
         if update.message:
-            await update.message.reply_text(body, parse_mode=ParseMode.HTML)
+            if atimed:
+                async with atimed("tg.send_text", bytes=len(body or "")):
+                    await update.message.reply_text(body, parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(body, parse_mode=ParseMode.HTML)
         elif chat_id and context:
-            await context.bot.send_message(chat_id=chat_id, text=body, parse_mode=ParseMode.HTML)
+            if atimed:
+                async with atimed("tg.send_text", bytes=len(body or "")):
+                    await context.bot.send_message(chat_id=chat_id, text=body, parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=body, parse_mode=ParseMode.HTML)
 
     for body in payloads:
         if body:
@@ -420,21 +434,45 @@ async def _send_bridge_responses(
             try:
                 if path and os.path.exists(path):
                     with open(path, "rb") as handler:
+                        if atimed:
+                            try:
+                                size = os.path.getsize(path)
+                            except Exception:
+                                size = 0
+                            async with atimed("tg.send_document", bytes=size, via="file"):
+                                await context.bot.send_document(
+                                    chat_id=chat_id,
+                                    document=handler,
+                                    caption=caption,
+                                    filename=filename,
+                                    parse_mode=ParseMode.HTML,
+                                )
+                        else:
+                            await context.bot.send_document(
+                                chat_id=chat_id,
+                                document=handler,
+                                caption=caption,
+                                filename=filename,
+                                parse_mode=ParseMode.HTML,
+                            )
+                elif url:
+                    if atimed:
+                        async with atimed("tg.send_document", bytes=0, via="url"):
+                            await context.bot.send_document(
+                                chat_id=chat_id,
+                                document=url,
+                                caption=caption,
+                                filename=filename,
+                                parse_mode=ParseMode.HTML,
+                            )
+                    else:
                         await context.bot.send_document(
                             chat_id=chat_id,
-                            document=handler,
+                            document=url,
                             caption=caption,
                             filename=filename,
                             parse_mode=ParseMode.HTML,
                         )
-                elif url:
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=url,
-                        caption=caption,
-                        filename=filename,
-                        parse_mode=ParseMode.HTML,
-                    )
             except Exception:
                 logging.exception("Failed to relay bridge document to Telegram")
 
@@ -449,19 +487,41 @@ async def _send_bridge_responses(
             try:
                 if path and os.path.exists(path):
                     with open(path, "rb") as handler:
+                        if atimed:
+                            try:
+                                size = os.path.getsize(path)
+                            except Exception:
+                                size = 0
+                            async with atimed("tg.send_photo", bytes=size, via="file"):
+                                await context.bot.send_photo(
+                                    chat_id=chat_id,
+                                    photo=handler,
+                                    caption=caption,
+                                    parse_mode=ParseMode.HTML,
+                                )
+                        else:
+                            await context.bot.send_photo(
+                                chat_id=chat_id,
+                                photo=handler,
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                            )
+                elif url:
+                    if atimed:
+                        async with atimed("tg.send_photo", bytes=0, via="url"):
+                            await context.bot.send_photo(
+                                chat_id=chat_id,
+                                photo=url,
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                            )
+                    else:
                         await context.bot.send_photo(
                             chat_id=chat_id,
-                            photo=handler,
+                            photo=url,
                             caption=caption,
                             parse_mode=ParseMode.HTML,
                         )
-                elif url:
-                    await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=url,
-                        caption=caption,
-                        parse_mode=ParseMode.HTML,
-                    )
             except Exception:
                 logging.exception("Failed to relay bridge media to Telegram")
 
@@ -4021,7 +4081,16 @@ async def request_activation_command(update: Update, context: ContextTypes.DEFAU
 # =================== VIN flow (send PDF only) ===================
 async def _send_pdf_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, filename: str, caption: str):
     with open(filename, "rb") as fh:
-        await context.bot.send_document(chat_id=chat_id, document=fh, filename=os.path.basename(filename), caption=caption, parse_mode=ParseMode.HTML)
+        try:
+            from bot_core.telemetry import atimed
+            try:
+                size = os.path.getsize(filename)
+            except Exception:
+                size = 0
+            async with atimed("tg.send_document", bytes=size, via="file"):
+                await context.bot.send_document(chat_id=chat_id, document=fh, filename=os.path.basename(filename), caption=caption, parse_mode=ParseMode.HTML)
+        except Exception:
+            await context.bot.send_document(chat_id=chat_id, document=fh, filename=os.path.basename(filename), caption=caption, parse_mode=ParseMode.HTML)
 def _normalize_phone(raw: str, cc: Optional[str]) -> Optional[str]:
     s = (raw or "").strip().replace(" ", "").replace("-", "")
     if s.startswith("+") and s[1:].isdigit() and 9 <= len(s) <= 16:

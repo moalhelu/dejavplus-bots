@@ -314,7 +314,7 @@ async def _google_free_batch(texts: List[str], target_lang: str) -> List[str]:
     # Translate many strings per request by joining them with a delimiter that
     # is very unlikely to be changed by translation.
     # This avoids issuing hundreds of HTTP requests for large HTML pages.
-    delimiter = "[[[DVSEP]]]"
+    delimiter = "__DVSEP__9f3b0a__"
     max_chars_per_request = 3500
 
     def _chunk_texts(items: List[str]) -> List[List[str]]:
@@ -371,6 +371,144 @@ async def _google_free_batch(texts: List[str], target_lang: str) -> List[str]:
         for ch in translated_chunks:
             results.extend(ch)
     return results
+
+
+async def translate_html_google_free(html_str: str, target: str = "ar") -> str:
+    """Translate HTML using only the free Google endpoint (best-effort, fast).
+
+    This exists to provide a reliable parallel fallback path when provider-based
+    translation times out or fails silently.
+
+    Notes:
+    - Preserves VIN-like tokens by skipping translation for nodes containing VINs.
+    - Uses the same RTL injection + Kurdish script enforcement as `translate_html`.
+    """
+
+    target_lang_raw = (target or "en").lower()
+    target_lang = _normalize_target(target_lang_raw)
+    is_kurdish = target_lang_raw in KURDISH_LANGS
+    html_input = html_str or ""
+    if not html_input:
+        return ""
+
+    async with atimed("translate.html.google_free", target=target_lang, html_len=len(html_input), is_kurdish=is_kurdish):
+        if is_kurdish:
+            html_input = _latin_ku_to_arabic(html_input)
+        if target_lang == "en":
+            return html_input
+
+        rtl = target_lang_raw in RTL_LANGS
+        if BeautifulSoup is None:
+            return inject_rtl(html_input, lang=target_lang) if rtl else html_input
+
+        try:
+            soup = BeautifulSoup(html_input, "html.parser")
+
+            def _segment(text: str, limit: int = 2000) -> List[str]:
+                if len(text) <= limit:
+                    return [text]
+                parts: List[str] = []
+                current: List[str] = []
+                current_len = 0
+                for chunk in re.split(r"(\.\s+|\n)", text):
+                    if not chunk:
+                        continue
+                    if current_len + len(chunk) > limit and current:
+                        parts.append("".join(current))
+                        current = []
+                        current_len = 0
+                    current.append(chunk)
+                    current_len += len(chunk)
+                if current:
+                    parts.append("".join(current))
+                return parts or [text]
+
+            text_nodes: List[Any] = []
+            for element in soup.find_all(text=True):
+                if element.parent and element.parent.name in ("script", "style", "noscript"):
+                    continue
+                raw = str(element)
+                if not _is_visible_text_node(raw):
+                    continue
+                # Keep VINs intact.
+                if re.search(r"\b[A-HJ-NPR-Z0-9]{17}\b", raw):
+                    continue
+                text_nodes.append(element)
+
+            originals: List[str] = []
+            idx_map: dict[str, int] = {}
+            expanded_map: List[List[str]] = []
+            for node in text_nodes:
+                raw = str(node)
+                if raw not in idx_map:
+                    idx_map[raw] = len(originals)
+                    originals.append(raw)
+                    expanded_map.append(_segment(raw))
+
+            if not originals:
+                # Nothing to translate; still enforce RTL wrapper.
+                result_html = str(soup)
+                return inject_rtl(result_html, lang=target_lang) if rtl else result_html
+
+            flat_segments: List[str] = [seg for segments in expanded_map for seg in segments]
+
+            # Use the shared cache to avoid repeating work across requests.
+            cached_hits, missing = _cache_get_batch(flat_segments, target_lang)
+            translated_map: Dict[str, str] = dict(cached_hits)
+            if missing:
+                try:
+                    translated_missing = await asyncio.wait_for(
+                        _google_free_batch(missing, target_lang),
+                        timeout=FREE_GOOGLE_TIMEOUT + 1,
+                    )
+                except Exception:
+                    translated_missing = []
+                if translated_missing and len(translated_missing) == len(missing):
+                    if is_kurdish:
+                        translated_missing = _ensure_kurdish_arabic_batch(translated_missing)
+                    pairs = dict(zip(missing, translated_missing))
+                    _cache_set_batch(pairs, target_lang)
+                    translated_map.update(pairs)
+                else:
+                    # Fail-soft for missing entries.
+                    translated_map.update({m: m for m in missing})
+
+            translated_segments = [translated_map.get(seg, seg) for seg in flat_segments]
+
+            rebuilt: List[str] = []
+            cursor = 0
+            for segments in expanded_map:
+                count = len(segments)
+                rebuilt.append("".join(translated_segments[cursor:cursor + count]))
+                cursor += count
+
+            for node in text_nodes:
+                idx = idx_map.get(str(node))
+                if idx is not None:
+                    node.replace_with(rebuilt[idx])
+
+            if is_kurdish:
+                _apply_kurdish_arabic_to_soup(soup)
+
+            for element in soup.find_all(text=True):
+                text_value = str(element) if element else ""
+                if re.search(r"\b[A-HJ-NPR-Z0-9]{17}\b", text_value):
+                    try:
+                        vin_wrapper = soup.new_tag("span", attrs={"class": "vin"})
+                        element.wrap(vin_wrapper)
+                    except Exception:
+                        pass
+
+            if ARABIC_INDIC_DIGITS:
+                for element in soup.find_all(text=True):
+                    if element.parent and element.parent.name in ("script", "style", "noscript"):
+                        continue
+                    element.replace_with(to_arabic_digits(str(element)))
+
+            result_html = str(soup)
+            return inject_rtl(result_html, lang=target_lang) if rtl else result_html
+        except Exception:
+            return inject_rtl(html_input, lang=target_lang) if rtl else html_input
 
 
 async def translate_batch(texts: List[str], target: str = "ar") -> List[str]:

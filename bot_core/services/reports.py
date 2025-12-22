@@ -6,6 +6,7 @@ import asyncio
 import aiohttp
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from html import escape
@@ -15,7 +16,7 @@ import aiohttp
 
 from bot_core.config import get_env
 from bot_core.services.pdf import html_to_pdf_bytes_chromium, fetch_page_html_chromium
-from bot_core.services.translation import inject_rtl, translate_html, _latin_ku_to_arabic  # type: ignore
+from bot_core.services.translation import inject_rtl, translate_html, translate_html_google_free, _latin_ku_to_arabic  # type: ignore
 from bot_core.telemetry import atimed
 
 try:  # optional dependency (used for quick HTML translation fallback)
@@ -630,12 +631,63 @@ async def _maybe_translate_html(html: Optional[str], lang: str) -> str:
     if lang_code == "en":
         return html
 
-    # Fail-fast translation: avoid slow fallbacks that can exceed our budget.
+    def _translation_looks_ok(src: str, out: Optional[str], target: str) -> bool:
+        if not out:
+            return False
+        low = out.lower()
+        if "<html" not in low:
+            return False
+        # If output is identical, it's almost certainly an RTL-only fallback.
+        if out == src:
+            return False
+        # For RTL languages we must see Arabic-script characters, otherwise it's not a real translation.
+        if (target or "en").lower() in {"ar", "ku", "ckb"}:
+            if not re.search(r"[\u0600-\u06FF]", out):
+                return False
+        return True
+
+    # Run two translation strategies in parallel:
+    # - `translate_html`: provider-first + internal Google-free fallback + RTL injection.
+    # - `translate_html_google_free`: optimized Google-free-only HTML translator.
+    # We then take the first result that *actually* contains Arabic-script output.
     timeout_s = float(os.getenv("TRANSLATE_TIMEOUT_SEC", "6.0") or 6.0)
+    # Give a tiny bit of headroom so we don't cancel the translator right before success.
+    hard_timeout = max(2.0, min(timeout_s + 2.0, 15.0))
+
+    async def _primary() -> Optional[str]:
+        try:
+            return await asyncio.wait_for(translate_html(html, lang_code), timeout=hard_timeout)
+        except Exception:
+            return None
+
+    async def _google_free() -> Optional[str]:
+        try:
+            return await asyncio.wait_for(translate_html_google_free(html, lang_code), timeout=max(2.0, min(hard_timeout, 10.0)))
+        except Exception:
+            return None
+
+    t1 = asyncio.create_task(_primary())
+    t2 = asyncio.create_task(_google_free())
     try:
-        return await asyncio.wait_for(translate_html(html, lang_code), timeout=timeout_s)
-    except Exception:
+        pending = {t1, t2}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    candidate = task.result()
+                except Exception:
+                    candidate = None
+                if _translation_looks_ok(html, candidate, lang_code):
+                    for p in pending:
+                        p.cancel()
+                    return candidate
+
+        # If neither produced a real translation, fall back to original with RTL wrapper.
         return inject_rtl(html, lang=lang_code)
+    finally:
+        for t in (t1, t2):
+            if not t.done():
+                t.cancel()
 
 
 async def _fetch_page_html(url: str) -> Optional[str]:

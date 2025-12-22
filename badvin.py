@@ -64,6 +64,15 @@ def select_oldest_badvin_record_with_photos(records):
                         delta = timedelta(days=count)
                     if delta:
                         return (datetime.utcnow() - delta).timestamp()
+            # Relative phrases like "2 hours ago" / "15 minutes ago"
+            if "hour" in rel and "ago" in rel:
+                m = re.search(r"(\d+)", rel)
+                count = int(m.group(1)) if m else 1
+                return (datetime.utcnow() - timedelta(hours=count)).timestamp()
+            if "minute" in rel and "ago" in rel:
+                m = re.search(r"(\d+)", rel)
+                count = int(m.group(1)) if m else 1
+                return (datetime.utcnow() - timedelta(minutes=count)).timestamp()
             return None
 
         for key in ("timestamp", "date", "sale_date", "record_date", "raw_date", "ts"):
@@ -251,6 +260,7 @@ class BadvinScraper:
 
             def _parse_sale_date(node):
                 # Attempt to extract a sortable timestamp from sale-record nodes
+                # Prefer explicit yyyy-mm-dd in parentheses (common on Badvin pages)
                 for attr in ("data-sale-date", "data-date", "data-sold-date"):
                     raw = node.get(attr)
                     if raw:
@@ -274,12 +284,46 @@ class BadvinScraper:
                             pass
                 # Look for yyyy-mm-dd in text
                 text = node.get_text(" ", strip=True)
+                m = re.search(r"\((20\d{2}-\d{2}-\d{2})\)", text)
+                if m:
+                    try:
+                        return datetime.fromisoformat(m.group(1)).timestamp()
+                    except Exception:
+                        pass
                 m = re.search(r"(20\d{2}-\d{2}-\d{2})", text)
                 if m:
                     try:
                         return datetime.fromisoformat(m.group(1)).timestamp()
                     except Exception:
                         pass
+                # Look for mm/dd/yyyy
+                m = re.search(r"\b(\d{1,2}/\d{1,2}/20\d{2})\b", text)
+                if m:
+                    try:
+                        return datetime.strptime(m.group(1), "%m/%d/%Y").timestamp()
+                    except Exception:
+                        pass
+                # Relative phrases: "2 hours ago", "15 minutes ago", "8 months ago"
+                rel = (text or "").lower()
+                m = re.search(r"\b(\d+)\s*(minute|hour|day|week|month|year)s?\s+ago\b", rel)
+                if m:
+                    count = int(m.group(1))
+                    unit = m.group(2)
+                    delta = None
+                    if unit == "minute":
+                        delta = timedelta(minutes=count)
+                    elif unit == "hour":
+                        delta = timedelta(hours=count)
+                    elif unit == "day":
+                        delta = timedelta(days=count)
+                    elif unit == "week":
+                        delta = timedelta(weeks=count)
+                    elif unit == "month":
+                        delta = timedelta(days=30 * count)
+                    elif unit == "year":
+                        delta = timedelta(days=365 * count)
+                    if delta:
+                        return (datetime.utcnow() - delta).timestamp()
                 return None
 
             def _raw_date(node):
@@ -288,7 +332,13 @@ class BadvinScraper:
                     if raw:
                         return raw
                 text = node.get_text(" ", strip=True)
+                m = re.search(r"\((20\d{2}-\d{2}-\d{2})\)", text)
+                if m:
+                    return m.group(1)
                 m = re.search(r"(20\d{2}-\d{2}-\d{2})", text)
+                if m:
+                    return m.group(1)
+                m = re.search(r"\b(\d{1,2}/\d{1,2}/20\d{2})\b", text)
                 if m:
                     return m.group(1)
                 return None
@@ -311,15 +361,48 @@ class BadvinScraper:
             search_root = None
             record_summaries = []  # [(idx, ts, photo_count, raw_date)]
             if sale_section:
-                # Collect candidate sale-record blocks (some pages list multiple sale histories)
+                # Collect sale-record blocks. Some pages contain multiple "Sale Record" sections.
+                def _find_sale_record_blocks():
+                    blocks = []
+                    seen_ids = set()
+
+                    # Prefer explicit "Sale Record" headings to avoid matching nested gallery tiles.
+                    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5"], string=True):
+                        txt = (heading.get_text(" ", strip=True) or "").lower()
+                        if "sale record" not in txt:
+                            continue
+                        container = heading
+                        # Walk up to a container that actually holds images/gallery.
+                        for _ in range(8):
+                            if not container:
+                                break
+                            if container.find("div", class_=lambda c: c and "bv-gallery" in _cls_str(c)) or container.find("img"):
+                                break
+                            container = container.parent
+                        if container and id(container) not in seen_ids:
+                            seen_ids.add(id(container))
+                            blocks.append(container)
+
+                    # Fallback: use immediate children of the js-sale-record-container.
+                    if not blocks:
+                        for child in sale_section.find_all(recursive=False):
+                            if child.find("img") and id(child) not in seen_ids:
+                                seen_ids.add(id(child))
+                                blocks.append(child)
+
+                    # Last fallback: treat the whole container as one record.
+                    if not blocks:
+                        blocks = [sale_section]
+                    return blocks
+
                 candidates = []
-                for idx, node in enumerate(sale_section.find_all(["div", "section", "article", "li"], class_=lambda c: c and ("sale" in _cls_str(c) or "record" in _cls_str(c) or "bv-gallery" in _cls_str(c)))):
+                for idx, node in enumerate(_find_sale_record_blocks()):
                     gallery = node.find("div", class_=lambda c: c and "bv-gallery" in _cls_str(c)) or node
-                    candidates.append((idx, _parse_sale_date(node), gallery))
+                    candidates.append((idx, _parse_sale_date(node), gallery, node))
 
                 if candidates:
                     prepared_records = []
-                    for idx, ts, gallery in candidates:
+                    for idx, ts, gallery, node in candidates:
                         photos_local = []
                         def _push_local(url: str):
                             if not url:

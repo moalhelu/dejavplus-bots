@@ -677,8 +677,19 @@ async def _send_photo_batch(
     for url in cleaned:
         payload: Dict[str, Any] = {}
 
+        async def _retry(coro_factory, *, attempts: int = 3, base_sleep: float = 0.6):
+            last_exc: Optional[Exception] = None
+            for attempt in range(attempts):
+                try:
+                    return await coro_factory()
+                except Exception as exc:  # pragma: no cover
+                    last_exc = exc
+                    await asyncio.sleep(base_sleep * (attempt + 1))
+            if last_exc:
+                raise last_exc
+
         try:
-            await client.send_image(msisdn, image_url=url, **payload)
+            await _retry(lambda: client.send_image(msisdn, image_url=url, **payload))
             sent += 1
             continue
         except Exception as exc:  # pragma: no cover - network dependent
@@ -690,7 +701,12 @@ async def _send_photo_batch(
                 exc,
             )
 
-        data = await download_image_bytes(url)
+        data: Optional[bytes] = None
+        for attempt in range(3):
+            data = await download_image_bytes(url)
+            if data:
+                break
+            await asyncio.sleep(0.4 * (attempt + 1))
         if not data:
             failed_urls.append(url)
             LOGGER.warning(
@@ -703,7 +719,7 @@ async def _send_photo_batch(
 
         try:
             b64 = base64.b64encode(data).decode("ascii")
-            await client.send_image(msisdn, image_base64=b64, **payload)
+            await _retry(lambda: client.send_image(msisdn, image_base64=b64, **payload))
             sent += 1
         except Exception as exc:  # pragma: no cover - network dependent
             failed_urls.append(url)
@@ -714,6 +730,9 @@ async def _send_photo_batch(
                 url,
                 exc,
             )
+
+        # Small pacing to reduce WhatsApp provider throttling.
+        await asyncio.sleep(0.15)
 
     LOGGER.info(
         "whatsapp: photo send summary vin=%s choice=%s sent=%s failed=%s total=%s",
@@ -1467,7 +1486,11 @@ def _resolve_ultramsg_settings() -> tuple[str, str, str]:
 def _build_client() -> UltraMsgClient:
     instance_id, token, base_url = _resolve_ultramsg_settings()
     creds = UltraMsgCredentials(instance_id=instance_id, token=token, base_url=base_url)
-    return UltraMsgClient(creds)
+    try:
+        timeout = float(os.getenv("ULTRAMSG_TIMEOUT", "25") or 25.0)
+    except Exception:
+        timeout = 25.0
+    return UltraMsgClient(creds, timeout=timeout)
 
 
 def _get_ultramsg_client(request: Optional[Request] = None) -> UltraMsgClient:

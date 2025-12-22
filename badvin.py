@@ -4,6 +4,8 @@ import re
 import json
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import logging
@@ -132,7 +134,26 @@ class BadvinScraper:
         self.session = requests.Session()
         self.base_url = "https://badvin.com"
         self.logged_in = False
-        self.timeout = float(os.getenv("BADVIN_REQUEST_TIMEOUT", "12") or 12.0)
+        # Network requests must have a timeout to avoid hanging forever.
+        # This is per-request (not a global cut-off) and is paired with retries below.
+        self.timeout = float(os.getenv("BADVIN_REQUEST_TIMEOUT", "20") or 20.0)
+
+        try:
+            retries = Retry(
+                total=int(os.getenv("BADVIN_HTTP_RETRIES", "3") or 3),
+                connect=int(os.getenv("BADVIN_HTTP_RETRIES", "3") or 3),
+                read=int(os.getenv("BADVIN_HTTP_RETRIES", "3") or 3),
+                backoff_factor=float(os.getenv("BADVIN_HTTP_BACKOFF", "0.5") or 0.5),
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=frozenset(["GET", "POST"]),
+                raise_on_status=False,
+                respect_retry_after_header=True,
+            )
+            adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+        except Exception:
+            pass
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",

@@ -5229,14 +5229,21 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+    tg_id = str(q.from_user.id) if (q and q.from_user) else ""
+    user_lang: Optional[str] = None
     try:
-        _, action, vin = q.data.split(":", 2)
+        db = _load_db()
+        u = _ensure_user(db, tg_id, None)
+        user_lang = _get_user_report_lang(u)
+    except Exception:
+        user_lang = None
+
+    try:
+        _, action, vin = (q.data or "").split(":", 2)
     except ValueError:
         return await q.answer(_bridge.t("common.invalid_button", user_lang), show_alert=True)
-    tg_id = str(q.from_user.id)
-    db = _load_db()
-    u = _ensure_user(db, tg_id, None)
-    services = u.get("services", {})
+    services = u.get("services", {}) if isinstance(u, dict) else {}
 
     def _accident_no_images(lang: str) -> str:
         return _bridge.t("report.photos.empty.accident", lang)
@@ -5244,7 +5251,7 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def _accident_error(lang: str) -> str:
         return _bridge.t("report.photos.accident.error", lang)
 
-    user_lang = _get_user_report_lang(u)
+    # user_lang is already derived above (fallback None)
 
     photo_actions: Dict[str, Dict[str, Any]] = {
         "badvin": {
@@ -5283,57 +5290,104 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat_id
     status_msg = None
 
+    status_timeout = float(os.getenv("TELEGRAM_PHOTOS_STATUS_TIMEOUT", "8") or 8.0)
+
     async def _status_update(text: str, *, markup: Optional[InlineKeyboardMarkup] = None) -> bool:
         if not status_msg:
             return False
         try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg.message_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
+            await asyncio.wait_for(
+                context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                ),
+                timeout=status_timeout,
             )
             return True
         except Exception:
             return False
 
     try:
-        status_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=_bridge.t("report.photos.collecting", user_lang, label=info["label"], vin=vin),
-            parse_mode=ParseMode.HTML,
+        status_msg = await asyncio.wait_for(
+            context.bot.send_message(
+                chat_id=chat_id,
+                text=_bridge.t("report.photos.collecting", user_lang, label=info["label"], vin=vin),
+                parse_mode=ParseMode.HTML,
+            ),
+            timeout=status_timeout,
         )
     except Exception:
         status_msg = None
 
+    loader_timeout = float(os.getenv("TELEGRAM_PHOTOS_LOADER_TIMEOUT", "12") or 12.0)
+    image_timeout = float(os.getenv("TELEGRAM_PHOTOS_IMAGE_TIMEOUT", "8") or 8.0)
+    send_timeout = float(os.getenv("TELEGRAM_PHOTOS_SEND_TIMEOUT", "15") or 15.0)
+    max_photos = max(1, min(10, int(os.getenv("TELEGRAM_PHOTOS_MAX", "10") or 10)))
+
     try:
         if action == "accident":
             logger.info("telegram: fetching accident images via apicar vin=%s", vin)
-        urls = await info["loader"](vin)
-    except Exception:
-        if action == "accident":
-            err_msg = _accident_error(user_lang)
-        else:
-            err_msg = info["empty"]
+        urls = await asyncio.wait_for(info["loader"](vin), timeout=loader_timeout)
+    except asyncio.TimeoutError:
+        err_msg = _accident_error(user_lang) if action == "accident" else info["empty"]
         if not await _status_update(err_msg):
-            await context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode=ParseMode.HTML)
+            try:
+                await asyncio.wait_for(
+                    context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode=ParseMode.HTML),
+                    timeout=status_timeout,
+                )
+            except Exception:
+                pass
+        return
+    except Exception:
+        err_msg = _accident_error(user_lang) if action == "accident" else info["empty"]
+        if not await _status_update(err_msg):
+            try:
+                await asyncio.wait_for(
+                    context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode=ParseMode.HTML),
+                    timeout=status_timeout,
+                )
+            except Exception:
+                pass
         return
 
     urls = _select_images(urls)
     if not urls:
         no_images_msg = info["empty"]
         if not await _status_update(no_images_msg):
-            await context.bot.send_message(chat_id=chat_id, text=no_images_msg, parse_mode=ParseMode.HTML)
+            try:
+                await asyncio.wait_for(
+                    context.bot.send_message(chat_id=chat_id, text=no_images_msg, parse_mode=ParseMode.HTML),
+                    timeout=status_timeout,
+                )
+            except Exception:
+                pass
         return
+
+    urls = urls[:max_photos]
 
     BATCH = 10
     sent_any = False
     for i in range(0, len(urls), BATCH):
         chunk = urls[i:i+BATCH]
         media: List[InputMediaPhoto] = []
-        for url in chunk:
-            data = await _download_image_bytes(url)
+
+        async def _fetch(url: str) -> Tuple[str, Optional[bytes]]:
+            try:
+                data = await asyncio.wait_for(_download_image_bytes(url), timeout=image_timeout)
+                return url, data
+            except Exception:
+                return url, None
+
+        try:
+            results = await asyncio.gather(*(_fetch(url) for url in chunk))
+        except Exception:
+            results = []
+
+        for url, data in results:
             if not data:
                 continue
             filename = url.split("?")[0].split("/")[-1] or "photo.jpg"
@@ -5345,15 +5399,47 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not media:
             continue
         try:
-            await context.bot.send_media_group(chat_id=chat_id, media=media)
-            sent_any = True
+            for attempt in range(3):
+                try:
+                    await asyncio.wait_for(
+                        context.bot.send_media_group(chat_id=chat_id, media=media),
+                        timeout=send_timeout,
+                    )
+                    sent_any = True
+                    break
+                except Exception:
+                    await asyncio.sleep(0.6 * (attempt + 1))
+            else:
+                raise RuntimeError("send_media_group_failed")
         except Exception:
+            # Fallback: send individually so a single invalid photo doesn't block the whole batch.
+            for item in media:
+                try:
+                    for attempt in range(2):
+                        try:
+                            # item.media can be InputFile/bytes-like; PTB accepts file-like objects.
+                            await asyncio.wait_for(
+                                context.bot.send_photo(chat_id=chat_id, photo=item.media),
+                                timeout=send_timeout,
+                            )
+                            sent_any = True
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                except Exception:
+                    continue
             continue
 
     if not sent_any:
         fail_msg = _bridge.t("report.photos.error", user_lang)
         if not await _status_update(fail_msg):
-            await context.bot.send_message(chat_id=chat_id, text=fail_msg, parse_mode=ParseMode.HTML)
+            try:
+                await asyncio.wait_for(
+                    context.bot.send_message(chat_id=chat_id, text=fail_msg, parse_mode=ParseMode.HTML),
+                    timeout=status_timeout,
+                )
+            except Exception:
+                pass
         return
 
     left_days = _days_left(u.get("expiry_date"))
@@ -5363,7 +5449,13 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     credit_line = _bridge.t("report.summary.unlimited", user_lang) if monthly_remaining is None else _bridge.t("report.summary.credit", user_lang, remaining=monthly_remaining, limit=monthly_limit)
     summary = _bridge.t("report.summary.sent", user_lang, label=info["label"], vin=vin, expires=days_txt, credit=credit_line)
     if not await _status_update(summary):
-        await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode=ParseMode.HTML)
+        try:
+            await asyncio.wait_for(
+                context.bot.send_message(chat_id=chat_id, text=summary, parse_mode=ParseMode.HTML),
+                timeout=status_timeout,
+            )
+        except Exception:
+            pass
 
     await q.answer(_bridge.t("report.photos.toast", user_lang), show_alert=False)
 

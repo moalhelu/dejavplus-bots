@@ -20,7 +20,6 @@ except Exception:  # pragma: no cover
     BadvinScraper = None  # type: ignore
 
 _CACHE_TTL = 30 * 60  # seconds
-_BADVIN_TOTAL_TIMEOUT = float(os.getenv("BADVIN_TOTAL_TIMEOUT", "25") or 25.0)
 _IMAGE_CACHE: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
 _BADVIN_SEM = asyncio.Semaphore(2)  # simple rate-limit for Badvin login/scrape
 _PHOTO_EXCLUDE_MARKERS = (
@@ -100,11 +99,10 @@ async def get_badvin_images(vin: str) -> List[str]:
             LOGGER.warning("badvin fetch failed vin=%s error=%s", vin, last_err)
         return []
 
-    try:
-        urls = await asyncio.wait_for(_fetch_with_retries(), timeout=_BADVIN_TOTAL_TIMEOUT)
-    except asyncio.TimeoutError:
-        LOGGER.warning("badvin fetch timed out vin=%s timeout=%s", vin, _BADVIN_TOTAL_TIMEOUT)
-        urls = []
+    # Do not enforce a global cut-off here; BadvinScraper has per-request timeouts
+    # and an HTTP retry adapter. This avoids "timed out" behavior while still
+    # preventing infinite hangs.
+    urls = await _fetch_with_retries()
     if urls:
         _cache_set(key, urls)
     return urls

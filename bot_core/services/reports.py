@@ -72,6 +72,27 @@ def _html_looks_renderable(html: str) -> bool:
     return True
 
 
+def _pdf_bytes_looks_ok(pdf_bytes: Optional[bytes]) -> bool:
+    if not pdf_bytes:
+        return False
+    if not pdf_bytes.startswith(b"%PDF"):
+        return False
+    return len(pdf_bytes) >= 30_000
+
+
+def _en_hedged_render_enabled() -> bool:
+    return (os.getenv("EN_HEDGED_RENDER", "1") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _en_hedge_delay_ms() -> int:
+    raw = (os.getenv("EN_HEDGE_DELAY_MS", "700") or "").strip()
+    try:
+        val = int(raw)
+    except Exception:
+        val = 700
+    return max(0, min(val, 5_000))
+
+
 def _t(key: str, lang: str, _fallback: Optional[str] = None, **kwargs: Any) -> str:
     """Lazy translation helper to avoid hardcoded strings."""
 
@@ -438,25 +459,80 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
         else:
             pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
     else:
-        # Optional fast path for single-user English: fetch HTML over HTTP and render without Playwright URL.
-        if _prefer_http_fetch_for_en_enabled():
+        lang_code = (language or "en").lower()
+
+        # English: hedge (parallelize) to reduce tail latency.
+        # - Fast path: HTTP GET HTML (short timeout) -> Chromium render from HTML.
+        # - Slow path: Chromium render from URL (may wait for networkidle).
+        if lang_code == "en" and _prefer_http_fetch_for_en_enabled() and _en_hedged_render_enabled():
+            async def _http_html_render() -> Optional[bytes]:
+                nonlocal html
+                try:
+                    async with atimed("report.fetch_html", vin=vin, lang=language, mode="http"):
+                        html = await _fetch_page_html_http_only(url)
+                except Exception:
+                    html = None
+                if html and _html_looks_renderable(html):
+                    return await html_to_pdf_bytes_chromium(html_str=html)
+                return None
+
+            async def _url_render() -> Optional[bytes]:
+                delay_ms = _en_hedge_delay_ms()
+                if delay_ms:
+                    try:
+                        await asyncio.sleep(delay_ms / 1000.0)
+                    except Exception:
+                        pass
+                return await html_to_pdf_bytes_chromium(url=url)
+
+            http_task = asyncio.create_task(_http_html_render())
+            url_task = asyncio.create_task(_url_render())
             try:
-                async with atimed("report.fetch_html", vin=vin, lang=language, mode="http"):
-                    html = await _fetch_page_html_http_only(url)
-            except Exception:
-                html = None
-            if html and _html_looks_renderable(html):
-                # IMPORTANT: For English, prefer Chromium for HTML rendering.
-                # WeasyPrint will attempt to fetch many external assets referenced by the HTML
-                # (and can be slow / noisy with warnings). Chromium path is typically faster,
-                # supports our PDF_BLOCK_RESOURCE_TYPES knob, and has a safe fallback.
-                pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html)
+                pending = {http_task, url_task}
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        try:
+                            candidate = task.result()
+                        except Exception:
+                            candidate = None
+                        if _pdf_bytes_looks_ok(candidate):
+                            pdf_bytes = candidate
+                            for p in pending:
+                                p.cancel()
+                            pending = set()
+                            break
                 if not pdf_bytes:
-                    pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language)
+                    # If neither produced a valid PDF, await results for fallbacks below.
+                    try:
+                        pdf_bytes = http_task.result() if http_task.done() else await http_task
+                    except Exception:
+                        pdf_bytes = None
+                    if not _pdf_bytes_looks_ok(pdf_bytes):
+                        try:
+                            pdf_bytes = url_task.result() if url_task.done() else await url_task
+                        except Exception:
+                            pdf_bytes = None
+            finally:
+                for t in (http_task, url_task):
+                    if not t.done():
+                        t.cancel()
+        else:
+            # Non-English or hedging disabled: keep existing behavior.
+            if _prefer_http_fetch_for_en_enabled() and lang_code == "en":
+                try:
+                    async with atimed("report.fetch_html", vin=vin, lang=language, mode="http"):
+                        html = await _fetch_page_html_http_only(url)
+                except Exception:
+                    html = None
+                if html and _html_looks_renderable(html):
+                    pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html)
+                    if not pdf_bytes:
+                        pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language)
+                else:
+                    pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
             else:
                 pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
-        else:
-            pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
 
     if not pdf_bytes and html:
         pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html)

@@ -311,27 +311,65 @@ async def _google_free_batch(texts: List[str], target_lang: str) -> List[str]:
     timeout = aiohttp.ClientTimeout(total=FREE_GOOGLE_TIMEOUT)
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    async def _one(text: str) -> str:
-        params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
-        async with sem:
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, params=params) as resp:
-                        data = await resp.json(content_type=None)
-                        if isinstance(data, list) and data and isinstance(data[0], list):
-                            parts: List[str] = []
-                            for entry in data[0]:
-                                if isinstance(entry, list) and entry:
-                                    segment = entry[0]
-                                    if isinstance(segment, str):
-                                        parts.append(segment)
-                            return "".join(parts) if parts else text
-            except Exception:
-                return text
-            return text
+    # Translate many strings per request by joining them with a delimiter that
+    # is very unlikely to be changed by translation.
+    # This avoids issuing hundreds of HTTP requests for large HTML pages.
+    delimiter = "[[[DVSEP]]]"
+    max_chars_per_request = 3500
 
-    gathered = await asyncio.gather(*[_one(t) for t in texts])
-    results.extend(gathered)
+    def _chunk_texts(items: List[str]) -> List[List[str]]:
+        chunks: List[List[str]] = []
+        current: List[str] = []
+        current_len = 0
+        for item in items:
+            item = item or ""
+            add_len = len(item) + (len(delimiter) if current else 0)
+            if current and current_len + add_len > max_chars_per_request:
+                chunks.append(current)
+                current = [item]
+                current_len = len(item)
+                continue
+            if current:
+                current_len += len(delimiter)
+            current.append(item)
+            current_len += len(item)
+        if current:
+            chunks.append(current)
+        return chunks
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        async def _translate_joined(joined: str) -> str:
+            params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": joined}
+            try:
+                async with session.get(url, params=params) as resp:
+                    data = await resp.json(content_type=None)
+                    if isinstance(data, list) and data and isinstance(data[0], list):
+                        parts: List[str] = []
+                        for entry in data[0]:
+                            if isinstance(entry, list) and entry:
+                                segment = entry[0]
+                                if isinstance(segment, str):
+                                    parts.append(segment)
+                        return "".join(parts) if parts else joined
+            except Exception:
+                return joined
+            return joined
+
+        async def _one_chunk(chunk: List[str]) -> List[str]:
+            joined = delimiter.join(chunk)
+            async with sem:
+                translated_joined = await _translate_joined(joined)
+            parts = translated_joined.split(delimiter)
+            if len(parts) != len(chunk):
+                # If the delimiter got altered, fail-soft for this chunk.
+                return chunk
+            return parts
+
+        chunks = _chunk_texts(texts)
+        translated_chunks = await asyncio.gather(*[_one_chunk(ch) for ch in chunks])
+        for ch in translated_chunks:
+            results.extend(ch)
     return results
 
 
@@ -537,7 +575,10 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
             # If no change happened (provider failed silently), try batched Google free as last resort
             if no_change and target_lang != "en":
                 try:
-                    fallback_rebuilt = await _google_free_batch(originals, target_lang)
+                    fallback_rebuilt = await asyncio.wait_for(
+                        _google_free_batch(originals, target_lang),
+                        timeout=FREE_GOOGLE_TIMEOUT + 1,
+                    )
                     rebuilt = fallback_rebuilt if len(fallback_rebuilt) == len(originals) else originals
                 except Exception:
                     rebuilt = originals

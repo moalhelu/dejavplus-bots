@@ -630,59 +630,12 @@ async def _maybe_translate_html(html: Optional[str], lang: str) -> str:
     if lang_code == "en":
         return html
 
+    # Fail-fast translation: avoid slow fallbacks that can exceed our budget.
     timeout_s = float(os.getenv("TRANSLATE_TIMEOUT_SEC", "6.0") or 6.0)
-
-    # Hedge translation to reduce tail latency: start the primary translator and
-    # a fast Google fallback (slightly delayed) in parallel, then take the first
-    # successful result.
-    if _translate_hedge_enabled():
-        async def _primary() -> Optional[str]:
-            try:
-                return await asyncio.wait_for(translate_html(html, lang_code), timeout=timeout_s)
-            except Exception:
-                return None
-
-        async def _quick() -> Optional[str]:
-            delay_ms = _translate_hedge_delay_ms()
-            if delay_ms:
-                try:
-                    await asyncio.sleep(delay_ms / 1000.0)
-                except Exception:
-                    pass
-            try:
-                out = await _quick_translate_html_google(html, lang_code, timeout=min(5.0, max(1.0, timeout_s)))
-                return out if out else None
-            except Exception:
-                return None
-
-        primary_task = asyncio.create_task(_primary())
-        quick_task = asyncio.create_task(_quick())
-        try:
-            pending = {primary_task, quick_task}
-            while pending:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    try:
-                        result = task.result()
-                    except Exception:
-                        result = None
-                    if result and result.strip():
-                        for p in pending:
-                            p.cancel()
-                        return result
-            # Nothing succeeded
-            return inject_rtl(html, lang=lang_code)
-        finally:
-            for t in (primary_task, quick_task):
-                if not t.done():
-                    t.cancel()
-
-    # Non-hedged legacy behavior
     try:
         return await asyncio.wait_for(translate_html(html, lang_code), timeout=timeout_s)
     except Exception:
-        quick = await _quick_translate_html_google(html, lang_code, timeout=min(5.0, max(1.0, timeout_s)))
-        return quick if quick else inject_rtl(html, lang=lang_code)
+        return inject_rtl(html, lang=lang_code)
 
 
 async def _fetch_page_html(url: str) -> Optional[str]:

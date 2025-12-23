@@ -110,6 +110,45 @@ async def get_badvin_images(vin: str) -> List[str]:
     return urls
 
 
+async def get_badvin_images_media(vin: str, *, limit: int = 10) -> List[Tuple[str, bytes]]:
+    """Fetch BadVin photos as (filename, bytes) using an authenticated session.
+
+    Some deployments (Telegram/WhatsApp) import this helper to reliably send
+    protected BadVin images. If the site allows direct URL fetching, callers can
+    still use `get_badvin_images`.
+    """
+
+    cfg = get_env()
+    if not BadvinScraper or not cfg.badvin_email or not cfg.badvin_password:
+        return []
+
+    safe_limit = max(1, min(10, int(limit)))
+
+    async def _fetch_once() -> List[Tuple[str, bytes]]:
+        return await asyncio.to_thread(
+            _badvin_fetch_media_sync,
+            vin,
+            cfg.badvin_email,
+            cfg.badvin_password,
+            safe_limit,
+        )
+
+    last_err: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            async with _BADVIN_SEM:
+                return await asyncio.wait_for(_fetch_once(), timeout=_BADVIN_TOTAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            last_err = RuntimeError("badvin media fetch timed out")
+        except Exception as exc:  # pragma: no cover
+            last_err = exc
+        await asyncio.sleep(0.5 * (attempt + 1))
+
+    if last_err:
+        LOGGER.warning("badvin media fetch failed vin=%s error=%s", vin, last_err)
+    return []
+
+
 def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
     if BadvinScraper is None:
         raise RuntimeError("BadvinScraper dependency is unavailable")
@@ -176,6 +215,66 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
         return deduped
     except Exception:
         return []
+    finally:
+        try:
+            scraper.logout()
+        except Exception:
+            pass
+
+
+def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) -> List[Tuple[str, bytes]]:
+    if BadvinScraper is None:
+        raise RuntimeError("BadvinScraper dependency is unavailable")
+
+    def _filename_from_url(url: str) -> str:
+        try:
+            base = (url or "").split("?", 1)[0].rstrip("/")
+            name = base.rsplit("/", 1)[-1] or "photo.jpg"
+        except Exception:
+            name = "photo.jpg"
+        if "." not in name:
+            name += ".jpg"
+        return name
+
+    scraper = BadvinScraper(email, password)
+    try:
+        if not scraper.login():
+            return []
+        result_url = scraper.search_vin(vin)
+        if not result_url:
+            return []
+
+        # Reuse the URL extraction logic (oldest sale record with photos) then download bytes.
+        urls = _badvin_fetch_sync(vin, email, password)
+        if not urls:
+            return []
+
+        headers = dict(scraper.headers)
+        headers["Referer"] = result_url
+        headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+
+        media: List[Tuple[str, bytes]] = []
+        seen: set[str] = set()
+        for url in urls:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            try:
+                resp = scraper.session.get(url, headers=headers, timeout=getattr(scraper, "timeout", 12.0))
+                if getattr(resp, "status_code", 0) >= 400:
+                    continue
+                ctype = str(resp.headers.get("content-type", "")).lower()
+                if "image" not in ctype:
+                    continue
+                content = resp.content or b""
+                if len(content) < 128:
+                    continue
+                media.append((_filename_from_url(url), content))
+                if len(media) >= limit:
+                    break
+            except Exception:
+                continue
+        return media
     finally:
         try:
             scraper.logout()

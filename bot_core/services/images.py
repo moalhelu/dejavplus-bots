@@ -196,14 +196,26 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
                 html_candidates.append(html)
 
         images: List[str] = []
+        last_car_data: Dict[str, Any] = {}
         for html in html_candidates:
             if not html:
                 continue
-            _, images = scraper.extract_car_data_and_images(html, vin)
+            car_data, images = scraper.extract_car_data_and_images(html, vin)
+            if isinstance(car_data, dict):
+                last_car_data = car_data
             if images:
                 break
 
         if not images:
+            if last_car_data:
+                LOGGER.info(
+                    "badvin: no images vin=%s diag source=%s sale_section=%s blocks=%s json_records=%s",
+                    vin,
+                    last_car_data.get("source"),
+                    last_car_data.get("sale_section_found"),
+                    last_car_data.get("sale_record_blocks"),
+                    last_car_data.get("json_records"),
+                )
             return []
         deduped: List[str] = []
         for url in images:
@@ -244,9 +256,60 @@ def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) ->
         if not result_url:
             return []
 
-        # Reuse the URL extraction logic (oldest sale record with photos) then download bytes.
-        urls = _badvin_fetch_sync(vin, email, password)
+        def _fetch_html(url: str) -> str:
+            try:
+                r = scraper.session.get(url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 12.0))
+                return getattr(r, "text", "") or ""
+            except Exception:
+                return ""
+
+        html_candidates: List[str] = []
+        html_candidates.append(_fetch_html(result_url))
+
+        report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "full,basic")
+        report_types = [t.strip().lower() for t in report_types_raw.split(",") if t.strip()]
+        for rtype in (report_types or ["basic"]):
+            try:
+                _, report_html = scraper.get_report(result_url, vin, rtype)
+                if report_html:
+                    html_candidates.append(report_html)
+            except Exception:
+                continue
+
+        extra_urls = [
+            result_url.rstrip("/") + "/photos",
+            result_url.rstrip("/") + "/photos/",
+            result_url.rstrip("/") + "/sales-history",
+            result_url.rstrip("/") + "/sales-history/",
+            result_url + "?tab=photos",
+            result_url + "?tab=sales",
+        ]
+        for u in extra_urls:
+            html = _fetch_html(u)
+            if html:
+                html_candidates.append(html)
+
+        urls: List[str] = []
+        last_car_data: Dict[str, Any] = {}
+        for html in html_candidates:
+            if not html:
+                continue
+            car_data, urls = scraper.extract_car_data_and_images(html, vin)
+            if isinstance(car_data, dict):
+                last_car_data = car_data
+            if urls:
+                break
+
         if not urls:
+            if last_car_data:
+                LOGGER.info(
+                    "badvin media: no urls vin=%s diag source=%s sale_section=%s blocks=%s json_records=%s",
+                    vin,
+                    last_car_data.get("source"),
+                    last_car_data.get("sale_section_found"),
+                    last_car_data.get("sale_record_blocks"),
+                    last_car_data.get("json_records"),
+                )
             return []
 
         headers = dict(scraper.headers)

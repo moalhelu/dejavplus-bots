@@ -34,8 +34,8 @@ from bot_core import bridge as _bridge
 from bot_core.clients.ultramsg import UltraMsgClient, UltraMsgCredentials, UltraMsgError
 from bot_core.config import get_report_default_lang, get_ultramsg_settings, is_super_admin
 from bot_core.services.images import (
-    get_badvin_images,
     get_badvin_images_media,
+    get_badvin_images,
     get_apicar_current_images,
     get_apicar_history_images,
     get_apicar_accident_images,
@@ -678,19 +678,8 @@ async def _send_photo_batch(
     for url in cleaned:
         payload: Dict[str, Any] = {}
 
-        async def _retry(coro_factory, *, attempts: int = 3, base_sleep: float = 0.6):
-            last_exc: Optional[Exception] = None
-            for attempt in range(attempts):
-                try:
-                    return await coro_factory()
-                except Exception as exc:  # pragma: no cover
-                    last_exc = exc
-                    await asyncio.sleep(base_sleep * (attempt + 1))
-            if last_exc:
-                raise last_exc
-
         try:
-            await _retry(lambda: client.send_image(msisdn, image_url=url, **payload))
+            await client.send_image(msisdn, image_url=url, **payload)
             sent += 1
             continue
         except Exception as exc:  # pragma: no cover - network dependent
@@ -702,12 +691,7 @@ async def _send_photo_batch(
                 exc,
             )
 
-        data: Optional[bytes] = None
-        for attempt in range(3):
-            data = await download_image_bytes(url)
-            if data:
-                break
-            await asyncio.sleep(0.4 * (attempt + 1))
+        data = await download_image_bytes(url)
         if not data:
             failed_urls.append(url)
             LOGGER.warning(
@@ -720,7 +704,7 @@ async def _send_photo_batch(
 
         try:
             b64 = base64.b64encode(data).decode("ascii")
-            await _retry(lambda: client.send_image(msisdn, image_base64=b64, **payload))
+            await client.send_image(msisdn, image_base64=b64, **payload)
             sent += 1
         except Exception as exc:  # pragma: no cover - network dependent
             failed_urls.append(url)
@@ -731,9 +715,6 @@ async def _send_photo_batch(
                 url,
                 exc,
             )
-
-        # Small pacing to reduce WhatsApp provider throttling.
-        await asyncio.sleep(0.15)
 
     LOGGER.info(
         "whatsapp: photo send summary vin=%s choice=%s sent=%s failed=%s total=%s",
@@ -762,71 +743,6 @@ async def _send_photo_batch(
     return {"status": "ok", "images": 0, "failed": len(failed_urls) or len(cleaned)}
 
 
-async def _send_photo_batch_media(
-    msisdn: str,
-    user_ctx: _bridge.UserContext,
-    vin: str,
-    media_items: List[tuple[str, bytes]],
-    client: UltraMsgClient,
-    *,
-    choice: str,
-) -> Dict[str, Any]:
-    cleaned = media_items[:10]
-    LOGGER.info(
-        "whatsapp: photos(media) fetched choice=%s vin=%s total=%s",
-        choice,
-        vin,
-        len(cleaned),
-    )
-
-    if not cleaned:
-        await send_whatsapp_text(
-            msisdn,
-            _photo_no_images_message(user_ctx.language, choice),
-            client=client,
-        )
-        await _send_report_options_prompt(msisdn, client, vin)
-        return {"status": "ok", "images": 0, "empty": True}
-
-    sent = 0
-    for filename, data in cleaned:
-        payload: Dict[str, Any] = {}
-
-        async def _retry(coro_factory, *, attempts: int = 3, base_sleep: float = 0.6):
-            last_exc: Optional[Exception] = None
-            for attempt in range(attempts):
-                try:
-                    return await coro_factory()
-                except Exception as exc:  # pragma: no cover
-                    last_exc = exc
-                    await asyncio.sleep(base_sleep * (attempt + 1))
-            if last_exc:
-                raise last_exc
-
-        try:
-            b64 = base64.b64encode(data).decode("ascii")
-            await _retry(lambda: client.send_image(msisdn, image_base64=b64, filename=(filename or None), **payload))
-            sent += 1
-        except Exception as exc:  # pragma: no cover
-            LOGGER.warning(
-                "whatsapp: failed to send badvin image_base64 vin=%s choice=%s file=%s error=%s",
-                vin,
-                choice,
-                filename,
-                exc,
-            )
-        await asyncio.sleep(0.15)
-
-    if sent > 0:
-        await send_whatsapp_text(msisdn, _bridge.t("wa.photos.sent_count", user_ctx.language, count=sent), client=client)
-        await _send_report_options_prompt(msisdn, client, vin)
-        return {"status": "ok", "images": sent}
-
-    await send_whatsapp_text(msisdn, _photo_send_error_message(user_ctx.language), client=client)
-    await _send_report_options_prompt(msisdn, client, vin)
-    return {"status": "ok", "images": 0}
-
-
 async def _handle_report_option_choice(
     msisdn: str,
     user_ctx: _bridge.UserContext,
@@ -836,20 +752,9 @@ async def _handle_report_option_choice(
 ) -> Dict[str, Any]:
     """Fetch and send the chosen photo bundle (badvin/accident/auction)."""
 
-    if choice == "wa_opt_badvin":
-        LOGGER.info("whatsapp: report photos choice=%s vin=%s user=%s", choice, vin, user_ctx.user_id)
-        await send_whatsapp_text(msisdn, _bridge.t("wa.photos.fetching", user_ctx.language, vin=vin), client=client)
-        try:
-            media_items = await get_badvin_images_media(vin, limit=10)
-        except Exception as exc:  # pragma: no cover
-            LOGGER.warning("Failed to fetch badvin media vin=%s: %s", vin, exc)
-            await send_whatsapp_text(msisdn, _photo_fetch_error_message(user_ctx.language, choice), client=client)
-            await _send_report_options_prompt(msisdn, client, vin)
-            return {"status": "error", "reason": "fetch_failed"}
-        return await _send_photo_batch_media(msisdn, user_ctx, vin, media_items or [], client, choice=choice)
-
     fetchers = {
         "wa_opt_accident": get_apicar_accident_images,
+        "wa_opt_badvin": get_badvin_images,
     }
     fetcher = fetchers.get(choice)
     if not fetcher:
@@ -859,6 +764,31 @@ async def _handle_report_option_choice(
 
     LOGGER.info("whatsapp: report photos choice=%s vin=%s user=%s", choice, vin, user_ctx.user_id)
     await send_whatsapp_text(msisdn, _bridge.t("wa.photos.fetching", user_ctx.language, vin=vin), client=client)
+
+    # BadVin images are frequently protected; prefer authenticated bytes.
+    if choice == "wa_opt_badvin":
+        try:
+            media_items = await get_badvin_images_media(vin, limit=10)
+        except Exception as exc:  # pragma: no cover
+            LOGGER.warning("whatsapp: badvin media fetch failed vin=%s error=%s", vin, exc)
+            media_items = []
+
+        if media_items:
+            sent = 0
+            for _, data in media_items:
+                if not data:
+                    continue
+                try:
+                    b64 = base64.b64encode(data).decode("ascii")
+                    await client.send_image(msisdn, image_base64=b64)
+                    sent += 1
+                except Exception as exc:  # pragma: no cover
+                    LOGGER.warning("whatsapp: failed to send badvin media_base64 vin=%s error=%s", vin, exc)
+
+            if sent > 0:
+                await send_whatsapp_text(msisdn, _bridge.t("wa.photos.sent_count", user_ctx.language, count=sent), client=client)
+                await _send_report_options_prompt(msisdn, client, vin)
+                return {"status": "ok", "images": sent}
 
     try:
         if choice == "wa_opt_accident":
@@ -1563,11 +1493,7 @@ def _resolve_ultramsg_settings() -> tuple[str, str, str]:
 def _build_client() -> UltraMsgClient:
     instance_id, token, base_url = _resolve_ultramsg_settings()
     creds = UltraMsgCredentials(instance_id=instance_id, token=token, base_url=base_url)
-    try:
-        timeout = float(os.getenv("ULTRAMSG_TIMEOUT", "25") or 25.0)
-    except Exception:
-        timeout = 25.0
-    return UltraMsgClient(creds, timeout=timeout)
+    return UltraMsgClient(creds)
 
 
 def _get_ultramsg_client(request: Optional[Request] = None) -> UltraMsgClient:

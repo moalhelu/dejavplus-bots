@@ -231,6 +231,22 @@ from telegram.constants import ParseMode
 MAIN_MENU_TEXTS = tuple(_bridge.t("menu.header", lang) for lang in ("ar", "en", "ku", "ckb"))
 MAIN_MENU_BUTTON_REGEX = r"^(?:" + "|".join(re.escape(x) for x in MAIN_MENU_TEXTS) + r")$"
 
+# Open the main menu only when the user explicitly asks for it.
+_MENU_SHOW_KEYWORDS_BASE = {"/menu", "menu", "main menu", "mainmenu", ".", "القائمة", "قائمة"}
+MENU_SHOW_KEYWORDS = set(_MENU_SHOW_KEYWORDS_BASE)
+for _lang in ("ar", "en", "ku", "ckb"):
+    _header = _bridge.t("menu.header", _lang)
+    if _header:
+        MENU_SHOW_KEYWORDS.add((_header or "").strip().lower())
+        MENU_SHOW_KEYWORDS.add((_header or "").replace("🏠", "").strip().lower())
+
+
+def _menu_hint_text(lang: Optional[str]) -> str:
+    lang_code = _normalize_report_lang_code(lang)
+    if lang_code == "ar":
+        return "أرسل نقطة (.) لفتح القائمة الرئيسية أو أرسل رقم VIN."
+    return "Send '.' to open the main menu, or send a VIN."
+
 
 def _main_menu_button_text(lang: Optional[str]) -> str:
     return _bridge.t("menu.header", _normalize_report_lang_code(lang))
@@ -4188,6 +4204,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_super = _is_super_admin(str(update.effective_user.id))
     is_admin = _is_admin_tg(str(update.effective_user.id))
     txt = (update.message.text or "").strip()
+        # Open main menu only on explicit user request
+        try:
+            lower_txt = (txt or "").strip().lower()
+        except Exception:
+            lower_txt = ""
+        if lower_txt in MENU_SHOW_KEYWORDS:
+            await _show_main_menu_single()
+            return
     raw_payload = _bridge_raw_payload(update)
     bridge_user_ctx = _build_bridge_user_context(update, context)
     
@@ -4868,7 +4892,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not vin:
-        await _show_main_menu_single()
+        try:
+            await update.message.reply_text(_menu_hint_text(lang))
+        except Exception:
+            pass
         return
 
     if bridge_user_ctx and bridge_user_ctx.language == "ku":
@@ -5206,8 +5233,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
         return
 
-    # غير معروف: افتح القائمة الرئيسية وأخفِ الرسالة
-    await _show_main_menu_single()
+    # غير معروف: لا تفتح القائمة تلقائياً، أعطِ تلميحاً فقط
+    try:
+        await update.message.reply_text(_menu_hint_text(lang))
+    except Exception:
+        pass
     return
 
 # =================== Photos callback ===================
@@ -5224,7 +5254,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt in ALL_BUTTON_LABELS or not txt:
         return 
     if looks_like_vin and not vin_try:
-        await _show_main_menu_single()
+        try:
+            await update.message.reply_text(_menu_hint_text(lang))
+        except Exception:
+            pass
         return
 
     return 

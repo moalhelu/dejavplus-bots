@@ -5340,6 +5340,19 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not media_items:
             no_images_msg = info["empty"]
+            # Diagnostic hint for super admins (does not reveal secrets).
+            try:
+                if _is_super_admin(tg_id):
+                    cfg = get_env()
+                    diag = (
+                        f"\n\n<i>BadVin diag:</i> "
+                        f"email={'set' if bool(cfg.badvin_email) else 'missing'}, "
+                        f"pass={'set' if bool(cfg.badvin_password) else 'missing'}, "
+                        f"types=<code>{escape(os.getenv('BADVIN_REPORT_TYPES','full,basic'))}</code>"
+                    )
+                    no_images_msg = no_images_msg + diag
+            except Exception:
+                pass
             if not await _status_update(no_images_msg):
                 try:
                     await asyncio.wait_for(

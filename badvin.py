@@ -168,6 +168,12 @@ class BadvinScraper:
             login_url = f"{self.base_url}/users/login"
             r = self.session.get(login_url, headers=self.headers, timeout=self.timeout)
             r.raise_for_status()
+            try:
+                low = (r.text or "").lower()
+                if "cloudflare" in low or "cf-browser-verification" in low or "attention required" in low:
+                    logger.warning("Badvin: possible Cloudflare challenge on login page")
+            except Exception:
+                pass
             soup = BeautifulSoup(r.text, "html.parser")
             csrf = soup.find('input', {'name':'_csrf'})
             if not csrf or not csrf.get('value'):
@@ -209,40 +215,45 @@ class BadvinScraper:
             logger.error(f"search_vin error for {vin}: {e}")
             return None
 
-    def get_free_report(self, result_url, vin):
+    def get_report(self, result_url, vin, report_type: str = "basic"):
         try:
             r = self.session.get(result_url, headers=self.headers, timeout=self.timeout)
             r.raise_for_status()
-            # try buy-basic flow
-            buy_url = result_url + "/buy/?reportType=basic"
+            report_type = (report_type or "basic").strip().lower() or "basic"
+            # try buy flow for the chosen report type
+            buy_url = result_url + f"/buy/?reportType={report_type}"
             r = self.session.get(buy_url, headers={**self.headers, "Referer": result_url}, timeout=self.timeout)
             soup = BeautifulSoup(r.text, "html.parser")
             csrf = soup.find('input', {'name':'_csrf'})
             if not csrf or not csrf.get('value'):
-                report_url = result_url + "?buySuccess=basic"
+                report_url = result_url + f"?buySuccess={report_type}"
                 r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
                 return report_url, r.text
             # submit form
             form = soup.find('form', {'action': lambda a: a and '/buy' in a})
             if not form:
-                report_url = result_url + "?buySuccess=basic"
+                report_url = result_url + f"?buySuccess={report_type}"
                 r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
                 return report_url, r.text
             submit_url = urljoin(self.base_url, form.get('action'))
-            data = {'_csrf': csrf.get('value'), 'reportType':'basic'}
+            data = {'_csrf': csrf.get('value'), 'reportType': report_type}
             for inp in form.find_all('input'):
                 name = inp.get('name'); value = inp.get('value')
                 if name and name not in data and name != '_csrf':
                     data[name]=value
             r = self.session.post(submit_url, data=data, headers={**self.headers, "Referer": buy_url}, allow_redirects=True, timeout=self.timeout)
-            if "buySuccess=basic" in r.url:
+            if f"buySuccess={report_type}" in (r.url or ""):
                 return r.url, r.text
-            report_url = result_url + "?buySuccess=basic"
+            report_url = result_url + f"?buySuccess={report_type}"
             r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
             return report_url, r.text
         except Exception as e:
             logger.error(f"get_free_report error for {vin}: {e}")
             return None, None
+
+    def get_free_report(self, result_url, vin):
+        """Backward compatible wrapper (defaults to basic)."""
+        return self.get_report(result_url, vin, "basic")
 
     def is_car_image(self, url: str):
         if not url:

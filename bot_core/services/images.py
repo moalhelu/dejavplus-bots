@@ -148,28 +148,49 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
         result_url = scraper.search_vin(vin)
         if not result_url:
             return []
-        # Fetch the vehicle page HTML (often contains the Sale Record container)
-        vehicle_content: str = ""
-        try:
-            r = scraper.session.get(result_url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 20.0))
-            if getattr(r, "text", None):
-                vehicle_content = r.text
-        except Exception:
-            vehicle_content = ""
+        def _fetch_html(url: str) -> str:
+            try:
+                r = scraper.session.get(url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 20.0))
+                return getattr(r, "text", "") or ""
+            except Exception:
+                return ""
 
-        report_content: str = ""
-        try:
-            report_url, report_html = scraper.get_free_report(result_url, vin)
-            report_content = report_html or ""
-        except Exception:
-            report_content = ""
+        # Try multiple sources because BadVin moves sections between tabs/pages.
+        html_candidates: List[str] = []
+        html_candidates.append(_fetch_html(result_url))
+
+        # Prefer FULL report when account is purchased; fallback to BASIC.
+        report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "full,basic")
+        report_types = [t.strip().lower() for t in report_types_raw.split(",") if t.strip()]
+        for rtype in (report_types or ["basic"]):
+            try:
+                _, report_html = scraper.get_report(result_url, vin, rtype)
+                if report_html:
+                    html_candidates.append(report_html)
+            except Exception:
+                continue
+
+        # Extra tab URLs frequently host photos/sale records.
+        extra_urls = [
+            result_url.rstrip("/") + "/photos",
+            result_url.rstrip("/") + "/photos/",
+            result_url.rstrip("/") + "/sales-history",
+            result_url.rstrip("/") + "/sales-history/",
+            result_url + "?tab=photos",
+            result_url + "?tab=sales",
+        ]
+        for u in extra_urls:
+            html = _fetch_html(u)
+            if html:
+                html_candidates.append(html)
 
         images: List[str] = []
-        # Prefer report HTML first; fallback to vehicle page.
-        if report_content:
-            _, images = scraper.extract_car_data_and_images(report_content, vin)
-        if not images and vehicle_content:
-            _, images = scraper.extract_car_data_and_images(vehicle_content, vin)
+        for html in html_candidates:
+            if not html:
+                continue
+            _, images = scraper.extract_car_data_and_images(html, vin)
+            if images:
+                break
         if not images:
             LOGGER.info("badvin: no images found vin=%s", vin)
             return []
@@ -214,26 +235,46 @@ def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) ->
         if not result_url:
             return []
 
-        vehicle_content: str = ""
-        try:
-            r = scraper.session.get(result_url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 20.0))
-            if getattr(r, "text", None):
-                vehicle_content = r.text
-        except Exception:
-            vehicle_content = ""
+        def _fetch_html(url: str) -> str:
+            try:
+                r = scraper.session.get(url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 20.0))
+                return getattr(r, "text", "") or ""
+            except Exception:
+                return ""
 
-        report_content: str = ""
-        try:
-            _, report_html = scraper.get_free_report(result_url, vin)
-            report_content = report_html or ""
-        except Exception:
-            report_content = ""
+        html_candidates: List[str] = []
+        html_candidates.append(_fetch_html(result_url))
+
+        report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "full,basic")
+        report_types = [t.strip().lower() for t in report_types_raw.split(",") if t.strip()]
+        for rtype in (report_types or ["basic"]):
+            try:
+                _, report_html = scraper.get_report(result_url, vin, rtype)
+                if report_html:
+                    html_candidates.append(report_html)
+            except Exception:
+                continue
+
+        extra_urls = [
+            result_url.rstrip("/") + "/photos",
+            result_url.rstrip("/") + "/photos/",
+            result_url.rstrip("/") + "/sales-history",
+            result_url.rstrip("/") + "/sales-history/",
+            result_url + "?tab=photos",
+            result_url + "?tab=sales",
+        ]
+        for u in extra_urls:
+            html = _fetch_html(u)
+            if html:
+                html_candidates.append(html)
 
         urls: List[str] = []
-        if report_content:
-            _, urls = scraper.extract_car_data_and_images(report_content, vin)
-        if not urls and vehicle_content:
-            _, urls = scraper.extract_car_data_and_images(vehicle_content, vin)
+        for html in html_candidates:
+            if not html:
+                continue
+            _, urls = scraper.extract_car_data_and_images(html, vin)
+            if urls:
+                break
         if not urls:
             LOGGER.info("badvin media: no urls found vin=%s", vin)
             return []

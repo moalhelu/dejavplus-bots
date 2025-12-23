@@ -179,40 +179,66 @@ class BadvinScraper:
             logger.error(f"search_vin error for {vin}: {e}")
             return None
 
-    def get_free_report(self, result_url, vin):
+    def get_report(self, result_url, vin, report_type: str = "basic"):
+        """Fetch a report page for the given report_type.
+
+        For purchased accounts, older sale records/photos are often only available
+        in FULL report flows. This keeps the previous basic flow but allows
+        callers to request other types (e.g. full).
+        """
         try:
+            report_type = (report_type or "basic").strip().lower() or "basic"
             r = self.session.get(result_url, headers=self.headers, timeout=self.timeout)
             r.raise_for_status()
-            # try buy-basic flow
-            buy_url = result_url + "/buy/?reportType=basic"
+
+            buy_url = result_url + f"/buy/?reportType={report_type}"
             r = self.session.get(buy_url, headers={**self.headers, "Referer": result_url}, timeout=self.timeout)
             soup = BeautifulSoup(r.text, "html.parser")
             csrf = soup.find('input', {'name':'_csrf'})
+
+            # If we can't find CSRF/form, try the buySuccess URL directly.
             if not csrf or not csrf.get('value'):
-                report_url = result_url + "?buySuccess=basic"
-                r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
+                report_url = result_url + f"?buySuccess={report_type}"
+                r = self.session.get(report_url, headers=self.headers, timeout=self.timeout)
+                r.raise_for_status()
                 return report_url, r.text
-            # submit form
+
             form = soup.find('form', {'action': lambda a: a and '/buy' in a})
             if not form:
-                report_url = result_url + "?buySuccess=basic"
-                r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
+                report_url = result_url + f"?buySuccess={report_type}"
+                r = self.session.get(report_url, headers=self.headers, timeout=self.timeout)
+                r.raise_for_status()
                 return report_url, r.text
+
             submit_url = urljoin(self.base_url, form.get('action'))
-            data = {'_csrf': csrf.get('value'), 'reportType':'basic'}
+            data = {'_csrf': csrf.get('value'), 'reportType': report_type}
             for inp in form.find_all('input'):
                 name = inp.get('name'); value = inp.get('value')
                 if name and name not in data and name != '_csrf':
-                    data[name]=value
-            r = self.session.post(submit_url, data=data, headers={**self.headers, "Referer": buy_url}, allow_redirects=True, timeout=self.timeout)
-            if "buySuccess=basic" in r.url:
+                    data[name] = value
+
+            r = self.session.post(
+                submit_url,
+                data=data,
+                headers={**self.headers, "Referer": buy_url},
+                allow_redirects=True,
+                timeout=self.timeout,
+            )
+
+            if f"buySuccess={report_type}" in (r.url or ""):
                 return r.url, r.text
-            report_url = result_url + "?buySuccess=basic"
-            r = self.session.get(report_url, headers=self.headers, timeout=self.timeout); r.raise_for_status()
+
+            report_url = result_url + f"?buySuccess={report_type}"
+            r = self.session.get(report_url, headers=self.headers, timeout=self.timeout)
+            r.raise_for_status()
             return report_url, r.text
         except Exception as e:
-            logger.error(f"get_free_report error for {vin}: {e}")
+            logger.error(f"get_report error for {vin}: {e}")
             return None, None
+
+    def get_free_report(self, result_url, vin):
+        """Backward-compatible wrapper (defaults to basic)."""
+        return self.get_report(result_url, vin, "basic")
 
     def is_car_image(self, url: str):
         if not url:

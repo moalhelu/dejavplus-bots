@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
     BadvinScraper = None  # type: ignore
 
 _CACHE_TTL = 30 * 60  # seconds
+_BADVIN_TOTAL_TIMEOUT = float(os.getenv("BADVIN_TOTAL_TIMEOUT", "25") or 25.0)
 _IMAGE_CACHE: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
 _BADVIN_SEM = asyncio.Semaphore(2)  # simple rate-limit for Badvin login/scrape
 _PHOTO_EXCLUDE_MARKERS = (
@@ -99,43 +100,14 @@ async def get_badvin_images(vin: str) -> List[str]:
             LOGGER.warning("badvin fetch failed vin=%s error=%s", vin, last_err)
         return []
 
-    # Do not enforce a global cut-off here; BadvinScraper has per-request timeouts
-    # and an HTTP retry adapter. This avoids "timed out" behavior while still
-    # preventing infinite hangs.
-    urls = await _fetch_with_retries()
+    try:
+        urls = await asyncio.wait_for(_fetch_with_retries(), timeout=_BADVIN_TOTAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        LOGGER.warning("badvin fetch timed out vin=%s timeout=%s", vin, _BADVIN_TOTAL_TIMEOUT)
+        urls = []
     if urls:
         _cache_set(key, urls)
     return urls
-
-
-async def get_badvin_images_media(vin: str, *, limit: int = 10) -> List[Tuple[str, bytes]]:
-    """Fetch Badvin photos as (filename, bytes) using the authenticated session.
-
-    BadVin photo URLs are often protected and cannot be downloaded without cookies.
-    This helper logs in and downloads the actual image bytes so Telegram/WhatsApp
-    can send them reliably.
-    """
-
-    cfg = get_env()
-    if not BadvinScraper or not cfg.badvin_email or not cfg.badvin_password:
-        return []
-
-    safe_limit = max(1, min(10, int(limit)))
-
-    async def _fetch_once() -> List[Tuple[str, bytes]]:
-        return await asyncio.to_thread(_badvin_fetch_media_sync, vin, cfg.badvin_email, cfg.badvin_password, safe_limit)
-
-    last_err: Optional[Exception] = None
-    for attempt in range(2):
-        try:
-            async with _BADVIN_SEM:
-                return await _fetch_once()
-        except Exception as exc:  # pragma: no cover
-            last_err = exc
-            await asyncio.sleep(0.6 * (attempt + 1))
-    if last_err:
-        LOGGER.warning("badvin media fetch failed vin=%s error=%s", vin, last_err)
-    return []
 
 
 def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
@@ -150,16 +122,16 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
             return []
         def _fetch_html(url: str) -> str:
             try:
-                r = scraper.session.get(url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 20.0))
+                r = scraper.session.get(url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 12.0))
                 return getattr(r, "text", "") or ""
             except Exception:
                 return ""
 
-        # Try multiple sources because BadVin moves sections between tabs/pages.
         html_candidates: List[str] = []
+        # Vehicle landing page
         html_candidates.append(_fetch_html(result_url))
 
-        # Prefer FULL report when account is purchased; fallback to BASIC.
+        # Prefer FULL when account is purchased; fallback to BASIC.
         report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "full,basic")
         report_types = [t.strip().lower() for t in report_types_raw.split(",") if t.strip()]
         for rtype in (report_types or ["basic"]):
@@ -170,7 +142,7 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
             except Exception:
                 continue
 
-        # Extra tab URLs frequently host photos/sale records.
+        # Extra tab URLs frequently host sale history / photos.
         extra_urls = [
             result_url.rstrip("/") + "/photos",
             result_url.rstrip("/") + "/photos/",
@@ -185,27 +157,14 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
                 html_candidates.append(html)
 
         images: List[str] = []
-        last_car_data: Dict[str, Any] = {}
         for html in html_candidates:
             if not html:
                 continue
-            car_data, images = scraper.extract_car_data_and_images(html, vin)
-            if isinstance(car_data, dict):
-                last_car_data = car_data
+            _, images = scraper.extract_car_data_and_images(html, vin)
             if images:
                 break
+
         if not images:
-            if last_car_data:
-                LOGGER.info(
-                    "badvin: no images vin=%s diag source=%s sale_section=%s blocks=%s json_records=%s",
-                    vin,
-                    last_car_data.get("source"),
-                    last_car_data.get("sale_section_found"),
-                    last_car_data.get("sale_record_blocks"),
-                    last_car_data.get("json_records"),
-                )
-            else:
-                LOGGER.info("badvin: no images found vin=%s", vin)
             return []
         deduped: List[str] = []
         for url in images:
@@ -214,127 +173,9 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
                     deduped.append(url)
             if len(deduped) >= 20:
                 break
-        if deduped:
-            LOGGER.info("badvin: extracted=%s vin=%s", len(deduped), vin)
         return deduped
     except Exception:
         return []
-    finally:
-        try:
-            scraper.logout()
-        except Exception:
-            pass
-
-
-def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) -> List[Tuple[str, bytes]]:
-    if BadvinScraper is None:
-        raise RuntimeError("BadvinScraper dependency is unavailable")
-
-    def _filename_from_url(url: str) -> str:
-        try:
-            base = (url or "").split("?", 1)[0].rstrip("/")
-            name = base.rsplit("/", 1)[-1] or "photo.jpg"
-        except Exception:
-            name = "photo.jpg"
-        if "." not in name:
-            name += ".jpg"
-        return name
-
-    scraper = BadvinScraper(email, password)
-    try:
-        if not scraper.login():
-            return []
-        result_url = scraper.search_vin(vin)
-        if not result_url:
-            return []
-
-        def _fetch_html(url: str) -> str:
-            try:
-                r = scraper.session.get(url, headers=scraper.headers, timeout=getattr(scraper, "timeout", 20.0))
-                return getattr(r, "text", "") or ""
-            except Exception:
-                return ""
-
-        html_candidates: List[str] = []
-        html_candidates.append(_fetch_html(result_url))
-
-        report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "full,basic")
-        report_types = [t.strip().lower() for t in report_types_raw.split(",") if t.strip()]
-        for rtype in (report_types or ["basic"]):
-            try:
-                _, report_html = scraper.get_report(result_url, vin, rtype)
-                if report_html:
-                    html_candidates.append(report_html)
-            except Exception:
-                continue
-
-        extra_urls = [
-            result_url.rstrip("/") + "/photos",
-            result_url.rstrip("/") + "/photos/",
-            result_url.rstrip("/") + "/sales-history",
-            result_url.rstrip("/") + "/sales-history/",
-            result_url + "?tab=photos",
-            result_url + "?tab=sales",
-        ]
-        for u in extra_urls:
-            html = _fetch_html(u)
-            if html:
-                html_candidates.append(html)
-
-        urls: List[str] = []
-        last_car_data: Dict[str, Any] = {}
-        for html in html_candidates:
-            if not html:
-                continue
-            car_data, urls = scraper.extract_car_data_and_images(html, vin)
-            if isinstance(car_data, dict):
-                last_car_data = car_data
-            if urls:
-                break
-        if not urls:
-            if last_car_data:
-                LOGGER.info(
-                    "badvin media: no urls vin=%s diag source=%s sale_section=%s blocks=%s json_records=%s",
-                    vin,
-                    last_car_data.get("source"),
-                    last_car_data.get("sale_section_found"),
-                    last_car_data.get("sale_record_blocks"),
-                    last_car_data.get("json_records"),
-                )
-            else:
-                LOGGER.info("badvin media: no urls found vin=%s", vin)
-            return []
-
-        media: List[Tuple[str, bytes]] = []
-        seen: set[str] = set()
-
-        headers = dict(scraper.headers)
-        headers["Referer"] = result_url
-        headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-
-        # Try a little more than limit in case some URLs are protected/broken.
-        for url in urls:
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            try:
-                resp = scraper.session.get(url, headers=headers, timeout=getattr(scraper, "timeout", 20.0))
-                if getattr(resp, "status_code", 0) >= 400:
-                    continue
-                ctype = str(resp.headers.get("content-type", "")).lower()
-                if "image" not in ctype:
-                    continue
-                content = resp.content or b""
-                if len(content) < 128:
-                    continue
-                media.append((_filename_from_url(url), content))
-                if len(media) >= limit:
-                    break
-            except Exception:
-                continue
-
-        LOGGER.info("badvin media: downloaded=%s vin=%s", len(media), vin)
-        return media
     finally:
         try:
             scraper.logout()

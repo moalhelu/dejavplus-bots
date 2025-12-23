@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover
 
 _CACHE_TTL = 30 * 60  # seconds
 _BADVIN_TOTAL_TIMEOUT = float(os.getenv("BADVIN_TOTAL_TIMEOUT", "25") or 25.0)
+_BADVIN_MIN_CACHE_PHOTOS = int(os.getenv("BADVIN_MIN_CACHE_PHOTOS", "6") or 6)
 _IMAGE_CACHE: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
 _BADVIN_SEM = asyncio.Semaphore(2)  # simple rate-limit for Badvin login/scrape
 _PHOTO_EXCLUDE_MARKERS = (
@@ -105,7 +106,7 @@ async def get_badvin_images(vin: str) -> List[str]:
     except asyncio.TimeoutError:
         LOGGER.warning("badvin fetch timed out vin=%s timeout=%s", vin, _BADVIN_TOTAL_TIMEOUT)
         urls = []
-    if urls:
+    if urls and len(urls) >= max(1, _BADVIN_MIN_CACHE_PHOTOS):
         _cache_set(key, urls)
     return urls
 
@@ -176,8 +177,8 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
         # Vehicle landing page
         html_candidates.append(_fetch_html(result_url))
 
-        # Prefer FULL when account is purchased; fallback to BASIC.
-        report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "full,basic")
+        # Prefer BASIC first to avoid preview/blur-only landing pages; still try FULL afterwards.
+        report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "basic,full")
         report_types = [t.strip().lower() for t in report_types_raw.split(",") if t.strip()]
         for rtype in (report_types or ["basic"]):
             try:
@@ -201,18 +202,46 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
             if html:
                 html_candidates.append(html)
 
-        images: List[str] = []
+        def _dedupe_preserve_order(urls_in: List[str]) -> List[str]:
+            out: List[str] = []
+            seen: set[str] = set()
+            for u in urls_in or []:
+                if not isinstance(u, str):
+                    continue
+                s = u.strip()
+                if not s:
+                    continue
+                if s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+            return out
+
+        def _looks_blurry_url(url: str) -> bool:
+            low = (url or "").lower()
+            return any(tok in low for tok in ("blur", "blurry", "masked", "preview", "placeholder", "thumb"))
+
+        best_images: List[str] = []
         last_car_data: Dict[str, Any] = {}
+        best_car_data: Dict[str, Any] = {}
         for html in html_candidates:
             if not html:
                 continue
             car_data, images = scraper.extract_car_data_and_images(html, vin)
             if isinstance(car_data, dict):
                 last_car_data = car_data
-            if images:
-                break
+            images = _dedupe_preserve_order(images)
+            if images and len(images) > len(best_images):
+                best_images = images
+                best_car_data = car_data if isinstance(car_data, dict) else {}
 
-        if not images:
+        # If we have enough non-blurry URLs, prefer them.
+        if best_images:
+            non_blur = [u for u in best_images if not _looks_blurry_url(u)]
+            if len(non_blur) >= max(4, len(best_images) // 2):
+                best_images = non_blur
+
+        if not best_images:
             if last_car_data:
                 LOGGER.info(
                     "badvin: no images vin=%s diag source=%s sale_section=%s blocks=%s json_records=%s",
@@ -230,8 +259,21 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
             env_url_limit = 30
         url_limit = max(1, min(60, env_url_limit))
 
+        if best_car_data:
+            try:
+                LOGGER.info(
+                    "badvin: selected images vin=%s count=%s source=%s blocks=%s json_records=%s",
+                    vin,
+                    len(best_images),
+                    best_car_data.get("source"),
+                    best_car_data.get("sale_record_blocks"),
+                    best_car_data.get("json_records"),
+                )
+            except Exception:
+                pass
+
         deduped: List[str] = []
-        for url in images:
+        for url in best_images:
             if isinstance(url, str) and url.strip() and url.strip().lower().startswith(("http://", "https://")):
                 if url not in deduped:
                     deduped.append(url)
@@ -297,7 +339,7 @@ def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) ->
         html_candidates: List[str] = []
         html_candidates.append(_fetch_html(result_url))
 
-        report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "full,basic")
+        report_types_raw = os.getenv("BADVIN_REPORT_TYPES", "basic,full")
         report_types = [t.strip().lower() for t in report_types_raw.split(",") if t.strip()]
         for rtype in (report_types or ["basic"]):
             try:
@@ -320,18 +362,45 @@ def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) ->
             if html:
                 html_candidates.append(html)
 
-        urls: List[str] = []
+        def _dedupe_preserve_order(urls_in: List[str]) -> List[str]:
+            out: List[str] = []
+            seen: set[str] = set()
+            for u in urls_in or []:
+                if not isinstance(u, str):
+                    continue
+                s = u.strip()
+                if not s:
+                    continue
+                if s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+            return out
+
+        def _looks_blurry_url(url: str) -> bool:
+            low = (url or "").lower()
+            return any(tok in low for tok in ("blur", "blurry", "masked", "preview", "placeholder", "thumb"))
+
+        best_urls: List[str] = []
         last_car_data: Dict[str, Any] = {}
+        best_car_data: Dict[str, Any] = {}
         for html in html_candidates:
             if not html:
                 continue
             car_data, urls = scraper.extract_car_data_and_images(html, vin)
             if isinstance(car_data, dict):
                 last_car_data = car_data
-            if urls:
-                break
+            urls = _dedupe_preserve_order(urls)
+            if urls and len(urls) > len(best_urls):
+                best_urls = urls
+                best_car_data = car_data if isinstance(car_data, dict) else {}
 
-        if not urls:
+        if best_urls:
+            non_blur = [u for u in best_urls if not _looks_blurry_url(u)]
+            if len(non_blur) >= max(4, len(best_urls) // 2):
+                best_urls = non_blur
+
+        if not best_urls:
             if last_car_data:
                 LOGGER.info(
                     "badvin media: no urls vin=%s diag source=%s sale_section=%s blocks=%s json_records=%s",
@@ -343,13 +412,26 @@ def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) ->
                 )
             return []
 
+        if best_car_data:
+            try:
+                LOGGER.info(
+                    "badvin media: selected urls vin=%s count=%s source=%s blocks=%s json_records=%s",
+                    vin,
+                    len(best_urls),
+                    best_car_data.get("source"),
+                    best_car_data.get("sale_record_blocks"),
+                    best_car_data.get("json_records"),
+                )
+            except Exception:
+                pass
+
         headers = dict(scraper.headers)
         headers["Referer"] = result_url
         headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
 
         media: List[Tuple[str, bytes]] = []
         seen: set[str] = set()
-        for url in urls:
+        for url in best_urls:
             if not url or url in seen:
                 continue
             seen.add(url)

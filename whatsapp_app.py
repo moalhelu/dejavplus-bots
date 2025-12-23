@@ -171,6 +171,29 @@ STATIC_DIR = Path("temp_static")
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+
+def _infer_public_url_from_request(request: Request) -> Optional[str]:
+    """Best-effort public base URL inference from an inbound webhook request.
+
+    Useful when UltraMsg hits the server IP/domain directly and WHATSAPP_PUBLIC_URL
+    is not configured. We intentionally ignore localhost/0.0.0.0 values.
+    """
+
+    headers = request.headers
+    scheme = (headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
+    host = (headers.get("x-forwarded-host") or headers.get("host") or request.url.netloc or "").split(",")[0].strip()
+
+    if not host:
+        return None
+    lowered = host.lower()
+    if lowered.startswith("localhost") or lowered.startswith("127.0.0.1") or lowered.startswith("0.0.0.0"):
+        return None
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        # Some proxies might pass full URL in Host; normalize.
+        return lowered.rstrip("/")
+
+    return f"{scheme}://{host}".rstrip("/")
+
 async def _get_ngrok_url() -> Optional[str]:
     """Attempt to fetch the public URL from local ngrok API."""
     try:
@@ -1452,8 +1475,7 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
 
     if caption:
         payload["caption"] = caption
-    if document.get("mime_type"):
-        payload["mime_type"] = document["mime_type"]
+    # UltraMsg send_document does not accept a mime_type field; keep payload minimal.
 
     LOGGER.info("Sending PDF document to %s (filename=%s)", msisdn, filename)
     try:
@@ -1493,7 +1515,7 @@ async def _relay_image_document(client: UltraMsgClient, msisdn: str, media: Dict
     if base64_payload:
         payload["image_base64"] = base64_payload
     elif url_value:
-        payload["url"] = url_value
+        payload["image_url"] = url_value
     else:
         LOGGER.warning("Skipping image document without path or url: %s", media)
         return
@@ -1501,13 +1523,16 @@ async def _relay_image_document(client: UltraMsgClient, msisdn: str, media: Dict
     if media.get("filename"):
         payload["filename"] = media["filename"]
 
-    async with atimed(
-        "wa.ultramsg.send_image",
-        has_url=bool(url_value),
-        base64_len=len(base64_payload or ""),
-        filename=payload.get("filename"),
-    ):
-        await client.send_image(msisdn, **payload)
+    try:
+        async with atimed(
+            "wa.ultramsg.send_image",
+            has_url=bool(url_value),
+            base64_len=len(base64_payload or ""),
+            filename=payload.get("filename"),
+        ):
+            await client.send_image(msisdn, **payload)
+    except Exception as exc:
+        LOGGER.error("Failed to send image: %s", exc, exc_info=True)
 
 
 async def send_whatsapp_text(
@@ -1611,6 +1636,14 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
 
 @app.post("/whatsapp/webhook")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
+    # If UltraMsg is calling this server directly, we can infer the public base URL
+    # from the inbound request and use it for PDF links (served from /static).
+    if not (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip():
+        inferred = _infer_public_url_from_request(request)
+        if inferred:
+            os.environ["WHATSAPP_PUBLIC_URL"] = inferred
+            LOGGER.info("Inferred WHATSAPP_PUBLIC_URL from webhook request: %s", inferred)
+
     try:
         payload = await request.json()
     except Exception:

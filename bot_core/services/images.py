@@ -282,14 +282,27 @@ def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) ->
                 html_candidates.append(html)
 
         urls: List[str] = []
+        last_car_data: Dict[str, Any] = {}
         for html in html_candidates:
             if not html:
                 continue
-            _, urls = scraper.extract_car_data_and_images(html, vin)
+            car_data, urls = scraper.extract_car_data_and_images(html, vin)
+            if isinstance(car_data, dict):
+                last_car_data = car_data
             if urls:
                 break
         if not urls:
-            LOGGER.info("badvin media: no urls found vin=%s", vin)
+            if last_car_data:
+                LOGGER.info(
+                    "badvin media: no urls vin=%s diag source=%s sale_section=%s blocks=%s json_records=%s",
+                    vin,
+                    last_car_data.get("source"),
+                    last_car_data.get("sale_section_found"),
+                    last_car_data.get("sale_record_blocks"),
+                    last_car_data.get("json_records"),
+                )
+            else:
+                LOGGER.info("badvin media: no urls found vin=%s", vin)
             return []
 
         media: List[Tuple[str, bytes]] = []

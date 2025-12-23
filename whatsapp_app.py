@@ -768,7 +768,8 @@ async def _handle_report_option_choice(
     # BadVin images are frequently protected; prefer authenticated bytes.
     if choice == "wa_opt_badvin":
         try:
-            media_items = await get_badvin_images_media(vin, limit=10)
+            wa_limit = max(1, min(10, int(os.getenv("BADVIN_MEDIA_LIMIT", "30") or 30)))
+            media_items = await get_badvin_images_media(vin, limit=wa_limit)
         except Exception as exc:  # pragma: no cover
             LOGGER.warning("whatsapp: badvin media fetch failed vin=%s error=%s", vin, exc)
             media_items = []

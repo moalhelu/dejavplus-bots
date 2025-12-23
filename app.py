@@ -5311,7 +5311,10 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- BadVin: prefer authenticated bytes (protected images), fallback to URL flow ---
     if action == "badvin":
         try:
-            media_items = await _get_badvin_images_media(vin, limit=10)
+            media_items = await _get_badvin_images_media(
+                vin,
+                limit=int(os.getenv("BADVIN_MEDIA_LIMIT", "30") or 30),
+            )
         except Exception:
             media_items = []
 

@@ -122,7 +122,13 @@ async def get_badvin_images_media(vin: str, *, limit: int = 10) -> List[Tuple[st
     if not BadvinScraper or not cfg.badvin_email or not cfg.badvin_password:
         return []
 
-    safe_limit = max(1, min(10, int(limit)))
+    env_limit_raw = os.getenv("BADVIN_MEDIA_LIMIT", "30")
+    try:
+        env_limit = int(env_limit_raw)
+    except Exception:
+        env_limit = 30
+    # cap to avoid huge sends by accident
+    safe_limit = max(1, min(50, min(env_limit, int(limit or env_limit))))
 
     async def _fetch_once() -> List[Tuple[str, bytes]]:
         return await asyncio.to_thread(
@@ -217,12 +223,19 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
                     last_car_data.get("json_records"),
                 )
             return []
+        env_url_limit_raw = os.getenv("BADVIN_URL_LIMIT", os.getenv("BADVIN_MEDIA_LIMIT", "30"))
+        try:
+            env_url_limit = int(env_url_limit_raw)
+        except Exception:
+            env_url_limit = 30
+        url_limit = max(1, min(60, env_url_limit))
+
         deduped: List[str] = []
         for url in images:
             if isinstance(url, str) and url.strip() and url.strip().lower().startswith(("http://", "https://")):
                 if url not in deduped:
                     deduped.append(url)
-            if len(deduped) >= 20:
+            if len(deduped) >= url_limit:
                 break
         return deduped
     except Exception:
@@ -247,6 +260,24 @@ def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) ->
         if "." not in name:
             name += ".jpg"
         return name
+
+    def _looks_like_image(content: bytes, url: str, ctype: str) -> bool:
+        ct = (ctype or "").lower()
+        if ct.startswith("image/"):
+            return True
+        # Some endpoints omit content-type; fall back to URL extension.
+        if url and any(url.lower().split("?", 1)[0].endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+            return True
+        if not content:
+            return False
+        # Magic bytes for common image formats.
+        if content.startswith(b"\xFF\xD8\xFF"):
+            return True
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return True
+        if content.startswith(b"RIFF") and b"WEBP" in content[:32]:
+            return True
+        return False
 
     scraper = BadvinScraper(email, password)
     try:
@@ -326,10 +357,10 @@ def _badvin_fetch_media_sync(vin: str, email: str, password: str, limit: int) ->
                 resp = scraper.session.get(url, headers=headers, timeout=getattr(scraper, "timeout", 12.0))
                 if getattr(resp, "status_code", 0) >= 400:
                     continue
-                ctype = str(resp.headers.get("content-type", "")).lower()
-                if "image" not in ctype:
-                    continue
+                ctype = str(resp.headers.get("content-type", ""))
                 content = resp.content or b""
+                if not _looks_like_image(content, url, ctype):
+                    continue
                 if len(content) < 128:
                     continue
                 media.append((_filename_from_url(url), content))

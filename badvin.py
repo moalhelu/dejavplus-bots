@@ -64,6 +64,27 @@ def select_oldest_badvin_record_with_photos(records):
                         delta = timedelta(days=count)
                     if delta:
                         return (datetime.utcnow() - delta).timestamp()
+            # Future relative phrases like "in 4 hours" / "in 2 days"
+            if rel.startswith("in "):
+                m = re.search(r"\bin\s+(\d+)\s*(minute|hour|day|week|month|year)s?\b", rel)
+                if m:
+                    count = int(m.group(1))
+                    unit = m.group(2)
+                    delta = None
+                    if unit == "minute":
+                        delta = timedelta(minutes=count)
+                    elif unit == "hour":
+                        delta = timedelta(hours=count)
+                    elif unit == "day":
+                        delta = timedelta(days=count)
+                    elif unit == "week":
+                        delta = timedelta(weeks=count)
+                    elif unit == "month":
+                        delta = timedelta(days=30 * count)
+                    elif unit == "year":
+                        delta = timedelta(days=365 * count)
+                    if delta:
+                        return (datetime.utcnow() + delta).timestamp()
             return None
 
         for key in ("timestamp", "date", "sale_date", "record_date", "raw_date", "ts"):
@@ -268,6 +289,7 @@ class BadvinScraper:
             imgs = []
             diag = {
                 "sale_section_found": False,
+                "sale_sections": 0,
                 "sale_record_blocks": 0,
                 "json_records": 0,
                 "source": "dom",
@@ -406,71 +428,112 @@ class BadvinScraper:
                     return " ".join([str(x) for x in c if x])
                 return str(c or "")
 
-            sale_section = soup.find("div", class_="js-sale-record-container")
-            if not sale_section:
+            sale_sections = list(soup.find_all("div", class_="js-sale-record-container"))
+            if not sale_sections:
                 block = None
                 for h2 in soup.find_all("h2"):
                     if "sale record" in (h2.get_text(strip=True) or "").lower():
                         block = h2.find_parent("div", class_="block")
                         break
                 if block:
-                    sale_section = block.find("div", class_="js-sale-record-container")
+                    sec = block.find("div", class_="js-sale-record-container")
+                    if sec:
+                        sale_sections = [sec]
 
             search_root = None
             record_summaries = []  # [(idx, ts, photo_count, raw_date)]
-            if sale_section:
+            if sale_sections:
                 diag["sale_section_found"] = True
-                # Collect sale-record blocks without accidentally matching nested tiles.
+                diag["sale_sections"] = len(sale_sections)
+
+                # Collect sale-record blocks across ALL sale-record containers.
                 candidates = []
+                global_idx = 0
 
-                galleries = sale_section.find_all("div", class_=lambda c: c and "bv-gallery" in _cls_str(c))
-                if galleries:
-                    for idx, gallery in enumerate(galleries):
-                        node = gallery
-                        # Walk up a bit to a container that likely represents a single sale record.
-                        for _ in range(6):
-                            parent = getattr(node, "parent", None)
-                            if not parent or parent == sale_section:
-                                break
-                            # If parent contains multiple galleries, stop here.
-                            try:
-                                if len(parent.find_all("div", class_=lambda c: c and "bv-gallery" in _cls_str(c))) > 1:
+                for sale_section in sale_sections:
+                    galleries = sale_section.find_all("div", class_=lambda c: c and "bv-gallery" in _cls_str(c))
+                    if galleries:
+                        for gallery in galleries:
+                            node = gallery
+                            for _ in range(6):
+                                parent = getattr(node, "parent", None)
+                                if not parent or parent == sale_section:
                                     break
-                            except Exception:
-                                break
-                            node = parent
-                        candidates.append((idx, _parse_sale_date(node), gallery, node))
-                else:
-                    # Fallback: use immediate children of the sale section that contain images
-                    children = sale_section.find_all(recursive=False)
-                    for idx, node in enumerate(children):
-                        if not node.find("img") and not node.find("a", href=True):
-                            continue
-                        gallery = node.find("div", class_=lambda c: c and "bv-gallery" in _cls_str(c)) or node
-                        candidates.append((idx, _parse_sale_date(node), gallery, node))
+                                try:
+                                    if len(parent.find_all("div", class_=lambda c: c and "bv-gallery" in _cls_str(c))) > 1:
+                                        break
+                                except Exception:
+                                    break
+                                node = parent
+                            candidates.append((global_idx, _parse_sale_date(node), gallery, node))
+                            global_idx += 1
+                    else:
+                        children = sale_section.find_all(recursive=False)
+                        for child in children:
+                            if not child.find("img") and not child.find("a", href=True):
+                                continue
+                            gallery = child.find("div", class_=lambda c: c and "bv-gallery" in _cls_str(c)) or child
+                            candidates.append((global_idx, _parse_sale_date(child), gallery, child))
+                            global_idx += 1
 
-                if not candidates:
-                    # Last fallback: treat the entire container as one record.
-                    candidates = [(0, _parse_sale_date(sale_section), sale_section, sale_section)]
+                    if not galleries and not children:
+                        candidates.append((global_idx, _parse_sale_date(sale_section), sale_section, sale_section))
+                        global_idx += 1
 
                 diag["sale_record_blocks"] = len(candidates)
 
                 if candidates:
                     prepared_records = []
                     for idx, ts, gallery, node in candidates:
-                        photos_local = []
+                        photos_local: list[str] = []
+                        photos_seen: set[str] = set()
+
                         def _push_local(url: str):
                             if not url:
                                 return
                             url = url.strip()
                             full = urljoin(self.base_url, url)
-                            if self.is_car_image(full):
+                            if self.is_car_image(full) and full not in photos_seen:
+                                photos_seen.add(full)
                                 photos_local.append(full)
+
+                        def _extract_urls_from_chunk(html_chunk: str) -> None:
+                            if not html_chunk:
+                                return
+                            for m in re.findall(
+                                r"https?://[^\s\"'<>]+\.(?:jpe?g|png|webp)(?:\?[^\s\"'<>]+)?",
+                                html_chunk,
+                                flags=re.IGNORECASE,
+                            ):
+                                _push_local(m)
+                            for m in re.findall(
+                                r"/[^\s\"'<>]+\.(?:jpe?g|png|webp)(?:\?[^\s\"'<>]+)?",
+                                html_chunk,
+                                flags=re.IGNORECASE,
+                            ):
+                                _push_local(m)
+
                         for a in gallery.find_all("a", href=True):
                             _push_local(a.get("href"))
                         for img in gallery.find_all("img"):
                             _push_local(img.get("src"))
                             _push_local(img.get("data-src"))
+
+                        # Some galleries use styles/data-* attrs for lazy images.
+                        for tag in gallery.find_all(True):
+                            style = tag.get("style")
+                            if style and "url(" in style:
+                                _extract_urls_from_chunk(style)
+                            for attr in ("data-src", "data-original", "data-lazy", "data-bg", "data-background"):
+                                val = tag.get(attr)
+                                if val:
+                                    _push_local(val)
+
+                        # Regex scan the gallery HTML (still scoped to sale record section)
+                        try:
+                            _extract_urls_from_chunk(str(gallery))
+                        except Exception:
+                            pass
                         raw_date = _raw_date(node) or _raw_date(gallery)
                         record_summaries.append((idx, ts, len(photos_local), raw_date))
                         prepared_records.append({"idx": idx, "timestamp": ts, "raw_date": raw_date, "photos": photos_local})

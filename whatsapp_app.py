@@ -52,7 +52,7 @@ from bot_core.storage import (
     reserve_credit,
     refund_credit,
 )
-from bot_core.utils.vin import is_valid_vin, make_progress_bar
+from bot_core.utils.vin import is_valid_vin
 from bot_core.telemetry import atimed, new_rid, set_rid
 
 from bot_core.logging_setup import configure_logging
@@ -156,33 +156,6 @@ def _build_vin_progress_header(
 
     return "\n\n".join([p for p in parts if p])
 
-
-async def _whatsapp_progress_counter(
-    msisdn: str,
-    client: httpx.AsyncClient,
-    stop_event: asyncio.Event,
-) -> None:
-    """Send a short, fast progress counter for WhatsApp.
-
-    WhatsApp messages can't be edited reliably, so we send lightweight progress
-    updates for a fixed short duration to improve perceived speed.
-
-    Behavior:
-    - every 0.5s: +10%
-    - stops early if stop_event is set
-    - caps at 90% to avoid showing 100% before completion
-    """
-
-    for p in range(10, 100, 10):
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=0.5)
-            break
-        except asyncio.TimeoutError:
-            pass
-        try:
-            await send_whatsapp_text(msisdn, make_progress_bar(p), client=client)
-        except Exception:
-            break
 
 WHATSAPP_HOST = os.getenv("WHATSAPP_HOST", "0.0.0.0").strip() or "0.0.0.0"
 WHATSAPP_PORT = _coerce_port(os.getenv("WHATSAPP_PORT"), 5005)
@@ -1104,7 +1077,7 @@ async def handle_incoming_whatsapp_message(
                 else:
                     LOGGER.debug("whatsapp: skipping fallback menu because state=%s is active", state_lower)
 
-        # If user sent a VIN directly، أرسل رسالة تقدم فورية (مثل تلغرام) بالأرقام الحالية
+        # If user sent a VIN directly, send ONE processing message (no progress spam)
         if text_body and is_valid_vin(text_body):
             vin_clean = text_body.strip().upper()
             db_snapshot = _load_db()
@@ -1151,34 +1124,17 @@ async def handle_incoming_whatsapp_message(
                 days_left=expiry_days,
                 language=user_ctx.language,
             )
-            await send_whatsapp_text(msisdn, progress_msg + "\n\n" + make_progress_bar(0), client=client)
-
-            wa_progress_stop = asyncio.Event()
-            wa_progress_task = asyncio.create_task(
-                _whatsapp_progress_counter(msisdn, client=client, stop_event=wa_progress_stop)
-            )
-        else:
-            wa_progress_stop = None
-            wa_progress_task = None
+            await send_whatsapp_text(msisdn, progress_msg, client=client)
 
         try:
-            try:
-                resp = await _bridge.handle_text(
-                    user_ctx,
-                    incoming,
-                    skip_limit_validation=False,
-                    deduct_credit=True,
-                    pre_reserved_credit=pre_reserved_credit,
-                    **bridge_kwargs,
-                )
-            finally:
-                if wa_progress_stop is not None:
-                    wa_progress_stop.set()
-                    if wa_progress_task is not None:
-                        try:
-                            await asyncio.wait_for(wa_progress_task, timeout=1.0)
-                        except Exception:
-                            wa_progress_task.cancel()
+            resp = await _bridge.handle_text(
+                user_ctx,
+                incoming,
+                skip_limit_validation=False,
+                deduct_credit=True,
+                pre_reserved_credit=pre_reserved_credit,
+                **bridge_kwargs,
+            )
         except Exception:
             if pre_reserved_credit:
                 try:

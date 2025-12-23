@@ -83,6 +83,27 @@ python whatsapp_app.py
 - توليد PDF يعتمد على Playwright/Chromium فقط.
 - لتشغيل الاختبارات يمكنك استخدام `pytest tests/test_all.py`.
 
+### السرعة (هدف أقل من 10 ثواني)
+
+لضمان أن مسار (جلب التقرير + الترجمة + توليد PDF) لا يطول، تم إضافة سقف زمني موحّد:
+
+```
+REPORT_TOTAL_TIMEOUT_SEC=10
+```
+
+هذا السقف يقيّد وقت جلب Carfax + ترجمة HTML + طباعة PDF داخل Chromium. إذا كان الـAPI بطيء جدًا، سيفشل التقرير بسرعة ويتم إرجاع الرصيد (بدل الانتظار الطويل).
+
+إعدادات مساعدة (اختيارية) إذا احتجت تضييق/توسيع حدود أجزاء محددة:
+
+```
+CARFAX_HTTP_TIMEOUT=20
+CARFAX_HTML_HTTP_TIMEOUT=6
+TRANSLATE_TIMEOUT_SEC=6
+TRANSLATED_FETCH_TIMEOUT_MS=8000
+PDF_TIMEOUT_MS=30000
+PDF_FAST_FIRST_TIMEOUT_MS=12000
+```
+
 ## إعدادات اللوجز (Share-friendly)
 
 تم توحيد إعدادات اللوجز عبر `bot_core/logging_setup.py` لتقليل الضجيج (خصوصًا Telegram) وجعل مشاركة اللوجز أسهل.

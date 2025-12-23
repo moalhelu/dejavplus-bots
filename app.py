@@ -4204,14 +4204,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_super = _is_super_admin(str(update.effective_user.id))
     is_admin = _is_admin_tg(str(update.effective_user.id))
     txt = (update.message.text or "").strip()
-        # Open main menu only on explicit user request
-        try:
-            lower_txt = (txt or "").strip().lower()
-        except Exception:
-            lower_txt = ""
-        if lower_txt in MENU_SHOW_KEYWORDS:
-            await _show_main_menu_single()
-            return
+    # Open main menu only on explicit user request
+    try:
+        lower_txt = (txt or "").strip().lower()
+    except Exception:
+        lower_txt = ""
+    if lower_txt in MENU_SHOW_KEYWORDS:
+        await _show_main_menu_single()
+        return
     raw_payload = _bridge_raw_payload(update)
     bridge_user_ctx = _build_bridge_user_context(update, context)
     

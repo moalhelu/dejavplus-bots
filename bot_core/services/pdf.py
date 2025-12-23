@@ -325,6 +325,10 @@ async def html_to_pdf_bytes_chromium(
     url: Optional[str] = None,
     *,
     base_url: Optional[str] = None,
+    timeout_ms: Optional[int] = None,
+    wait_until: Optional[str] = None,
+    fast_first_timeout_ms: Optional[int] = None,
+    fast_first_wait_until: Optional[str] = None,
 ) -> Optional[bytes]:
     try:
         try:
@@ -332,12 +336,24 @@ async def html_to_pdf_bytes_chromium(
         except Exception:  # pragma: no cover
             PlaywrightTimeoutError = Exception  # type: ignore[assignment]
 
-        wait_until = _get_pdf_wait_until()
-        timeout_ms = _get_pdf_timeout_ms()
+        wait_until = (wait_until or _get_pdf_wait_until()).strip().lower()
+        if wait_until not in {"load", "domcontentloaded", "networkidle"}:
+            wait_until = _get_pdf_wait_until()
+
+        timeout_ms = int(timeout_ms) if timeout_ms is not None else _get_pdf_timeout_ms()
+        timeout_ms = max(1_000, min(timeout_ms, 300_000))
         block_types = sorted(_get_pdf_block_resource_types())
         fast_first = _pdf_fast_first_enabled() and not _pdf_wait_until_was_explicitly_set()
-        fast_first_timeout_ms = min(_pdf_fast_first_timeout_ms(), timeout_ms)
-        fast_first_wait_until = _pdf_fast_first_wait_until()
+        if fast_first_timeout_ms is not None:
+            try:
+                fast_first_timeout_ms = int(fast_first_timeout_ms)
+            except Exception:
+                fast_first_timeout_ms = None
+        fast_first_timeout_ms = min(fast_first_timeout_ms or _pdf_fast_first_timeout_ms(), timeout_ms)
+
+        fast_first_wait_until = (fast_first_wait_until or _pdf_fast_first_wait_until()).strip().lower()
+        if fast_first_wait_until not in {"load", "domcontentloaded", "networkidle"}:
+            fast_first_wait_until = _pdf_fast_first_wait_until()
         async with atimed(
             "pdf.chromium",
             html_len=len(html_str or "") if html_str else 0,

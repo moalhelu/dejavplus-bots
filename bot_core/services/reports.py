@@ -39,6 +39,9 @@ _HTTP_SESSION_LOCK = asyncio.Lock()
 _CARFAX_SEM = asyncio.Semaphore(15)
 _CARFAX_TIMEOUT = float(os.getenv("CARFAX_HTTP_TIMEOUT", "20") or 20)
 
+_REPORT_TOTAL_TIMEOUT_SEC = float(os.getenv("REPORT_TOTAL_TIMEOUT_SEC", "10") or 10)
+_REPORT_TOTAL_TIMEOUT_SEC = max(3.0, min(_REPORT_TOTAL_TIMEOUT_SEC, 60.0))
+
 _INFLIGHT_REPORTS: Dict[tuple[str, str], asyncio.Task["ReportResult"]] = {}
 _INFLIGHT_LOCK = asyncio.Lock()
 
@@ -240,11 +243,17 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> Rep
     if cached_pdf:
         return cached_pdf
 
+    start_t = time.perf_counter()
+    deadline = start_t + _REPORT_TOTAL_TIMEOUT_SEC
+
+    def _remaining_s() -> float:
+        return max(0.0, deadline - time.perf_counter())
+
     api_response = _cache_get(normalized_vin)
     if not api_response:
         prefer_non_pdf = lang_code != "en"
         async with atimed("report.fetch", vin=normalized_vin, lang=lang_code, prefer_non_pdf=prefer_non_pdf):
-            api_response = await _call_carfax_api(normalized_vin, prefer_non_pdf=prefer_non_pdf)
+            api_response = await _call_carfax_api(normalized_vin, prefer_non_pdf=prefer_non_pdf, total_timeout_s=_remaining_s())
         if api_response.get("ok"):
             _cache_set(normalized_vin, api_response)
     if not api_response.get("ok"):
@@ -274,7 +283,7 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> Rep
         api_response = {"ok": False, "error": "pdf_only_non_translatable"}
 
     async with atimed("report.render_pdf", vin=normalized_vin, lang=lang_code):
-        pdf_bytes = await _render_pdf_from_response(api_response, normalized_vin, lang_code)
+        pdf_bytes = await _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline)
     if not pdf_bytes:
         return ReportResult(
             success=False,
@@ -300,7 +309,7 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> Rep
 # Internal helpers copied from the legacy flow (refactored for reuse).
 # ---------------------------------------------------------------------------
 
-async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[str, Any]:
+async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False, total_timeout_s: Optional[float] = None) -> Dict[str, Any]:
     cfg = get_env()
     api_url = cfg.api_url.strip()
     headers: Dict[str, str] = {}
@@ -317,6 +326,14 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
     base = api_url.rstrip("/")
     payload = {"vin": vin}
     session = await _get_http_session()
+
+    # Cap request time budget (best-effort) so end-to-end report stays fast.
+    try:
+        budget = float(total_timeout_s) if total_timeout_s is not None else float(_CARFAX_TIMEOUT)
+    except Exception:
+        budget = float(_CARFAX_TIMEOUT)
+    budget = max(0.5, min(budget, float(_CARFAX_TIMEOUT)))
+    request_timeout = aiohttp.ClientTimeout(total=budget)
 
     async def _handle(resp: aiohttp.ClientResponse) -> Dict[str, Any]:
         status = resp.status
@@ -345,7 +362,7 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
     async def _try_get() -> Optional[Dict[str, Any]]:
         try:
             async with atimed("carfax.http", method="GET", route="/{vin}"):
-                async with session.get(f"{base}/{vin}", headers=headers) as resp:
+                async with session.get(f"{base}/{vin}", headers=headers, timeout=request_timeout) as resp:
                     parsed = await _handle(resp)
                     if parsed.get("ok"):
                         return parsed
@@ -356,7 +373,7 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
     async def _try_post_vin() -> Optional[Dict[str, Any]]:
         try:
             async with atimed("carfax.http", method="POST", route="/vin"):
-                async with session.post(f"{base}/vin", json=payload, headers=headers) as resp:
+                async with session.post(f"{base}/vin", json=payload, headers=headers, timeout=request_timeout) as resp:
                     parsed = await _handle(resp)
                     if parsed.get("ok"):
                         return parsed
@@ -367,7 +384,7 @@ async def _call_carfax_api(vin: str, *, prefer_non_pdf: bool = False) -> Dict[st
     async def _try_post_base() -> Dict[str, Any]:
         try:
             async with atimed("carfax.http", method="POST", route="/"):
-                async with session.post(base, json=payload, headers=headers) as resp:
+                async with session.post(base, json=payload, headers=headers, timeout=request_timeout) as resp:
                     parsed = await _handle(resp)
                     if parsed.get("ok"):
                         return parsed
@@ -537,7 +554,15 @@ def _json_to_html_report(payload: Any, vin: str) -> str:
     )
 
 
-async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language: str) -> Optional[bytes]:
+def _deadline_remaining_ms(deadline: Optional[float], *, floor_ms: int = 1_000, cap_ms: int = 120_000) -> int:
+    if deadline is None:
+        return cap_ms
+    rem = max(0.0, float(deadline) - time.perf_counter())
+    ms = int(rem * 1000.0)
+    return max(floor_ms, min(ms, cap_ms))
+
+
+async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language: str, *, deadline: Optional[float] = None) -> Optional[bytes]:
     pdf_bytes: Optional[bytes] = None
     needs_translation = _needs_translation(language)
     json_payload = response.get("json")
@@ -546,27 +571,27 @@ async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language
         extracted = _extract_html_or_url_from_json(json_payload)
         extracted_url = extracted.get("url")
         if extracted_url:
-            pdf_bytes = await _render_pdf_from_url(extracted_url, needs_translation, language, vin)
+            pdf_bytes = await _render_pdf_from_url(extracted_url, needs_translation, language, vin, deadline=deadline)
         else:
             html = extracted.get("html")
             if not html:
                 html = _json_to_html_report(json_payload, vin)
             # If the JSON included embedded HTML but no URL, base_url remains None.
-            pdf_bytes = await _render_pdf_from_html(html, needs_translation, language, base_url=extracted_url)
+            pdf_bytes = await _render_pdf_from_html(html, needs_translation, language, base_url=extracted_url, deadline=deadline)
     elif response.get("text"):
         text_payload = str(response["text"]).strip()
         if text_payload.startswith(("http://", "https://")):
-            pdf_bytes = await _render_pdf_from_url(text_payload, needs_translation, language, vin)
+            pdf_bytes = await _render_pdf_from_url(text_payload, needs_translation, language, vin, deadline=deadline)
         else:
             html = text_payload if text_payload.lower().startswith("<html") else (
                 f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3><pre style='white-space:pre-wrap'>{escape(text_payload)}</pre></body></html>"
             )
-            pdf_bytes = await _render_pdf_from_html(html, needs_translation, language)
+            pdf_bytes = await _render_pdf_from_html(html, needs_translation, language, deadline=deadline)
 
     return pdf_bytes
 
 
-async def _render_pdf_from_url(url: str, needs_translation: bool, language: str, vin: str) -> Optional[bytes]:
+async def _render_pdf_from_url(url: str, needs_translation: bool, language: str, vin: str, *, deadline: Optional[float] = None) -> Optional[bytes]:
     html = None
     pdf_bytes = None
 
@@ -578,7 +603,7 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 return await fetch_page_html_chromium(
                     url,
                     wait_until=_translated_fetch_wait_until(),
-                    timeout_ms=_translated_fetch_timeout_ms(),
+                    timeout_ms=min(_translated_fetch_timeout_ms(), _deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=30_000)),
                 )
             except Exception:
                 return None
@@ -620,13 +645,17 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 html = None
 
         if html:
-            html = await _maybe_translate_html(html, language)
+            html = await _maybe_translate_html(html, language, deadline=deadline)
             if (language or "en").lower() in {"ar", "ku", "ckb"}:
                 html = inject_rtl(html, lang=language)
-                pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html, base_url=url)
+                pdf_bytes = await html_to_pdf_bytes_chromium(
+                    html_str=html,
+                    base_url=url,
+                    timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
+                )
         if not pdf_bytes:
             # Last-resort: print the original URL without translation.
-            pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
+            pdf_bytes = await html_to_pdf_bytes_chromium(url=url, timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000))
     else:
         lang_code = (language or "en").lower()
 
@@ -652,7 +681,7 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                         await asyncio.sleep(delay_ms / 1000.0)
                     except Exception:
                         pass
-                return await html_to_pdf_bytes_chromium(url=url)
+                return await html_to_pdf_bytes_chromium(url=url, timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000))
 
             http_task = asyncio.create_task(_http_html_render())
             url_task = asyncio.create_task(_url_render())
@@ -695,23 +724,27 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 except Exception:
                     html = None
                 if html and _html_looks_renderable(html):
-                    pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html, base_url=url)
+                    pdf_bytes = await html_to_pdf_bytes_chromium(
+                        html_str=html,
+                        base_url=url,
+                        timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
+                    )
                     if not pdf_bytes:
-                        pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language, base_url=url)
+                        pdf_bytes = await _render_pdf_from_html(html, needs_translation=False, language=language, base_url=url, deadline=deadline)
                 else:
-                    pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
+                    pdf_bytes = await html_to_pdf_bytes_chromium(url=url, timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000))
             else:
-                pdf_bytes = await html_to_pdf_bytes_chromium(url=url)
+                pdf_bytes = await html_to_pdf_bytes_chromium(url=url, timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000))
 
     if not pdf_bytes and html:
-        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html, base_url=url)
+        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=html, base_url=url, timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000))
     if not pdf_bytes:
         fallback = (
             f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3>"
             f"<a href='{escape(url)}'>{escape(url)}</a></body></html>"
         )
-        fallback = await _maybe_translate_html(fallback, language) if needs_translation else fallback
-        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=fallback, base_url=url)
+        fallback = await _maybe_translate_html(fallback, language, deadline=deadline) if needs_translation else fallback
+        pdf_bytes = await html_to_pdf_bytes_chromium(html_str=fallback, base_url=url, timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000))
     return pdf_bytes
 
 
@@ -720,18 +753,24 @@ async def _render_pdf_from_html(
     needs_translation: bool,
     language: str,
     base_url: Optional[str] = None,
+    *,
+    deadline: Optional[float] = None,
 ) -> Optional[bytes]:
     if not html:
         return None
-    translated = await _maybe_translate_html(html, language) if needs_translation else html
+    translated = await _maybe_translate_html(html, language, deadline=deadline) if needs_translation else html
     # Enforce RTL wrapper for Arabic/Kurdish even if translation fell back to original
     if (language or "en").lower() in {"ar", "ku", "ckb"}:
         translated = inject_rtl(translated, lang=language)
     # Chromium-only renderer.
-    return await html_to_pdf_bytes_chromium(html_str=translated, base_url=base_url)
+    return await html_to_pdf_bytes_chromium(
+        html_str=translated,
+        base_url=base_url,
+        timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
+    )
 
 
-async def _maybe_translate_html(html: Optional[str], lang: str) -> str:
+async def _maybe_translate_html(html: Optional[str], lang: str, *, deadline: Optional[float] = None) -> str:
     if not html:
         return ""
     lang_code = (lang or "en").lower()
@@ -758,6 +797,9 @@ async def _maybe_translate_html(html: Optional[str], lang: str) -> str:
     # - `translate_html_google_free`: optimized Google-free-only HTML translator.
     # We then take the first result that *actually* contains Arabic-script output.
     timeout_s = float(os.getenv("TRANSLATE_TIMEOUT_SEC", "6.0") or 6.0)
+    if deadline is not None:
+        # Keep translation within remaining report budget.
+        timeout_s = min(timeout_s, max(2.0, (deadline - time.perf_counter()) - 1.0))
     # Give a tiny bit of headroom so we don't cancel the translator right before success.
     hard_timeout = max(2.0, min(timeout_s + 2.0, 15.0))
 

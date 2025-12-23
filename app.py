@@ -1493,11 +1493,12 @@ def _render_usercard_text(u: Dict[str, Any], lang: Optional[str] = None) -> str:
 
 async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, stop_event: asyncio.Event):
     try:
-        # Deterministic 10-second progress (0% -> 100%), updating 10% per second.
+        # Fast progress feel: advance 10% every 0.5s up to 90%.
+        # Avoid showing 100% before completion; caller sets 100% at the end.
         # The initial message is sent at 0% by the caller.
-        for p in range(10, 101, 10):
+        for p in range(10, 100, 10):
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+                await asyncio.wait_for(stop_event.wait(), timeout=0.5)
                 break
             except asyncio.TimeoutError:
                 pass

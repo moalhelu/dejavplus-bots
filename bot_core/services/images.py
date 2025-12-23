@@ -185,14 +185,27 @@ def _badvin_fetch_sync(vin: str, email: str, password: str) -> List[str]:
                 html_candidates.append(html)
 
         images: List[str] = []
+        last_car_data: Dict[str, Any] = {}
         for html in html_candidates:
             if not html:
                 continue
-            _, images = scraper.extract_car_data_and_images(html, vin)
+            car_data, images = scraper.extract_car_data_and_images(html, vin)
+            if isinstance(car_data, dict):
+                last_car_data = car_data
             if images:
                 break
         if not images:
-            LOGGER.info("badvin: no images found vin=%s", vin)
+            if last_car_data:
+                LOGGER.info(
+                    "badvin: no images vin=%s diag source=%s sale_section=%s blocks=%s json_records=%s",
+                    vin,
+                    last_car_data.get("source"),
+                    last_car_data.get("sale_section_found"),
+                    last_car_data.get("sale_record_blocks"),
+                    last_car_data.get("json_records"),
+                )
+            else:
+                LOGGER.info("badvin: no images found vin=%s", vin)
             return []
         deduped: List[str] = []
         for url in images:

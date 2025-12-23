@@ -281,6 +281,14 @@ class BadvinScraper:
         try:
             soup = BeautifulSoup(report_content, "html.parser")
             imgs = []
+            diag = {
+                "sale_section_found": False,
+                "sale_record_blocks": 0,
+                "sale_records_with_photos": 0,
+                "json_records": 0,
+                "json_records_with_photos": 0,
+                "source": "dom",
+            }
 
             def _push(url: str):
                 if not url:
@@ -393,6 +401,7 @@ class BadvinScraper:
             search_root = None
             record_summaries = []  # [(idx, ts, photo_count, raw_date)]
             if sale_section:
+                diag["sale_section_found"] = True
                 # Collect sale-record blocks. Some pages contain multiple "Sale Record" sections.
                 def _find_sale_record_blocks():
                     blocks = []
@@ -431,6 +440,8 @@ class BadvinScraper:
                 for idx, node in enumerate(_find_sale_record_blocks()):
                     gallery = node.find("div", class_=lambda c: c and "bv-gallery" in _cls_str(c)) or node
                     candidates.append((idx, _parse_sale_date(node), gallery, node))
+
+                diag["sale_record_blocks"] = len(candidates)
 
                 if candidates:
                     prepared_records = []
@@ -502,6 +513,7 @@ class BadvinScraper:
                     chosen = select_oldest_badvin_record_with_photos(prepared_records)
                     if chosen and chosen.get("photos"):
                         imgs.extend(chosen["photos"])
+                        diag["sale_records_with_photos"] = 1
                         logger.debug(
                             "Badvin: chose record idx=%s ts=%s photos=%s vin=%s",
                             chosen.get("idx"),
@@ -512,6 +524,71 @@ class BadvinScraper:
                     else:
                         logger.info("Badvin: no record with photos selected for vin %s", vin)
                 logger.info("Badvin: record summaries for vin %s => %s", vin, record_summaries)
+
+            def _extract_sale_records_from_embedded_json() -> list[dict]:
+                records: list[dict] = []
+                # Common case: JSON blobs in <script type="application/json"> or similar.
+                for script in soup.find_all("script"):
+                    stype = (script.get("type") or "").strip().lower()
+                    if stype and "json" not in stype:
+                        continue
+                    raw = script.string
+                    if not raw:
+                        continue
+                    raw = raw.strip()
+                    if not raw or len(raw) < 20:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+
+                    def _walk(x):
+                        if isinstance(x, dict):
+                            if "link_img_hd" in x:
+                                records.append(x)
+                            for v in x.values():
+                                _walk(v)
+                        elif isinstance(x, list):
+                            for it in x:
+                                _walk(it)
+
+                    _walk(obj)
+                return records
+
+            # If DOM sale-record section yielded nothing, try embedded JSON (JS-rendered pages).
+            if not imgs:
+                json_records = _extract_sale_records_from_embedded_json()
+                diag["json_records"] = len(json_records)
+                prepared: list[dict] = []
+                for idx, entry in enumerate(json_records):
+                    if not isinstance(entry, dict):
+                        continue
+                    photos: list[str] = []
+                    val = entry.get("link_img_hd")
+                    if isinstance(val, list):
+                        for u in val:
+                            if isinstance(u, str) and u.strip():
+                                photos.append(urljoin(self.base_url, u.strip()))
+                    elif isinstance(val, str) and val.strip():
+                        photos.append(urljoin(self.base_url, val.strip()))
+
+                    # pick one date-like field if present
+                    date_val = None
+                    for k in ("sale_date", "sold_date", "auction_date", "date", "created_at", "updated_at", "saleDate"):
+                        if entry.get(k):
+                            date_val = entry.get(k)
+                            break
+                    prepared.append({"idx": idx, "date": date_val, "timestamp": date_val, "photos": photos})
+
+                chosen = select_oldest_badvin_record_with_photos(prepared)
+                if chosen and chosen.get("photos"):
+                    # Filter via is_car_image + dedupe
+                    diag["source"] = "json"
+                    diag["json_records_with_photos"] = 1
+                    for u in chosen["photos"]:
+                        if self.is_car_image(u):
+                            imgs.append(u)
 
             # De-duplicate while preserving order
             seen = set()
@@ -532,9 +609,12 @@ class BadvinScraper:
             # Accept any non-empty set of images
             if not out:
                 logger.info(f"No valid images found for VIN {vin} in sale record section.")
-                return {'vin': vin, 'photos_count': 0}, []
+                car_data = {'vin': vin, 'photos_count': 0}
+                car_data.update(diag)
+                return car_data, []
 
             car_data = {'vin': vin, 'photos_count': len(out)}
+            car_data.update(diag)
             return car_data, out
 
         except Exception as e:

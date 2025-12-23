@@ -1377,21 +1377,69 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
     path_value = document.get("path")
     url_value = document.get("url")
 
+    # Prefer serving via public URL for larger PDFs to avoid UltraMsg payload limits.
+    wa_max_b64_raw = os.getenv("WA_PDF_BASE64_MAX_BYTES", "650000")  # ~0.65MB raw bytes (becomes larger in base64)
+    try:
+        wa_max_b64_bytes = int(wa_max_b64_raw)
+    except Exception:
+        wa_max_b64_bytes = 650000
+    wa_max_b64_bytes = max(100000, min(wa_max_b64_bytes, 5_000_000))
+
+    file_size = None
+    if path_value:
+        try:
+            file_size = Path(path_value).stat().st_size
+        except Exception:
+            file_size = None
+
+    async def _ensure_public_url() -> Optional[str]:
+        public = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip()
+        if public:
+            return public
+        try:
+            public = await _get_ngrok_url()
+        except Exception:
+            public = None
+        if public:
+            os.environ["WHATSAPP_PUBLIC_URL"] = public
+            return public
+        return None
+
     # Try to serve file via public URL if available (to avoid 413 Payload Too Large)
-    public_url = os.getenv("WHATSAPP_PUBLIC_URL")
-    if path_value and public_url:
+    public_url = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip() or None
+    if path_value and (public_url or (file_size is not None and file_size >= wa_max_b64_bytes)):
+        if not public_url:
+            public_url = await _ensure_public_url()
         try:
             # Copy file to static dir
             src_path = Path(path_value)
             if src_path.exists():
                 dst_path = STATIC_DIR / filename
                 shutil.copy2(src_path, dst_path)
-                url_value = f"{public_url}/static/{filename}"
-                LOGGER.info("Serving PDF via public URL: %s", url_value)
+                if public_url:
+                    url_value = f"{public_url}/static/{filename}"
+                    LOGGER.info("Serving PDF via public URL: %s", url_value)
         except Exception as e:
             LOGGER.warning("Failed to serve PDF via static URL: %s", e)
 
     if not base64_payload and not url_value and path_value:
+        # If file is big and we still don't have a public URL, base64 will likely fail.
+        if file_size is not None and file_size >= wa_max_b64_bytes:
+            LOGGER.warning(
+                "WhatsApp PDF too large for base64 and no public URL (size=%s bytes, max=%s). Set WHATSAPP_PUBLIC_URL.",
+                file_size,
+                wa_max_b64_bytes,
+            )
+            try:
+                await send_whatsapp_text(
+                    msisdn,
+                    "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير ولا يوجد رابط عام. "
+                    "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين) ثم أعد المحاولة.",
+                    client=client,
+                )
+            except Exception:
+                pass
+            return
         base64_payload = _encode_file_to_base64(str(path_value))
 
     if url_value:
@@ -1420,6 +1468,16 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
         LOGGER.info("UltraMsg send_document response: %s", resp)
     except Exception as e:
         LOGGER.error("Failed to send document: %s", e, exc_info=True)
+        # Notify user once (no spam) so failure is visible.
+        try:
+            await send_whatsapp_text(
+                msisdn,
+                "⚠️ حصل خطأ أثناء إرسال ملف PDF على واتساب. "
+                "جرّب مرة ثانية، وإذا استمرت المشكلة اطلب من الإدارة تفعيل إرسال PDF عبر رابط WHATSAPP_PUBLIC_URL.",
+                client=client,
+            )
+        except Exception:
+            pass
 
 
 async def _relay_image_document(client: UltraMsgClient, msisdn: str, media: Dict[str, Any]) -> None:

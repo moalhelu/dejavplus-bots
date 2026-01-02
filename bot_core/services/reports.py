@@ -332,14 +332,18 @@ class ReportResult:
 async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool = True) -> ReportResult:
     """Fetch a VIN report from the upstream API and return a PDF (if possible)."""
 
-    lang_code = (language or "en").strip().lower()
+    requested_lang = (language or "en").strip().lower()
     normalized_vin = normalize_vin(vin)
     if not normalized_vin:
-        return ReportResult(success=False, user_message=_t("report.invalid_vin", lang_code, "❌ رقم VIN غير صالح."), errors=["invalid_vin"])
+        return ReportResult(success=False, user_message=_t("report.invalid_vin", requested_lang, "❌ رقم VIN غير صالح."), errors=["invalid_vin"])
 
     effective_fast = bool(fast_mode) and _FAST_MODE_ENABLED
 
-    cached = _cache_get(normalized_vin, lang_code, "fast" if effective_fast else "full")
+    # FAST/base delivery must always be the official upstream PDF.
+    # Language is handled as optional derived output.
+    cache_lang = "en" if effective_fast else requested_lang
+
+    cached = _cache_get(normalized_vin, cache_lang, "fast" if effective_fast else "full")
     if cached:
         return ReportResult(
             success=True,
@@ -348,7 +352,7 @@ async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool
             vin=normalized_vin,
         )
 
-    inflight_key = f"{normalized_vin}:{lang_code}:{'fast' if effective_fast else 'full'}"
+    inflight_key = f"{normalized_vin}:{cache_lang}:{'fast' if effective_fast else 'full'}"
     async with _INFLIGHT_LOCK:
         task = _INFLIGHT.get(inflight_key)
         if task is None:
@@ -356,13 +360,13 @@ async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool
                 try:
                     if effective_fast:
                         result = await asyncio.wait_for(
-                            _generate_vin_report_inner(normalized_vin, lang_code, True),
+                            _generate_vin_report_inner(normalized_vin, requested_lang, True),
                             timeout=float(_TOTAL_BUDGET_SEC),
                         )
                     else:
-                        result = await _generate_vin_report_inner(normalized_vin, lang_code, False)
+                        result = await _generate_vin_report_inner(normalized_vin, requested_lang, False)
                     if result.success and result.pdf_bytes:
-                        _cache_put(normalized_vin, lang_code, "fast" if effective_fast else "full", result.pdf_bytes)
+                        _cache_put(normalized_vin, cache_lang, "fast" if effective_fast else "full", result.pdf_bytes)
                     return result
                 finally:
                     async with _INFLIGHT_LOCK:
@@ -377,8 +381,10 @@ async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool
     return await asyncio.shield(task)
 
 
-async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_mode: bool) -> ReportResult:
+async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, fast_mode: bool) -> ReportResult:
     """Inner implementation for generate_vin_report (no caching)."""
+
+    from bot_core.utils.pdf_format import validate_pdf_format
 
     start_t = time.perf_counter()
     total_budget = _TOTAL_BUDGET_SEC if fast_mode else _REPORT_TOTAL_TIMEOUT_SEC
@@ -395,7 +401,7 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
     except Exception:
         return ReportResult(
             success=False,
-            user_message=_t("report.error.timeout", lang_code, "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد. جرّب مرة أخرى."),
+            user_message=_t("report.error.timeout", requested_lang, "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد."),
             errors=["queue_timeout"],
             vin=normalized_vin,
         )
@@ -403,16 +409,19 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
     api_response: Dict[str, Any] = {}
     pdf_bytes: Optional[bytes] = None
     skipped_translation = False
-    delivered_lang = lang_code
-    requested_lang = lang_code
+    delivered_lang = requested_lang
     fetch_sec = 0.0
     pdf_sec = 0.0
+    format_ok = False
+    cache_hit_base = False
+    cache_hit_lang = False
 
     try:
-        prefer_non_pdf = lang_code != "en"
+        # Base FAST delivery: always fetch official PDF bytes.
+        prefer_non_pdf = False if fast_mode else ((requested_lang or "en") != "en")
         fetch_budget = _budget_s(_remaining_s(), _FETCH_BUDGET_SEC) if fast_mode else _remaining_s()
         t_fetch0 = time.perf_counter()
-        async with atimed("report.fetch", vin=normalized_vin, lang=lang_code, prefer_non_pdf=prefer_non_pdf, budget_s=fetch_budget, fast=bool(fast_mode)):
+        async with atimed("report.fetch", vin=normalized_vin, lang=requested_lang, prefer_non_pdf=prefer_non_pdf, budget_s=fetch_budget, fast=bool(fast_mode)):
             api_response = await _call_carfax_api(
                 normalized_vin,
                 prefer_non_pdf=prefer_non_pdf,
@@ -424,7 +433,7 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
         LOGGER.info(
             "report.fastmode fetch_done vin=%s lang=%s fast=%s remaining=%.2fs",
             normalized_vin,
-            lang_code,
+            requested_lang,
             bool(fast_mode),
             _remaining_s(),
         )
@@ -434,34 +443,107 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
             if str(err).lower() in {"busy", "queue_timeout", "deadline_exceeded"}:
                 return ReportResult(
                     success=False,
-                    user_message=_t("report.error.timeout", lang_code, "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد. جرّب مرة أخرى."),
+                    user_message=_t("report.error.timeout", requested_lang, "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد."),
                     errors=[str(err)],
                     vin=normalized_vin,
                     raw_response=api_response,
                 )
             return ReportResult(
                 success=False,
-                user_message=_t("report.error.fetch_detailed", lang_code, "⚠️ فشل جلب تقرير VIN: {error}", error=err),
+                user_message=_t("report.error.fetch_detailed", requested_lang, "⚠️ فشل جلب تقرير VIN: {error}", error=err),
                 errors=[str(err)],
                 vin=normalized_vin,
                 raw_response=api_response,
             )
 
-        # Shortcut: upstream returned a PDF already.
-        if api_response.get("pdf_bytes"):
-            filename = api_response.get("filename", f"{normalized_vin}.pdf")
-            # For non-English, avoid returning raw PDF (would remain English). Force translation flow.
-            if lang_code == "en":
+        # FAST/base path: accept only official upstream PDF bytes.
+        if fast_mode:
+            pdf_bytes = api_response.get("pdf_bytes")
+            if not pdf_bytes:
                 return ReportResult(
-                    success=True,
-                    user_message=_t("report.success.pdf_direct", lang_code, "✅ تم استلام ملف PDF مباشر."),
-                    pdf_bytes=api_response["pdf_bytes"],
-                    pdf_filename=filename,
+                    success=False,
+                    user_message=_t("report.error.timeout", requested_lang, "⚠️ تعذّر إكمال الطلب ضمن SLA الوقت."),
+                    errors=["no_pdf"],
                     vin=normalized_vin,
                     raw_response=api_response,
                 )
-            # If non-English but only PDF is available, treat as not ok to push fallback rendering.
-            api_response = {"ok": False, "error": "pdf_only_non_translatable"}
+
+            # Validate official format gate BEFORE returning.
+            chk = validate_pdf_format(bytes(pdf_bytes), expected_vin=normalized_vin, require_official_tokens=True)
+            if not chk.ok:
+                # One fresh retry (best-effort) to avoid cached/bad upstream variants.
+                retry_budget = max(0.25, _remaining_s())
+                try:
+                    api_response2 = await _call_carfax_api(
+                        normalized_vin,
+                        prefer_non_pdf=False,
+                        total_timeout_s=retry_budget,
+                        deadline=deadline,
+                        force_fresh=True,
+                    )
+                    pdf2 = api_response2.get("pdf_bytes")
+                    if pdf2:
+                        chk2 = validate_pdf_format(bytes(pdf2), expected_vin=normalized_vin, require_official_tokens=True)
+                        if chk2.ok:
+                            api_response = api_response2
+                            pdf_bytes = pdf2
+                            chk = chk2
+                except Exception:
+                    pass
+
+            format_ok = bool(chk.ok)
+            if not format_ok:
+                return ReportResult(
+                    success=False,
+                    user_message=_t("report.error.generic", requested_lang, "⚠️ تعذّر إكمال الطلب ضمن SLA الوقت."),
+                    errors=[f"format_mismatch:{chk.reason}"],
+                    vin=normalized_vin,
+                    raw_response=api_response,
+                )
+
+            # Requested language != EN: deliver base official report now; localized can follow asynchronously.
+            if (requested_lang or "en") != "en":
+                skipped_translation = True
+                delivered_lang = "en"
+
+            try:
+                api_response["_dv_fast"] = {
+                    "fast_mode": True,
+                    "skipped_translation": bool(skipped_translation),
+                    "requested_lang": (requested_lang or "en"),
+                    "delivered_lang": delivered_lang,
+                    "format_ok": True,
+                    "fetch_sec": round(float(fetch_sec), 3),
+                    "pdf_sec": 0.0,
+                    "total_sec": round(float(time.perf_counter() - start_t), 3),
+                }
+            except Exception:
+                pass
+
+            try:
+                LOGGER.info(
+                    "sla.base rid=%s vin=%s req_lang=%s del_lang=%s cache_hit_base=%s format_ok=%s fetch_sec=%.3f total_sec=%.3f outcome=success",
+                    get_rid() or "-",
+                    normalized_vin,
+                    requested_lang,
+                    delivered_lang,
+                    bool(cache_hit_base),
+                    True,
+                    float(fetch_sec),
+                    float(time.perf_counter() - start_t),
+                )
+            except Exception:
+                pass
+
+            filename = api_response.get("filename", f"{normalized_vin}.pdf")
+            return ReportResult(
+                success=True,
+                user_message=_t("report.success.pdf_direct", requested_lang, "✅ Report ready."),
+                pdf_bytes=bytes(pdf_bytes),
+                pdf_filename=filename,
+                vin=normalized_vin,
+                raw_response=api_response,
+            )
 
         # In Fast Mode, prefer using the full remaining SLA time for PDF rendering.
         pdf_budget = _remaining_s()
@@ -610,6 +692,7 @@ async def _call_carfax_api(
     prefer_non_pdf: bool = False,
     total_timeout_s: Optional[float] = None,
     deadline: Optional[float] = None,
+    force_fresh: bool = False,
 ) -> Dict[str, Any]:
     cfg = get_env()
     api_url = cfg.api_url.strip()
@@ -617,6 +700,9 @@ async def _call_carfax_api(
     token = cfg.api_token.strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if force_fresh:
+        headers["Cache-Control"] = "no-cache"
+        headers["Pragma"] = "no-cache"
     if prefer_non_pdf:
         headers["Accept"] = "application/json, text/html;q=0.9, */*;q=0.5"
     else:
@@ -626,6 +712,8 @@ async def _call_carfax_api(
 
     base = api_url.rstrip("/")
     payload = {"vin": vin}
+    if force_fresh:
+        payload["_ts"] = int(time.time())
     session = await _get_http_session()
 
     # Cap request time budget (best-effort) so end-to-end report stays fast.
@@ -669,7 +757,10 @@ async def _call_carfax_api(
     async def _try_get() -> Optional[Dict[str, Any]]:
         try:
             async with atimed("carfax.http", method="GET", route="/{vin}"):
-                async with session.get(f"{base}/{vin}", headers=headers, timeout=request_timeout) as resp:
+                url = f"{base}/{vin}"
+                if force_fresh:
+                    url = f"{url}?ts={int(time.time())}"
+                async with session.get(url, headers=headers, timeout=request_timeout) as resp:
                     parsed = await _handle(resp)
                     if parsed.get("ok"):
                         return parsed

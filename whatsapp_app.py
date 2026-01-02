@@ -58,6 +58,8 @@ from bot_core.utils.vin import is_valid_vin
 from bot_core.telemetry import atimed, new_rid, set_rid
 from bot_core.services.translation import close_http_session as _close_translation_session
 from bot_core.services.reports import close_http_session as _close_reports_session
+from bot_core.request_id import compute_request_id
+from bot_core.utils.pdf_format import validate_pdf_format
 
 from bot_core.logging_setup import configure_logging
 
@@ -124,6 +126,27 @@ def _wa_handler_timeout_sec() -> float:
     except Exception:
         val = 120.0
     return max(10.0, min(val, 600.0))
+
+
+def _extract_first_vin(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    for tok in re.findall(r"[A-Za-z0-9]{17}", text):
+        candidate = tok.strip().upper()
+        if is_valid_vin(candidate):
+            return candidate
+    return None
+
+
+def _compute_whatsapp_rid(*, user_id: str, vin: str, language: str) -> str:
+    # Charge idempotency is per base VIN report delivery.
+    return compute_request_id(
+        platform="whatsapp",
+        user_id=str(user_id),
+        vin=vin,
+        language=language or "en",
+        options={"product": "carfax_vhr"},
+    )
 
 
 def _get_pending_reports_count(user_id: str) -> int:
@@ -1147,6 +1170,7 @@ async def handle_incoming_whatsapp_message(
         report_vin = (user_ctx.state or "").split(":", 1)[1] or None
     LOGGER.debug("whatsapp inbound state=%s vin_state=%s", user_ctx.state, report_vin)
     pre_reserved_credit = False
+    rid_for_request: Optional[str] = None
 
     if (user_ctx.state or "").startswith("report_options"):
         LOGGER.debug("whatsapp: entering photo-options handler (vin=%s text=%s)", report_vin, text_body)
@@ -1307,6 +1331,7 @@ async def handle_incoming_whatsapp_message(
         # If user sent a VIN directly, send ONE processing message (no progress spam)
         if text_body and is_valid_vin(text_body):
             vin_clean = text_body.strip().upper()
+            rid_for_request = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_clean, language=user_ctx.language)
             db_snapshot = _load_db()
             user_record = db_snapshot.get("users", {}).get(user_ctx.user_id, {}) or {}
             limits = user_record.get("limits", {})
@@ -1336,7 +1361,7 @@ async def handle_incoming_whatsapp_message(
 
             # Reserve credit immediately on VIN receipt; downstream handler will commit/refund
             try:
-                reserve_credit(user_ctx.user_id)
+                reserve_credit(user_ctx.user_id, rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin_clean})
                 pre_reserved_credit = True
                 LOGGER.info("whatsapp: credit reserved on receipt for vin=%s user=%s", vin_clean, user_ctx.user_id)
             except Exception as exc:
@@ -1365,7 +1390,7 @@ async def handle_incoming_whatsapp_message(
         except Exception:
             if pre_reserved_credit:
                 try:
-                    refund_credit(user_ctx.user_id)
+                    refund_credit(user_ctx.user_id, rid=rid_for_request, meta={"platform": "whatsapp", "reason": "bridge_exception"})
                     LOGGER.info("whatsapp: refunded pre-reserved credit after handler error user=%s", user_ctx.user_id)
                 except Exception:
                     LOGGER.exception("whatsapp: failed to refund credit after handler error user=%s", user_ctx.user_id)
@@ -1650,6 +1675,7 @@ async def handle_incoming_whatsapp_message(
         # Guarantee: if a VIN report was successfully generated, we must either deliver it
         # (then commit credit) or explicitly fail + refund credit.
         if report_success and vin_from_response and credit_commit_required:
+            rid_for_delivery = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_from_response, language=user_ctx.language)
             delivery_ok = False
             if pdf_present:
                 delivery_ok = delivered_pdfs > 0
@@ -1659,7 +1685,7 @@ async def handle_incoming_whatsapp_message(
             if delivery_ok:
                 try:
                     if not delivery_committed:
-                        commit_credit(user_ctx.user_id)
+                        commit_credit(user_ctx.user_id, rid=rid_for_delivery, meta={"platform": "whatsapp", "vin": vin_from_response})
                         delivery_committed = True
                         LOGGER.info("whatsapp: committed credit after successful delivery user=%s vin=%s", user_ctx.user_id, vin_from_response)
                 except Exception:
@@ -1706,7 +1732,11 @@ async def handle_incoming_whatsapp_message(
             else:
                 try:
                     if not delivery_refunded:
-                        refund_credit(user_ctx.user_id)
+                        refund_credit(
+                            user_ctx.user_id,
+                            rid=rid_for_delivery,
+                            meta={"platform": "whatsapp", "vin": vin_from_response, "reason": "delivery_failed"},
+                        )
                         delivery_refunded = True
                         LOGGER.info(
                             "whatsapp: refunded credit due to delivery failure user=%s vin=%s pdf_present=%s delivered_pdfs=%s send_successes=%s send_failures=%s",
@@ -1739,7 +1769,14 @@ async def handle_incoming_whatsapp_message(
         send_failures += 1
         try:
             if report_success and credit_commit_required and not delivery_refunded:
-                refund_credit(user_ctx.user_id)
+                rid_for_timeout = rid_for_request
+                if vin_from_response:
+                    rid_for_timeout = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_from_response, language=user_ctx.language)
+                refund_credit(
+                    user_ctx.user_id,
+                    rid=rid_for_timeout,
+                    meta={"platform": "whatsapp", "reason": "sla_timeout", "vin": vin_from_response or ""},
+                )
                 delivery_refunded = True
         except Exception:
             pass
@@ -1827,10 +1864,22 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
 
     public_url = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip() or None
 
+    def _maybe_validate_vin_pdf(raw_bytes: bytes) -> bool:
+        vin = _extract_first_vin(str(filename)) or _extract_first_vin(str(caption))
+        if not vin:
+            return True
+        ok, reason = validate_pdf_format(raw_bytes, expected_vin=vin)
+        if not ok:
+            LOGGER.warning("Blocked PDF send due to format mismatch vin=%s reason=%s", vin, reason)
+            return False
+        return True
+
     # If we have bytes, prefer them (no disk).
     if not base64_payload and not url_value:
         if isinstance(doc_bytes, (bytes, bytearray)) and doc_bytes:
             raw_bytes = bytes(doc_bytes)
+            if not _maybe_validate_vin_pdf(raw_bytes):
+                return False
             if len(raw_bytes) >= wa_max_b64_bytes:
                 if not public_url:
                     public_url = await _ensure_public_url()
@@ -1865,6 +1914,8 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                 raw_bytes = b""
             if not raw_bytes:
                 LOGGER.warning("Skipping pdf document: failed to read path=%s", path_value)
+                return False
+            if not _maybe_validate_vin_pdf(raw_bytes):
                 return False
             if len(raw_bytes) >= wa_max_b64_bytes:
                 if not public_url:
@@ -2110,10 +2161,11 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                     msisdn = _normalize_recipient(raw_sender) or bridge_sender
                     if msisdn and bridge_sender:
                         user_ctx = _build_user_context(bridge_sender, entry)
-                        # Always best-effort refund on timeout. `refund_credit` is safe
-                        # even if nothing was reserved (it clamps counters at 0).
                         try:
-                            refund_credit(user_ctx.user_id)
+                            vin = _extract_first_vin(str(entry.get("body") or entry.get("text") or ""))
+                            if vin:
+                                rrid = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin, language=user_ctx.language)
+                                refund_credit(user_ctx.user_id, rid=rrid, meta={"reason": "timeout", "platform": "whatsapp", "vin": vin})
                         except Exception:
                             pass
                         msg = _bridge.t("report.error.timeout", user_ctx.language)
@@ -2130,7 +2182,10 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                     if msisdn and bridge_sender:
                         user_ctx = _build_user_context(bridge_sender, entry)
                         try:
-                            refund_credit(user_ctx.user_id)
+                            vin = _extract_first_vin(str(entry.get("body") or entry.get("text") or ""))
+                            if vin:
+                                rrid = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin, language=user_ctx.language)
+                                refund_credit(user_ctx.user_id, rid=rrid, meta={"reason": "handler_error", "platform": "whatsapp", "vin": vin})
                         except Exception:
                             pass
                         msg = _bridge.t("report.error.generic", user_ctx.language)

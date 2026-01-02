@@ -49,12 +49,18 @@ def _bytes_contain_token(pdf_bytes: bytes, token: str) -> bool:
 
 async def _check_fast_report(vin: str, lang: str) -> None:
     from bot_core.services import reports
+    from bot_core.utils.pdf_format import validate_pdf_format
 
     res = await reports.generate_vin_report(vin, language=lang, fast_mode=True)
     if not res or not res.success or not res.pdf_bytes:
         raise RuntimeError(f"FAST report failed (success={getattr(res,'success',None)} errors={getattr(res,'errors',None)})")
 
     pdf_bytes = bytes(res.pdf_bytes)
+
+    # Must pass official format gate for base delivery.
+    chk = validate_pdf_format(pdf_bytes, expected_vin=vin, require_official_tokens=True)
+    if not chk.ok:
+        raise RuntimeError(f"FAST PDF format gate failed: {chk.reason}")
 
     # Must contain VIN somewhere (basic sanity).
     if not _bytes_contain_token(pdf_bytes, vin):

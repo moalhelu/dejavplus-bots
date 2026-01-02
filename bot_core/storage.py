@@ -9,6 +9,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Optional, Final
 
+from bot_core.request_ledger import reserve_once as _ledger_reserve_once, commit_once as _ledger_commit_once, refund_once as _ledger_refund_once
+
 from bot_core.config import get_env
 from bot_core.telemetry import log_timing, timed
 
@@ -220,9 +222,19 @@ def bump_usage(user: Dict[str, Any]) -> None:
         limits["last_month"] = month_key
 
 
-def reserve_credit(user_id: str) -> None:
-    """Deduct 1 credit from the user's balance (increment usage)."""
+def reserve_credit(user_id: str, *, rid: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> bool:
+    """Reserve 1 report credit (idempotent when rid is provided).
+
+    Returns True only when the reservation is applied (first time for this rid).
+    """
+
     db = load_db()
+    if rid:
+        decision = _ledger_reserve_once(db, rid, meta=meta)
+        if not decision.changed:
+            save_db(db)
+            return False
+
     u = ensure_user(db, user_id, None)
     limits = u.setdefault("limits", {})
     limits["today_used"] = _safe_int(limits.get("today_used")) + 1
@@ -230,11 +242,22 @@ def reserve_credit(user_id: str) -> None:
     stats = u.setdefault("stats", {})
     stats["pending_reports"] = stats.get("pending_reports", 0) + 1
     save_db(db)
+    return True
 
 
-def refund_credit(user_id: str) -> None:
-    """Refund 1 credit to the user's balance (decrement usage)."""
+def refund_credit(user_id: str, *, rid: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> bool:
+    """Refund 1 reserved credit (idempotent when rid is provided).
+
+    Returns True only when the refund is applied (first time for this rid).
+    """
+
     db = load_db()
+    if rid:
+        decision = _ledger_refund_once(db, rid, outcome_meta=meta)
+        if not decision.changed:
+            save_db(db)
+            return False
+
     u = ensure_user(db, user_id, None)
     limits = u.setdefault("limits", {})
     limits["today_used"] = max(0, _safe_int(limits.get("today_used")) - 1)
@@ -242,17 +265,29 @@ def refund_credit(user_id: str) -> None:
     stats = u.setdefault("stats", {})
     stats["pending_reports"] = max(0, stats.get("pending_reports", 0) - 1)
     save_db(db)
+    return True
 
 
-def commit_credit(user_id: str) -> None:
-    """Confirm successful report generation (update stats)."""
+def commit_credit(user_id: str, *, rid: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> bool:
+    """Commit successful report delivery (idempotent when rid is provided).
+
+    Returns True only when the commit is applied (first time for this rid).
+    """
+
     db = load_db()
+    if rid:
+        decision = _ledger_commit_once(db, rid, outcome_meta=meta)
+        if not decision.changed:
+            save_db(db)
+            return False
+
     u = ensure_user(db, user_id, None)
     stats = u.setdefault("stats", {})
     stats["pending_reports"] = max(0, stats.get("pending_reports", 0) - 1)
     stats["total_reports"] = stats.get("total_reports", 0) + 1
     stats["last_report_ts"] = now_str()
     save_db(db)
+    return True
 
 
 

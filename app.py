@@ -58,7 +58,12 @@ from bot_core.storage import (
     bump_usage as _bump_usage,
     now_str as _now_str,
     remaining_monthly_reports as _remaining_monthly_reports,
+    reserve_credit as _reserve_credit,
+    refund_credit as _refund_credit,
+    commit_credit as _commit_credit,
 )
+from bot_core.request_id import compute_request_id
+from bot_core.utils.pdf_format import validate_pdf_format
 from bot_core.services.images import (
     get_badvin_images as _get_badvin_images,
     get_badvin_images_media as _get_badvin_images_media,
@@ -1185,26 +1190,50 @@ async def _finalize_report_request(
     tg_id: str,
     *,
     delivered: bool,
+    rid: Optional[str] = None,
 ) -> Dict[str, Any]:
     lock = _user_lock(tg_id)
     async with lock:
+        if rid:
+            # Exactly-once accounting (reserve/commit/refund) across retries/restarts.
+            try:
+                if delivered:
+                    _commit_credit(tg_id, rid=rid, meta={"platform": "telegram"})
+                else:
+                    _refund_credit(tg_id, rid=rid, meta={"platform": "telegram"})
+            except Exception:
+                logger.warning("rid-aware finalize failed", exc_info=True)
+
+        else:
+            # Legacy path (no rid): mutate counters directly.
+            db = _load_db()
+            u = _ensure_user(db, tg_id, None)
+            limits = u.setdefault("limits", {})
+            stats = u.setdefault("stats", {})
+            stats["pending_reports"] = max(0, stats.get("pending_reports", 0) - 1)
+
+            if delivered:
+                stats["total_reports"] = stats.get("total_reports", 0) + 1
+                stats["last_report_ts"] = _now_str()
+            else:
+                limits["today_used"] = max(0, _safe_int(limits.get("today_used")) - 1)
+                limits["month_used"] = max(0, _safe_int(limits.get("month_used")) - 1)
+
+            if delivered:
+                await _notify_usage_caps_if_needed(context, u)
+
+            _save_db(db)
+
+        # Refresh snapshot from disk after accounting (rid-aware path uses storage helpers).
         db = _load_db()
         u = _ensure_user(db, tg_id, None)
         limits = u.setdefault("limits", {})
-        stats = u.setdefault("stats", {})
-        stats["pending_reports"] = max(0, stats.get("pending_reports", 0) - 1)
 
         if delivered:
-            stats["total_reports"] = stats.get("total_reports", 0) + 1
-            stats["last_report_ts"] = _now_str()
-        else:
-            limits["today_used"] = max(0, _safe_int(limits.get("today_used")) - 1)
-            limits["month_used"] = max(0, _safe_int(limits.get("month_used")) - 1)
-
-        if delivered:
-            await _notify_usage_caps_if_needed(context, u)
-
-        _save_db(db)
+            try:
+                await _notify_usage_caps_if_needed(context, u)
+            except Exception:
+                pass
 
         snapshot = {
             "user": copy.deepcopy(u),
@@ -4949,6 +4978,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lock = _user_lock(tg_id)
         header_snapshot: Optional[Dict[str, Any]] = None
         report_lang = get_report_default_lang() or "en"
+        rid_charge: Optional[str] = None
 
         async with lock:
             db = _load_db()
@@ -4995,15 +5025,28 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _send_bridge_responses(update, limit_response, context=context)
                 return
 
-            _reserve_report_slot(u)
-            _save_db(db)
+            # Deterministic rid for exactly-once accounting.
+            rid_charge = compute_request_id(
+                platform="telegram",
+                user_id=str(tg_id),
+                vin=vin,
+                language=report_lang,
+                options={"product": "carfax_vhr"},
+            )
+            try:
+                _reserve_credit(tg_id, rid=rid_charge, meta={"platform": "telegram", "vin": vin, "lang": report_lang})
+            except Exception:
+                logger.warning("reserve_credit failed", exc_info=True)
 
+            # Refresh snapshot from disk after reserve (rid-aware path writes via storage helpers).
+            db2 = _load_db()
+            u2 = _ensure_user(db2, tg_id, update.effective_user.username)
             header_snapshot = {
-                "monthly_remaining": _remaining_monthly_reports(u),
-                "monthly_limit": _safe_int(u["limits"].get("monthly")),
-                "today_used": _safe_int(u["limits"].get("today_used")),
-                "daily_limit": _safe_int(u["limits"].get("daily")),
-                "days_left": _days_left(u.get("expiry_date")),
+                "monthly_remaining": _remaining_monthly_reports(u2),
+                "monthly_limit": _safe_int((u2.get("limits", {}) or {}).get("monthly")),
+                "today_used": _safe_int((u2.get("limits", {}) or {}).get("today_used")),
+                "daily_limit": _safe_int((u2.get("limits", {}) or {}).get("daily")),
+                "days_left": _days_left(u2.get("expiry_date")),
             }
 
         if not header_snapshot:
@@ -5159,7 +5202,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if not report_result.success:
                 err_text = report_result.user_message or _bridge.t("report.error.fetch", report_lang)
-                refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False)
+                refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False, rid=rid_charge)
                 refreshed_header = _build_vin_progress_header(
                     vin,
                     monthly_remaining=refund_snapshot["monthly_remaining"],
@@ -5203,24 +5246,45 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     pdf_local_path = None
 
-                try:
-                    # We are now past generation and entering the upload/send phase.
-                    context.chat_data["progress_cap"] = 95
-                    if pdf_local_path:
-                        _register_cleanup(pdf_local_path)
-                        await asyncio.wait_for(
-                            _send_pdf_file(context, update.effective_chat.id, pdf_local_path, f"📄 تقرير VIN <code>{vin}</code>"),
-                            timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=10.0)),
-                        )
-                    else:
-                        bio = BytesIO(bytes(report_result.pdf_bytes))
-                        bio.name = report_result.pdf_filename or f"{vin}.pdf"
-                        try:
-                            from bot_core.telemetry import atimed
-                        except Exception:
-                            atimed = None
-                        if atimed:
-                            async with atimed("tg.send_document", bytes=len(report_result.pdf_bytes), via="bytes"):
+                ok, reason = validate_pdf_format(bytes(report_result.pdf_bytes), expected_vin=vin)
+                if not ok:
+                    report_result = _ReportResult(
+                        success=False,
+                        user_message=_bridge.t("report.error.generic", report_lang),
+                        errors=[f"pdf_format:{reason}"],
+                        vin=vin,
+                    )
+                else:
+
+                    try:
+                        # We are now past generation and entering the upload/send phase.
+                        context.chat_data["progress_cap"] = 95
+                        if pdf_local_path:
+                            _register_cleanup(pdf_local_path)
+                            await asyncio.wait_for(
+                                _send_pdf_file(context, update.effective_chat.id, pdf_local_path, f"📄 تقرير VIN <code>{vin}</code>"),
+                                timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=10.0)),
+                            )
+                        else:
+                            bio = BytesIO(bytes(report_result.pdf_bytes))
+                            bio.name = report_result.pdf_filename or f"{vin}.pdf"
+                            try:
+                                from bot_core.telemetry import atimed
+                            except Exception:
+                                atimed = None
+                            if atimed:
+                                async with atimed("tg.send_document", bytes=len(report_result.pdf_bytes), via="bytes"):
+                                    await asyncio.wait_for(
+                                        context.bot.send_document(
+                                            chat_id=update.effective_chat.id,
+                                            document=bio,
+                                            filename=bio.name,
+                                            caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                            parse_mode=ParseMode.HTML,
+                                        ),
+                                        timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
+                                    )
+                            else:
                                 await asyncio.wait_for(
                                     context.bot.send_document(
                                         chat_id=update.effective_chat.id,
@@ -5231,31 +5295,20 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     ),
                                     timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
                                 )
-                        else:
-                            await asyncio.wait_for(
-                                context.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=bio,
-                                    filename=bio.name,
-                                    caption=f"📄 تقرير VIN <code>{vin}</code>",
-                                    parse_mode=ParseMode.HTML,
-                                ),
-                                timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
-                            )
-                except asyncio.TimeoutError:
-                    report_result = _ReportResult(
-                        success=False,
-                        user_message=_bridge.t("report.error.timeout", report_lang),
-                        errors=["send_timeout"],
-                        vin=vin,
-                    )
-                except Exception as exc:
-                    report_result = _ReportResult(
-                        success=False,
-                        user_message=_bridge.t("report.error.generic", report_lang),
-                        errors=[f"send_failed:{exc}"],
-                        vin=vin,
-                    )
+                    except asyncio.TimeoutError:
+                        report_result = _ReportResult(
+                            success=False,
+                            user_message=_bridge.t("report.error.timeout", report_lang),
+                            errors=["send_timeout"],
+                            vin=vin,
+                        )
+                    except Exception as exc:
+                        report_result = _ReportResult(
+                            success=False,
+                            user_message=_bridge.t("report.error.generic", report_lang),
+                            errors=[f"send_failed:{exc}"],
+                            vin=vin,
+                        )
                 delivery_note = _bridge.t("report.success.pdf_note", report_lang)
                 delivered = bool(report_result and report_result.success)
 
@@ -5272,7 +5325,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
             if delivered:
-                finalize_snapshot = await _finalize_report_request(context, tg_id, delivered=True)
+                finalize_snapshot = await _finalize_report_request(context, tg_id, delivered=True, rid=rid_charge)
                 success_header = _build_vin_progress_header(
                     vin,
                     monthly_remaining=finalize_snapshot["monthly_remaining"],
@@ -5346,6 +5399,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 cm.__enter__()
                             full = await _generate_vin_report(vin, language=requested_lang, fast_mode=False)
                             if full and getattr(full, "success", False) and getattr(full, "pdf_bytes", None):
+                                ok2, _ = validate_pdf_format(bytes(full.pdf_bytes), expected_vin=vin)
+                                if not ok2:
+                                    return
                                 bio2 = BytesIO(bytes(full.pdf_bytes))
                                 bio2.name = getattr(full, "pdf_filename", None) or f"{vin}.pdf"
                                 await context.bot.send_document(
@@ -5371,7 +5427,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 return
             else:
-                refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False)
+                refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False, rid=rid_charge)
                 refreshed_header = _build_vin_progress_header(
                     vin,
                     monthly_remaining=refund_snapshot["monthly_remaining"],

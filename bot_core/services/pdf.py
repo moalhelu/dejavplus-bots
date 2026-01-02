@@ -326,6 +326,7 @@ async def html_to_pdf_bytes_chromium(
     *,
     base_url: Optional[str] = None,
     timeout_ms: Optional[int] = None,
+    acquire_timeout_ms: Optional[int] = None,
     wait_until: Optional[str] = None,
     fast_first_timeout_ms: Optional[int] = None,
     fast_first_wait_until: Optional[str] = None,
@@ -364,7 +365,16 @@ async def html_to_pdf_bytes_chromium(
             fast_first=fast_first,
             fast_first_timeout_ms=fast_first_timeout_ms,
         ):
-            async with _PDF_RENDER_SEM:
+            sem_acquired = False
+            try:
+                if acquire_timeout_ms is None:
+                    await _PDF_RENDER_SEM.acquire()
+                    sem_acquired = True
+                else:
+                    acquire_s = max(0.001, min(float(acquire_timeout_ms) / 1000.0, 120.0))
+                    await asyncio.wait_for(_PDF_RENDER_SEM.acquire(), timeout=acquire_s)
+                    sem_acquired = True
+
                 page = await _acquire_page()
                 try:
                     await _ensure_page_configured(page)
@@ -426,6 +436,12 @@ async def html_to_pdf_bytes_chromium(
                     return pdf_bytes
                 finally:
                     await _release_page(page)
+            finally:
+                if sem_acquired:
+                    try:
+                        _PDF_RENDER_SEM.release()
+                    except Exception:
+                        pass
     except Exception as e:
         await _reset_browser()
         with open("pdf_errors.log", "a", encoding="utf-8") as f:
@@ -439,6 +455,7 @@ async def fetch_page_html_chromium(
     *,
     wait_until: Optional[str] = None,
     timeout_ms: Optional[int] = None,
+    acquire_timeout_ms: Optional[int] = None,
 ) -> Optional[str]:
     """Fetch fully-rendered page HTML using the shared Chromium instance.
 
@@ -467,7 +484,16 @@ async def fetch_page_html_chromium(
             timeout_ms=timeout_ms,
             block_types=",".join(block_types),
         ):
-            async with _PDF_RENDER_SEM:
+            sem_acquired = False
+            try:
+                if acquire_timeout_ms is None:
+                    await _PDF_RENDER_SEM.acquire()
+                    sem_acquired = True
+                else:
+                    acquire_s = max(0.001, min(float(acquire_timeout_ms) / 1000.0, 120.0))
+                    await asyncio.wait_for(_PDF_RENDER_SEM.acquire(), timeout=acquire_s)
+                    sem_acquired = True
+
                 page = await _acquire_page()
                 try:
                     await _ensure_page_configured(page)
@@ -478,5 +504,11 @@ async def fetch_page_html_chromium(
                     return await page.content()
                 finally:
                     await _release_page(page)
+            finally:
+                if sem_acquired:
+                    try:
+                        _PDF_RENDER_SEM.release()
+                    except Exception:
+                        pass
     except Exception:
         return None

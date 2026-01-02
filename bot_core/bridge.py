@@ -1232,6 +1232,11 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "⚠️ Report fetch failed.",
         "ku": "⚠️ هێنانی ڕاپۆرت شکستی هێنا.",
     },
+    "report.error.busy": {
+        "ar": "⚠️ السيرفر مشغول حالياً. جرّب بعد قليل.",
+        "en": "⚠️ Server is busy right now. Please try again shortly.",
+        "ku": "⚠️ سێرڤەر ئێستا سەرقاڵە. تکایە دووبارە هەوڵ بدە دوای کەمێک.",
+    },
     "report.error.fetch_detailed": {
         "ar": "⚠️ فشل جلب تقرير VIN: {error}",
         "en": "⚠️ Failed to fetch VIN report: {error}",

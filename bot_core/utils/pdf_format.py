@@ -12,6 +12,11 @@ class PdfFormatCheck:
     reason: str
     extracted_head: str = ""
 
+    def __iter__(self):
+        # Backward-compatible tuple-unpacking: ok, reason = validate_pdf_format(...)
+        yield self.ok
+        yield self.reason
+
 
 # Hard prohibitions (never allowed)
 _FORBIDDEN_PHRASES = [

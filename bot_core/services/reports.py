@@ -30,10 +30,6 @@ def _empty_errors() -> List[str]:
     return []
 
 
-_VIN_CACHE_TTL = 10 * 60  # seconds
-_VIN_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
-_PDF_CACHE_TTL = 30 * 60  # seconds
-_PDF_CACHE: Dict[tuple[str, str], tuple[float, "ReportResult"]] = {}
 _HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 _HTTP_SESSION_LOCK = asyncio.Lock()
 _CARFAX_SEM = asyncio.Semaphore(15)
@@ -41,9 +37,6 @@ _CARFAX_TIMEOUT = float(os.getenv("CARFAX_HTTP_TIMEOUT", "20") or 20)
 
 _REPORT_TOTAL_TIMEOUT_SEC = float(os.getenv("REPORT_TOTAL_TIMEOUT_SEC", "10") or 10)
 _REPORT_TOTAL_TIMEOUT_SEC = max(3.0, min(_REPORT_TOTAL_TIMEOUT_SEC, 60.0))
-
-_INFLIGHT_REPORTS: Dict[tuple[str, str], asyncio.Task["ReportResult"]] = {}
-_INFLIGHT_LOCK = asyncio.Lock()
 
 # Backpressure: bound concurrent end-to-end report generation so heavy load doesn't
 # push all requests into timeouts after partial progress.
@@ -152,38 +145,6 @@ def _t(key: str, lang: str, _fallback: Optional[str] = None, **kwargs: Any) -> s
         return key
 
 
-def _cache_get(vin: str) -> Optional[Dict[str, Any]]:
-    exp_payload = _VIN_CACHE.get(vin)
-    if not exp_payload:
-        return None
-    expires_at, payload = exp_payload
-    if expires_at > time.time():
-        return payload
-    _VIN_CACHE.pop(vin, None)
-    return None
-
-
-def _cache_set(vin: str, payload: Dict[str, Any]) -> None:
-    _VIN_CACHE[vin] = (time.time() + _VIN_CACHE_TTL, payload)
-
-
-def _pdf_cache_get(vin: str, language: str) -> Optional["ReportResult"]:
-    key = (vin, language)
-    payload = _PDF_CACHE.get(key)
-    if not payload:
-        return None
-    expires_at, result = payload
-    if expires_at > time.time():
-        return result
-    _PDF_CACHE.pop(key, None)
-    return None
-
-
-def _pdf_cache_set(vin: str, language: str, result: "ReportResult") -> None:
-    key = (vin, language)
-    _PDF_CACHE[key] = (time.time() + _PDF_CACHE_TTL, result)
-
-
 async def _get_http_session() -> aiohttp.ClientSession:
     global _HTTP_SESSION
     async with _HTTP_SESSION_LOCK:
@@ -228,35 +189,12 @@ async def generate_vin_report(vin: str, *, language: str = "en") -> ReportResult
     if not normalized_vin:
         return ReportResult(success=False, user_message=_t("report.invalid_vin", lang_code, "❌ رقم VIN غير صالح."), errors=["invalid_vin"])
 
-    cached_pdf = _pdf_cache_get(normalized_vin, lang_code)
-    if cached_pdf:
-        return cached_pdf
-
-    # Prevent duplicate work for the same VIN+language when multiple requests arrive concurrently.
-    inflight_key = (normalized_vin, lang_code)
-    async with _INFLIGHT_LOCK:
-        existing = _INFLIGHT_REPORTS.get(inflight_key)
-        if existing and not existing.done():
-            return await asyncio.shield(existing)
-
-        task = asyncio.create_task(_generate_vin_report_inner(normalized_vin, lang_code))
-        _INFLIGHT_REPORTS[inflight_key] = task
-
-    try:
-        return await asyncio.shield(task)
-    finally:
-        async with _INFLIGHT_LOCK:
-            cur = _INFLIGHT_REPORTS.get(inflight_key)
-            if cur is task:
-                _INFLIGHT_REPORTS.pop(inflight_key, None)
+    # No caching / de-dupe: always fetch from upstream per request.
+    return await _generate_vin_report_inner(normalized_vin, lang_code)
 
 
 async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> ReportResult:
-    """Inner implementation for generate_vin_report (supports in-flight de-dupe)."""
-
-    cached_pdf = _pdf_cache_get(normalized_vin, lang_code)
-    if cached_pdf:
-        return cached_pdf
+    """Inner implementation for generate_vin_report (no caching)."""
 
     start_t = time.perf_counter()
     deadline = start_t + _REPORT_TOTAL_TIMEOUT_SEC
@@ -280,18 +218,14 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> Rep
     pdf_bytes: Optional[bytes] = None
 
     try:
-        api_response = _cache_get(normalized_vin) or {}
-        if not api_response:
-            prefer_non_pdf = lang_code != "en"
-            async with atimed("report.fetch", vin=normalized_vin, lang=lang_code, prefer_non_pdf=prefer_non_pdf):
-                api_response = await _call_carfax_api(
-                    normalized_vin,
-                    prefer_non_pdf=prefer_non_pdf,
-                    total_timeout_s=_remaining_s(),
-                    deadline=deadline,
-                )
-            if api_response.get("ok"):
-                _cache_set(normalized_vin, api_response)
+        prefer_non_pdf = lang_code != "en"
+        async with atimed("report.fetch", vin=normalized_vin, lang=lang_code, prefer_non_pdf=prefer_non_pdf):
+            api_response = await _call_carfax_api(
+                normalized_vin,
+                prefer_non_pdf=prefer_non_pdf,
+                total_timeout_s=_remaining_s(),
+                deadline=deadline,
+            )
 
         if not api_response.get("ok"):
             err = api_response.get("error") or f"HTTP_{api_response.get('status','NA')}"
@@ -355,7 +289,6 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> Rep
             vin=normalized_vin,
             raw_response=api_response,
         )
-        _pdf_cache_set(normalized_vin, lang_code, result)
         return result
     finally:
         try:

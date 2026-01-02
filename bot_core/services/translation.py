@@ -45,9 +45,8 @@ PROVIDER_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_PROVIDER_T
 FREE_GOOGLE_TIMEOUT = float(get_env().translator_defaults.get("TRANSLATE_FREE_GOOGLE_TIMEOUT", "2") or 2)
 MAX_CONCURRENCY = int(get_env().translator_defaults.get("TRANSLATE_CONCURRENCY", "10") or 10)
 
-# Simple TTL cache to avoid retranslating common fragments
-_BATCH_CACHE: Dict[Tuple[str, str], Tuple[float, str]] = {}
-_CACHE_TTL = 60 * 60  # 60 minutes
+# NOTE: Cache intentionally disabled per request (no caching of report/text fragments).
+# Keep helper functions but make them no-ops.
 _HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 _HTTP_SESSION_LOCK = asyncio.Lock()
 
@@ -202,25 +201,13 @@ def _preprocess_kurdish_texts(texts: list[str], target: str) -> list[str]:
 
 
 def _cache_get_batch(texts: List[str], target: str) -> Tuple[Dict[str, str], List[str]]:
-    hits: Dict[str, str] = {}
-    missing: List[str] = []
-    now = time.time()
-    for text in texts:
-        key = (target, text)
-        cached = _BATCH_CACHE.get(key)
-        if cached and cached[0] > now:
-            hits[text] = cached[1]
-        else:
-            missing.append(text)
-    return hits, missing
+    # Cache disabled: always treat everything as missing.
+    return {}, list(texts or [])
 
 
 def _cache_set_batch(pairs: Dict[str, str], target: str) -> None:
-    expires = time.time() + _CACHE_TTL
-    if len(_BATCH_CACHE) > 4096:
-        _BATCH_CACHE.clear()
-    for original, translated in pairs.items():
-        _BATCH_CACHE[(target, original)] = (expires, translated)
+    # Cache disabled.
+    return
 
 
 async def _azure_translate(session: aiohttp.ClientSession, texts: List[str], target_lang: str, defaults: Dict[str, str]) -> Optional[List[str]]:

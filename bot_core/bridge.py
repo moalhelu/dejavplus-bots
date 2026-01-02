@@ -3871,17 +3871,15 @@ async def _handle_vin_request(
     response.messages.append(user_message)
 
     if report_result.success and report_result.pdf_bytes and _should_attach_pdf(message.platform):
-        pdf_path = _persist_pdf_to_temp(report_result, user)
-        if pdf_path:
-            response.documents.append(
-                {
-                    "type": "pdf",
-                    "path": pdf_path,
-                    "caption": user_message,
-                    "filename": os.path.basename(pdf_path),
-                }
-            )
-            response.actions.setdefault("temp_files", []).append(pdf_path)
+        filename = _sanitize_filename(report_result.pdf_filename or f"{report_result.vin or 'report'}.pdf")
+        response.documents.append(
+            {
+                "type": "pdf",
+                "bytes": report_result.pdf_bytes,
+                "caption": user_message,
+                "filename": filename,
+            }
+        )
 
     return response
 
@@ -3890,23 +3888,6 @@ def _should_attach_pdf(platform: Optional[str]) -> bool:
     if not platform:
         return False
     return platform.lower() in {"telegram", "whatsapp"}
-
-
-def _persist_pdf_to_temp(result: ReportResult, user: UserContext) -> Optional[str]:
-    if not result.pdf_bytes:
-        return None
-
-    filename = _sanitize_filename(result.pdf_filename or f"{result.vin or 'report'}.pdf")
-    tmp_dir = Path(tempfile.gettempdir())
-    unique_name = f"vin-{user.user_id}-{int(time.time() * 1000)}-{filename}"
-    target = tmp_dir / unique_name
-    try:
-        with open(target, "wb") as handler:
-            handler.write(result.pdf_bytes)
-    except OSError:
-        LOGGER.exception("Failed to persist VIN PDF for user_id=%s", user.user_id)
-        return None
-    return str(target)
 
 
 def _sanitize_filename(filename: str) -> str:

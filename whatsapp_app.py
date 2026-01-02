@@ -17,16 +17,16 @@ import base64
 import logging
 import os
 import re
+import secrets
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse, Response
 import uvicorn
-import shutil
 import httpx
 from telegram import Bot
 
@@ -63,6 +63,25 @@ load_dotenv(override=True)
 configure_logging()
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _wa_handler_timeout_sec() -> float:
+    raw = (os.getenv("WA_HANDLER_TIMEOUT_SEC", "120") or "120").strip()
+    try:
+        val = float(raw)
+    except Exception:
+        val = 120.0
+    return max(10.0, min(val, 600.0))
+
+
+def _get_pending_reports_count(user_id: str) -> int:
+    try:
+        db = _load_db()
+        user = (db.get("users", {}) or {}).get(str(user_id), {}) or {}
+        stats = user.get("stats", {}) or {}
+        return int(stats.get("pending_reports") or 0)
+    except Exception:
+        return 0
 
 
 def _coerce_port(raw: Optional[str], default: int) -> int:
@@ -166,10 +185,51 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 app = FastAPI(title="Carfax WhatsApp Bridge", version="1.0.0")
 
-# Mount static directory for serving temporary files (PDFs)
-STATIC_DIR = Path("temp_static")
-STATIC_DIR.mkdir(exist_ok=True)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# One-shot in-memory blobs for UltraMsg document_url fetching.
+# This avoids saving PDFs on disk while still supporting large PDFs (base64 limits).
+_ONE_SHOT_BLOBS: Dict[str, Dict[str, Any]] = {}
+_ONE_SHOT_LOCK = asyncio.Lock()
+_ONE_SHOT_TTL_SEC = float(os.getenv("WA_ONE_SHOT_TTL_SEC", "180") or 180)
+_ONE_SHOT_TTL_SEC = max(30.0, min(_ONE_SHOT_TTL_SEC, 900.0))
+
+
+async def _put_one_shot_blob(payload: bytes, *, filename: str, media_type: str) -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    expires = now + _ONE_SHOT_TTL_SEC
+    async with _ONE_SHOT_LOCK:
+        # Best-effort cleanup of expired entries.
+        for k in list(_ONE_SHOT_BLOBS.keys()):
+            try:
+                if float(_ONE_SHOT_BLOBS[k].get("expires_at", 0)) <= now:
+                    _ONE_SHOT_BLOBS.pop(k, None)
+            except Exception:
+                _ONE_SHOT_BLOBS.pop(k, None)
+        _ONE_SHOT_BLOBS[token] = {
+            "expires_at": expires,
+            "bytes": payload,
+            "filename": filename,
+            "media_type": media_type,
+        }
+    return token
+
+
+@app.get("/download/{token}")
+async def download_one_shot(token: str) -> Response:
+    now = time.time()
+    async with _ONE_SHOT_LOCK:
+        entry = _ONE_SHOT_BLOBS.pop(token, None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="not_found")
+    if float(entry.get("expires_at", 0)) <= now:
+        raise HTTPException(status_code=410, detail="expired")
+    filename = str(entry.get("filename") or "file.bin")
+    media_type = str(entry.get("media_type") or "application/octet-stream")
+    data = entry.get("bytes")
+    if not isinstance(data, (bytes, bytearray)):
+        raise HTTPException(status_code=410, detail="invalid")
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=bytes(data), media_type=media_type, headers=headers)
 
 
 def _infer_public_url_from_request(request: Request) -> Optional[str]:
@@ -1350,19 +1410,63 @@ async def handle_incoming_whatsapp_message(
             continue
         image_tasks.append(asyncio.create_task(_relay_image_document(client, msisdn, media)))
 
+    # Never allow a single send failure to abort the whole WhatsApp response batch.
+    send_failures = 0
+    send_successes = 0
     try:
         if send_tasks:
-            await asyncio.gather(*send_tasks)
+            results = await asyncio.gather(*send_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    send_failures += 1
+                    LOGGER.warning("whatsapp: text send failed: %s", r)
+                else:
+                    send_successes += 1
         if doc_tasks:
-            await asyncio.gather(*doc_tasks)
+            results = await asyncio.gather(*doc_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    send_failures += 1
+                    LOGGER.warning("whatsapp: document send task failed: %s", r)
+                else:
+                    send_successes += 1
         if image_tasks:
-            await asyncio.gather(*image_tasks)
+            results = await asyncio.gather(*image_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    send_failures += 1
+                    LOGGER.warning("whatsapp: image send task failed: %s", r)
+                else:
+                    send_successes += 1
         if photo_tasks:
-            await asyncio.gather(*photo_tasks)
+            results = await asyncio.gather(*photo_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    send_failures += 1
+                    LOGGER.warning("whatsapp: photo batch task failed: %s", r)
+                else:
+                    send_successes += 1
         if pdf_present and vin_from_response:
-            await _send_report_options_menu(msisdn, user_ctx.user_id, vin_from_response, client)
+            try:
+                await _send_report_options_menu(msisdn, user_ctx.user_id, vin_from_response, client)
+            except Exception as exc:
+                send_failures += 1
+                LOGGER.warning("whatsapp: failed to send report options menu: %s", exc)
+
+        if send_failures and send_successes == 0:
+            # If *everything* failed to send, attempt one last minimal message.
+            try:
+                await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", user_ctx.language), client=client)
+            except Exception:
+                pass
+
     except UltraMsgError as exc:
+        # Keep legacy error return for logging/observability, but do not leave user hanging.
         LOGGER.error("Failed to relay WhatsApp response: %s", exc)
+        try:
+            await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", user_ctx.language), client=client)
+        except Exception:
+            pass
         return {"status": "error", "reason": str(exc)}
     finally:
         _cleanup_temp_files(temp_files)
@@ -1397,6 +1501,7 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
     payload: Dict[str, Any] = {"filename": filename}
 
     base64_payload = document.get("document_base64") or document.get("base64")
+    doc_bytes = document.get("bytes")
     path_value = document.get("path")
     url_value = document.get("url")
 
@@ -1408,8 +1513,10 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
         wa_max_b64_bytes = 650000
     wa_max_b64_bytes = max(100000, min(wa_max_b64_bytes, 5_000_000))
 
-    file_size = None
-    if path_value:
+    file_size: Optional[int] = None
+    if isinstance(doc_bytes, (bytes, bytearray)):
+        file_size = len(doc_bytes)
+    elif path_value:
         try:
             file_size = Path(path_value).stat().st_size
         except Exception:
@@ -1428,42 +1535,71 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
             return public
         return None
 
-    # Try to serve file via public URL if available (to avoid 413 Payload Too Large)
     public_url = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip() or None
-    if path_value and (public_url or (file_size is not None and file_size >= wa_max_b64_bytes)):
-        if not public_url:
-            public_url = await _ensure_public_url()
-        try:
-            # Copy file to static dir
-            src_path = Path(path_value)
-            if src_path.exists():
-                dst_path = STATIC_DIR / filename
-                shutil.copy2(src_path, dst_path)
-                if public_url:
-                    url_value = f"{public_url}/static/{filename}"
-                    LOGGER.info("Serving PDF via public URL: %s", url_value)
-        except Exception as e:
-            LOGGER.warning("Failed to serve PDF via static URL: %s", e)
 
-    if not base64_payload and not url_value and path_value:
-        # If file is big and we still don't have a public URL, base64 will likely fail.
-        if file_size is not None and file_size >= wa_max_b64_bytes:
-            LOGGER.warning(
-                "WhatsApp PDF too large for base64 and no public URL (size=%s bytes, max=%s). Set WHATSAPP_PUBLIC_URL.",
-                file_size,
-                wa_max_b64_bytes,
-            )
+    # If we have bytes, prefer them (no disk).
+    if not base64_payload and not url_value:
+        if isinstance(doc_bytes, (bytes, bytearray)) and doc_bytes:
+            raw_bytes = bytes(doc_bytes)
+            if len(raw_bytes) >= wa_max_b64_bytes:
+                if not public_url:
+                    public_url = await _ensure_public_url()
+                if not public_url:
+                    LOGGER.warning(
+                        "WhatsApp PDF too large for base64 and no public URL (size=%s bytes, max=%s).",
+                        len(raw_bytes),
+                        wa_max_b64_bytes,
+                    )
+                    try:
+                        await send_whatsapp_text(
+                            msisdn,
+                            "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير ولا يوجد رابط عام. "
+                            "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين) ثم أعد المحاولة.",
+                            client=client,
+                        )
+                    except Exception:
+                        pass
+                    return
+                token = await _put_one_shot_blob(raw_bytes, filename=filename, media_type="application/pdf")
+                url_value = f"{public_url}/download/{token}"
+                LOGGER.info("Serving PDF via one-shot URL: %s", url_value)
+            else:
+                base64_payload = base64.b64encode(raw_bytes).decode("ascii")
+
+        elif path_value:
+            # Backward compatibility: legacy callers may still pass a temp path.
+            # We still avoid persisting extra copies; read then decide base64 vs one-shot URL.
             try:
-                await send_whatsapp_text(
-                    msisdn,
-                    "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير ولا يوجد رابط عام. "
-                    "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين) ثم أعد المحاولة.",
-                    client=client,
-                )
+                raw_bytes = Path(path_value).read_bytes()
             except Exception:
-                pass
-            return
-        base64_payload = _encode_file_to_base64(str(path_value))
+                raw_bytes = b""
+            if not raw_bytes:
+                LOGGER.warning("Skipping pdf document: failed to read path=%s", path_value)
+                return
+            if len(raw_bytes) >= wa_max_b64_bytes:
+                if not public_url:
+                    public_url = await _ensure_public_url()
+                if not public_url:
+                    LOGGER.warning(
+                        "WhatsApp PDF too large for base64 and no public URL (size=%s bytes, max=%s).",
+                        len(raw_bytes),
+                        wa_max_b64_bytes,
+                    )
+                    try:
+                        await send_whatsapp_text(
+                            msisdn,
+                            "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير ولا يوجد رابط عام. "
+                            "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين) ثم أعد المحاولة.",
+                            client=client,
+                        )
+                    except Exception:
+                        pass
+                    return
+                token = await _put_one_shot_blob(raw_bytes, filename=filename, media_type="application/pdf")
+                url_value = f"{public_url}/download/{token}"
+                LOGGER.info("Serving PDF via one-shot URL: %s", url_value)
+            else:
+                base64_payload = base64.b64encode(raw_bytes).decode("ascii")
 
     if url_value:
         payload["document_url"] = url_value
@@ -1629,15 +1765,47 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
     with set_rid(rid):
         async with atimed("wa.handle", event_type=event_type or ""):
             try:
-                await handle_incoming_whatsapp_message(entry, client, event_type=event_type)
+                await asyncio.wait_for(
+                    handle_incoming_whatsapp_message(entry, client, event_type=event_type),
+                    timeout=_wa_handler_timeout_sec(),
+                )
+            except asyncio.TimeoutError:
+                LOGGER.exception("WhatsApp processing timed out")
+                # Best-effort: notify the user so they don't stay stuck on "processing".
+                try:
+                    raw_sender = entry.get("from") or entry.get("chatId") or entry.get("author")
+                    bridge_sender = _normalize_sender(raw_sender)
+                    msisdn = _normalize_recipient(raw_sender) or bridge_sender
+                    if msisdn and bridge_sender:
+                        user_ctx = _build_user_context(bridge_sender, entry)
+                        # If we reserved a slot, pending_reports > 0; refund one slot.
+                        if _get_pending_reports_count(user_ctx.user_id) > 0:
+                            try:
+                                refund_credit(user_ctx.user_id)
+                            except Exception:
+                                pass
+                        msg = _bridge.t("report.error.busy", user_ctx.language)
+                        await send_whatsapp_text(msisdn, msg, client=client)
+                except Exception:
+                    pass
             except Exception:
                 LOGGER.exception("Background processing failed for WhatsApp message")
+                # Best-effort: notify the user (single message) instead of silence.
+                try:
+                    raw_sender = entry.get("from") or entry.get("chatId") or entry.get("author")
+                    bridge_sender = _normalize_sender(raw_sender)
+                    msisdn = _normalize_recipient(raw_sender) or bridge_sender
+                    if msisdn and bridge_sender:
+                        user_ctx = _build_user_context(bridge_sender, entry)
+                        await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", user_ctx.language), client=client)
+                except Exception:
+                    pass
 
 
 @app.post("/whatsapp/webhook")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
     # If UltraMsg is calling this server directly, we can infer the public base URL
-    # from the inbound request and use it for PDF links (served from /static).
+    # from the inbound request and use it for PDF links (served from /download).
     if not (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip():
         inferred = _infer_public_url_from_request(request)
         if inferred:

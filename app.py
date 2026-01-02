@@ -443,8 +443,29 @@ async def _send_bridge_responses(
             filename = doc.get("filename")
             path = doc.get("path")
             url = doc.get("url")
+            content_bytes = doc.get("bytes")
             try:
-                if path and os.path.exists(path):
+                if isinstance(content_bytes, (bytes, bytearray)) and content_bytes:
+                    bio = BytesIO(bytes(content_bytes))
+                    bio.name = filename or "document.bin"
+                    if atimed:
+                        async with atimed("tg.send_document", bytes=len(content_bytes), via="bytes"):
+                            await context.bot.send_document(
+                                chat_id=chat_id,
+                                document=bio,
+                                caption=caption,
+                                filename=filename,
+                                parse_mode=ParseMode.HTML,
+                            )
+                    else:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=bio,
+                            caption=caption,
+                            filename=filename,
+                            parse_mode=ParseMode.HTML,
+                        )
+                elif path and os.path.exists(path):
                     with open(path, "rb") as handler:
                         if atimed:
                             try:
@@ -496,8 +517,27 @@ async def _send_bridge_responses(
             caption = media.get("caption")
             path = media.get("path")
             url = media.get("url")
+            media_bytes = media.get("bytes")
             try:
-                if path and os.path.exists(path):
+                if isinstance(media_bytes, (bytes, bytearray)) and media_bytes:
+                    bio = BytesIO(bytes(media_bytes))
+                    bio.name = media.get("filename") or "image.jpg"
+                    if atimed:
+                        async with atimed("tg.send_photo", bytes=len(media_bytes), via="bytes"):
+                            await context.bot.send_photo(
+                                chat_id=chat_id,
+                                photo=bio,
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                            )
+                    else:
+                        await context.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=bio,
+                            caption=caption,
+                            parse_mode=ParseMode.HTML,
+                        )
+                elif path and os.path.exists(path):
                     with open(path, "rb") as handler:
                         if atimed:
                             try:

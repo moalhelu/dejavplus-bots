@@ -8,9 +8,6 @@ __pycache__/
 db.json
 backups/db-*.json
 
-# Ignore generated PDFs
-temp_static/*.pdf
-
 # Ignore misc logs
 pdf_errors.log
 

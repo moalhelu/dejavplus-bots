@@ -19,10 +19,8 @@ try:  # optional dependency
 except Exception:  # pragma: no cover
     BadvinScraper = None  # type: ignore
 
-_CACHE_TTL = 30 * 60  # seconds
 _BADVIN_TOTAL_TIMEOUT = float(os.getenv("BADVIN_TOTAL_TIMEOUT", "25") or 25.0)
 _BADVIN_MIN_CACHE_PHOTOS = int(os.getenv("BADVIN_MIN_CACHE_PHOTOS", "6") or 6)
-_IMAGE_CACHE: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
 _BADVIN_SEM = asyncio.Semaphore(2)  # simple rate-limit for Badvin login/scrape
 _PHOTO_EXCLUDE_MARKERS = (
     "360view",
@@ -51,23 +49,8 @@ async def _get_http_client() -> httpx.AsyncClient:
         return _HTTP_CLIENT
 
 
-def _cache_get(key: Tuple[str, str]) -> Optional[List[str]]:
-    exp_payload = _IMAGE_CACHE.get(key)
-    if not exp_payload:
-        return None
-    expires_at, payload = exp_payload
-    if expires_at > time.time():
-        return list(payload)
-    _IMAGE_CACHE.pop(key, None)
-    return None
-
-
-def _cache_set(key: Tuple[str, str], urls: List[str]) -> None:
-    _IMAGE_CACHE[key] = (time.time() + _CACHE_TTL, list(urls))
-
-
 async def get_badvin_images(vin: str) -> List[str]:
-    """Fetch Badvin photos with caching, retries, and basic rate limiting.
+    """Fetch Badvin photos (no caching), with retries and basic rate limiting.
 
     The Badvin scraper already selects the oldest sale record with photos; this
     wrapper adds:
@@ -75,11 +58,6 @@ async def get_badvin_images(vin: str) -> List[str]:
     - concurrency guard to avoid hammering Badvin
     - small retry loop on transient failures
     """
-
-    key = ("badvin", vin)
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
 
     cfg = get_env()
     if not BadvinScraper or not cfg.badvin_email or not cfg.badvin_password:
@@ -106,8 +84,6 @@ async def get_badvin_images(vin: str) -> List[str]:
     except asyncio.TimeoutError:
         LOGGER.warning("badvin fetch timed out vin=%s timeout=%s", vin, _BADVIN_TOTAL_TIMEOUT)
         urls = []
-    if urls and len(urls) >= max(1, _BADVIN_MIN_CACHE_PHOTOS):
-        _cache_set(key, urls)
     return urls
 
 

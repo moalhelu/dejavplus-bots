@@ -54,6 +54,8 @@ from bot_core.storage import (
 )
 from bot_core.utils.vin import is_valid_vin
 from bot_core.telemetry import atimed, new_rid, set_rid
+from bot_core.services.translation import close_http_session as _close_translation_session
+from bot_core.services.reports import close_http_session as _close_reports_session
 
 from bot_core.logging_setup import configure_logging
 
@@ -192,25 +194,111 @@ _ONE_SHOT_LOCK = asyncio.Lock()
 _ONE_SHOT_TTL_SEC = float(os.getenv("WA_ONE_SHOT_TTL_SEC", "180") or 180)
 _ONE_SHOT_TTL_SEC = max(30.0, min(_ONE_SHOT_TTL_SEC, 900.0))
 
+# Hard caps to prevent unbounded RAM growth if UltraMsg never fetches the URL.
+_ONE_SHOT_MAX_ENTRIES = int(os.getenv("WA_ONE_SHOT_MAX_ENTRIES", "30") or 30)
+_ONE_SHOT_MAX_ENTRIES = max(1, min(_ONE_SHOT_MAX_ENTRIES, 500))
+_ONE_SHOT_MAX_TOTAL_BYTES = int(os.getenv("WA_ONE_SHOT_MAX_TOTAL_BYTES", "200000000") or 200000000)
+_ONE_SHOT_MAX_TOTAL_BYTES = max(5_000_000, min(_ONE_SHOT_MAX_TOTAL_BYTES, 2_000_000_000))
+_ONE_SHOT_TOTAL_BYTES = 0
+
+# Track background tasks (startup loops) so exceptions are never lost.
+_BG_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _track_bg_task(task: asyncio.Task[Any], *, name: str) -> None:
+    """Track background tasks so exceptions are never lost (prevents 'Future exception was never retrieved')."""
+
+    _BG_TASKS.add(task)
+
+    def _done(t: asyncio.Task[Any]) -> None:
+        _BG_TASKS.discard(t)
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        if exc:
+            LOGGER.warning("background task failed: %s", name, exc_info=exc)
+
+    task.add_done_callback(_done)
+
+
+def _one_shot_total_bytes_locked() -> int:
+    try:
+        return int(sum(len(v.get("bytes") or b"") for v in _ONE_SHOT_BLOBS.values()))
+    except Exception:
+        return 0
+
+
+async def _cleanup_one_shot_blobs(*, now: Optional[float] = None) -> None:
+    """Remove expired entries and enforce caps (entries + total bytes)."""
+
+    global _ONE_SHOT_TOTAL_BYTES
+    ts = float(now if now is not None else time.time())
+    async with _ONE_SHOT_LOCK:
+        # Remove expired first.
+        for k in list(_ONE_SHOT_BLOBS.keys()):
+            try:
+                if float(_ONE_SHOT_BLOBS[k].get("expires_at", 0)) <= ts:
+                    _ONE_SHOT_BLOBS.pop(k, None)
+            except Exception:
+                _ONE_SHOT_BLOBS.pop(k, None)
+
+        # Enforce max entries (evict the oldest by created_at).
+        if len(_ONE_SHOT_BLOBS) > _ONE_SHOT_MAX_ENTRIES:
+            items = list(_ONE_SHOT_BLOBS.items())
+            items.sort(key=lambda kv: float(kv[1].get("created_at", 0.0)))
+            excess = len(items) - _ONE_SHOT_MAX_ENTRIES
+            for k, _v in items[:excess]:
+                _ONE_SHOT_BLOBS.pop(k, None)
+
+        # Enforce max total bytes (evict oldest until under cap).
+        total = _one_shot_total_bytes_locked()
+        if total > _ONE_SHOT_MAX_TOTAL_BYTES and _ONE_SHOT_BLOBS:
+            items = list(_ONE_SHOT_BLOBS.items())
+            items.sort(key=lambda kv: float(kv[1].get("created_at", 0.0)))
+            for k, _v in items:
+                if total <= _ONE_SHOT_MAX_TOTAL_BYTES:
+                    break
+                try:
+                    total -= len((_ONE_SHOT_BLOBS.get(k) or {}).get("bytes") or b"")
+                except Exception:
+                    pass
+                _ONE_SHOT_BLOBS.pop(k, None)
+
+        _ONE_SHOT_TOTAL_BYTES = _one_shot_total_bytes_locked()
+
+
+async def _one_shot_cleanup_loop() -> None:
+    """Periodic cleanup so expired blobs are removed even when traffic goes quiet."""
+
+    interval = float(os.getenv("WA_ONE_SHOT_CLEANUP_INTERVAL_SEC", "30") or 30)
+    interval = max(5.0, min(interval, 300.0))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _cleanup_one_shot_blobs()
+        except Exception:
+            LOGGER.debug("one-shot cleanup failed", exc_info=True)
+
 
 async def _put_one_shot_blob(payload: bytes, *, filename: str, media_type: str) -> str:
     token = secrets.token_urlsafe(32)
     now = time.time()
     expires = now + _ONE_SHOT_TTL_SEC
+    # Best-effort cleanup and cap enforcement before insert.
+    await _cleanup_one_shot_blobs(now=now)
     async with _ONE_SHOT_LOCK:
-        # Best-effort cleanup of expired entries.
-        for k in list(_ONE_SHOT_BLOBS.keys()):
-            try:
-                if float(_ONE_SHOT_BLOBS[k].get("expires_at", 0)) <= now:
-                    _ONE_SHOT_BLOBS.pop(k, None)
-            except Exception:
-                _ONE_SHOT_BLOBS.pop(k, None)
         _ONE_SHOT_BLOBS[token] = {
+            "created_at": now,
             "expires_at": expires,
             "bytes": payload,
             "filename": filename,
             "media_type": media_type,
         }
+    # Re-enforce caps after insert (may evict old entries under memory pressure).
+    await _cleanup_one_shot_blobs(now=now)
     return token
 
 
@@ -1739,7 +1827,13 @@ async def _on_startup() -> None:
     try:
         from bot_core.services.pdf import prewarm_pdf_engine
 
-        asyncio.create_task(prewarm_pdf_engine())
+        _track_bg_task(asyncio.create_task(prewarm_pdf_engine()), name="pdf_prewarm")
+    except Exception:
+        pass
+
+    # Periodic cleanup for one-shot blobs (prevents unbounded RAM growth).
+    try:
+        _track_bg_task(asyncio.create_task(_one_shot_cleanup_loop()), name="one_shot_cleanup")
     except Exception:
         pass
     
@@ -1752,6 +1846,40 @@ async def _on_startup() -> None:
             os.environ["WHATSAPP_PUBLIC_URL"] = ngrok_url
         else:
             LOGGER.warning("Could not detect public URL. PDF sending might fail if files are too large for base64.")
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    """Graceful shutdown: close shared sessions + Chromium engine to avoid leaks and restart loops."""
+
+    try:
+        await _close_translation_session()
+    except Exception:
+        pass
+    try:
+        await _close_reports_session()
+    except Exception:
+        pass
+    try:
+        from bot_core.services.pdf import close_pdf_engine
+
+        await close_pdf_engine()
+    except Exception:
+        pass
+
+    # Cancel any long-running background loops (cleanup/prewarm). Idempotent.
+    for t in list(_BG_TASKS):
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    for t in list(_BG_TASKS):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
 
 @app.get("/whatsapp/health")

@@ -1,14 +1,24 @@
-"""PDF generation helpers (Playwright/Chromium)."""
+"""PDF generation helpers (Playwright/Chromium).
+
+Reliability goals:
+- Keep at most one Playwright driver + one Chromium browser per process
+- Cap total pages (idle + in-flight) to prevent RAM/process explosions
+- Reset and retry once if the driver/browser crashes
+"""
 from __future__ import annotations
 
 import os
 import asyncio
 import re
 import traceback
+import logging
 from urllib.parse import urlparse
 from typing import Optional, List
 
 from bot_core.telemetry import atimed
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PdfBusyError(RuntimeError):
@@ -167,10 +177,21 @@ async def _ensure_page_configured(page) -> None:
 _PDF_PLAYWRIGHT = None
 _PDF_BROWSER = None
 _PDF_BROWSER_LOCK = asyncio.Lock()
-_PDF_RENDER_SEM = asyncio.Semaphore(8)
+
+# Hard cap on total pages (idle + in-flight). Default is intentionally small.
+_PDF_PAGE_MAX = int(os.getenv("PDF_PAGE_MAX", "3") or 3)
+_PDF_PAGE_MAX = max(1, min(_PDF_PAGE_MAX, 8))
+
+# Limit concurrent renders to the available page capacity.
+_PDF_RENDER_SEM = asyncio.Semaphore(_PDF_PAGE_MAX)
+
+# Page pool holds *idle* pages; total pages are capped via _PDF_PAGE_CREATE_SEM.
 _PDF_PAGE_POOL: List[object] = []
 _PDF_PAGE_LOCK = asyncio.Lock()
-_PDF_PAGE_MAX = 8
+_PDF_PAGE_CREATE_SEM = asyncio.Semaphore(_PDF_PAGE_MAX)
+
+_PDF_ACTIVE_JOBS = 0
+_PDF_ACTIVE_LOCK = asyncio.Lock()
 _PDF_PREWARM_ENABLED = os.getenv("ENABLE_PDF_PREWARM", "1").lower() not in {"0", "false", "off"}
 _PDF_PREWARM_PAGES = int(os.getenv("PDF_PREWARM_PAGES", "1") or 1)
 
@@ -200,9 +221,21 @@ async def _ensure_browser():
                         await _ensure_page_configured(page)
                         async with _PDF_PAGE_LOCK:
                             if len(_PDF_PAGE_POOL) < _PDF_PAGE_MAX:
+                                try:
+                                    # Account this page against the total cap.
+                                    await _PDF_PAGE_CREATE_SEM.acquire()
+                                    setattr(page, "_dv_pdf_counted", True)
+                                except Exception:
+                                    pass
                                 _PDF_PAGE_POOL.append(page)
                             else:
-                                await page.close()
+                                try:
+                                    await page.close()
+                                finally:
+                                    try:
+                                        _PDF_PAGE_CREATE_SEM.release()
+                                    except Exception:
+                                        pass
                     except Exception:
                         try:
                             await page.close()
@@ -244,11 +277,21 @@ async def prewarm_pdf_engine() -> None:
                     needed = max(0, pages - len(_PDF_PAGE_POOL))
                 for _ in range(needed):
                     try:
+                        # Total page cap: acquire a creation slot.
+                        await _PDF_PAGE_CREATE_SEM.acquire()
                         page = await browser.new_page()
                         await page.goto("about:blank")
                         await _ensure_page_configured(page)
+                        try:
+                            setattr(page, "_dv_pdf_counted", True)
+                        except Exception:
+                            pass
                         created.append(page)
                     except Exception:
+                        try:
+                            _PDF_PAGE_CREATE_SEM.release()
+                        except Exception:
+                            pass
                         break
 
                 if created:
@@ -266,15 +309,47 @@ async def prewarm_pdf_engine() -> None:
 
 
 async def _reset_browser() -> None:
+    """Dispose browser + driver and free all page-cap slots."""
+
     global _PDF_BROWSER
     global _PDF_PAGE_POOL
+    global _PDF_PLAYWRIGHT
     try:
         if _PDF_BROWSER and not _PDF_BROWSER.is_closed():
             await _PDF_BROWSER.close()
     except Exception:
         pass
     _PDF_BROWSER = None
+    # Close and drop any idle pages; release the page-cap permits.
+    pool = _PDF_PAGE_POOL
     _PDF_PAGE_POOL = []
+    for page in list(pool):
+        try:
+            await page.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                if getattr(page, "_dv_pdf_counted", False):
+                    _PDF_PAGE_CREATE_SEM.release()
+            except Exception:
+                pass
+
+    # Stop Playwright driver (prevents accumulating driver/node processes).
+    try:
+        if _PDF_PLAYWRIGHT is not None:
+            await _PDF_PLAYWRIGHT.stop()
+    except Exception:
+        pass
+    _PDF_PLAYWRIGHT = None
+
+    LOGGER.warning("PDF engine reset")
+
+
+async def close_pdf_engine() -> None:
+    """Explicit shutdown hook for services."""
+
+    await _reset_browser()
 
 
 async def _acquire_page():
@@ -292,17 +367,22 @@ async def _acquire_page():
             except Exception:
                 continue
 
-        # Create a new page if under the cap
-        try:
-            if len(_PDF_PAGE_POOL) < _PDF_PAGE_MAX:
-                return await browser.new_page()
-        except Exception:
-            return None
+        # No idle pages available; fall through and create a new one.
 
-    # Fallback: create page outside the lock if pool was busy but under cap
     try:
-        return await browser.new_page()
+        # Total page cap: only allow creating up to _PDF_PAGE_MAX pages total.
+        await _PDF_PAGE_CREATE_SEM.acquire()
+        page = await browser.new_page()
+        try:
+            setattr(page, "_dv_pdf_counted", True)
+        except Exception:
+            pass
+        return page
     except Exception:
+        try:
+            _PDF_PAGE_CREATE_SEM.release()
+        except Exception:
+            pass
         return None
 
 
@@ -322,6 +402,38 @@ async def _release_page(page) -> None:
         await page.close()
     except Exception:
         pass
+    finally:
+        try:
+            if getattr(page, "_dv_pdf_counted", False):
+                _PDF_PAGE_CREATE_SEM.release()
+        except Exception:
+            pass
+
+
+def _chromium_process_count_best_effort() -> Optional[int]:
+    """Best-effort process count for ms-playwright/chromium (requires psutil).
+
+    This is intentionally defensive and optional; it should never fail a render.
+    """
+
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        count = 0
+        for p in psutil.process_iter(attrs=["name", "cmdline"]):
+            name = (p.info.get("name") or "").lower()
+            cmd = " ".join(p.info.get("cmdline") or []).lower()
+            if "playwright" in cmd or "ms-playwright" in cmd:
+                count += 1
+                continue
+            if "chrom" in name and ("playwright" in cmd or "ms-playwright" in cmd):
+                count += 1
+        return count
+    except Exception:
+        return None
 
 
 async def html_to_pdf_bytes_chromium(
@@ -335,39 +447,52 @@ async def html_to_pdf_bytes_chromium(
     fast_first_timeout_ms: Optional[int] = None,
     fast_first_wait_until: Optional[str] = None,
 ) -> Optional[bytes]:
-    try:
+    async def _once() -> Optional[bytes]:
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
         except Exception:  # pragma: no cover
             PlaywrightTimeoutError = Exception  # type: ignore[assignment]
 
-        wait_until = (wait_until or _get_pdf_wait_until()).strip().lower()
-        if wait_until not in {"load", "domcontentloaded", "networkidle"}:
-            wait_until = _get_pdf_wait_until()
+        effective_wait_until = (wait_until or _get_pdf_wait_until()).strip().lower()
+        if effective_wait_until not in {"load", "domcontentloaded", "networkidle"}:
+            effective_wait_until = _get_pdf_wait_until()
 
-        timeout_ms = int(timeout_ms) if timeout_ms is not None else _get_pdf_timeout_ms()
-        timeout_ms = max(1_000, min(timeout_ms, 300_000))
+        effective_timeout_ms = int(timeout_ms) if timeout_ms is not None else _get_pdf_timeout_ms()
+        effective_timeout_ms = max(1_000, min(effective_timeout_ms, 300_000))
         block_types = sorted(_get_pdf_block_resource_types())
         fast_first = _pdf_fast_first_enabled() and not _pdf_wait_until_was_explicitly_set()
+        effective_fast_first_timeout_ms: Optional[int] = None
         if fast_first_timeout_ms is not None:
             try:
-                fast_first_timeout_ms = int(fast_first_timeout_ms)
+                effective_fast_first_timeout_ms = int(fast_first_timeout_ms)
             except Exception:
-                fast_first_timeout_ms = None
-        fast_first_timeout_ms = min(fast_first_timeout_ms or _pdf_fast_first_timeout_ms(), timeout_ms)
+                effective_fast_first_timeout_ms = None
+        effective_fast_first_timeout_ms = min(
+            effective_fast_first_timeout_ms or _pdf_fast_first_timeout_ms(),
+            effective_timeout_ms,
+        )
 
-        fast_first_wait_until = (fast_first_wait_until or _pdf_fast_first_wait_until()).strip().lower()
-        if fast_first_wait_until not in {"load", "domcontentloaded", "networkidle"}:
-            fast_first_wait_until = _pdf_fast_first_wait_until()
+        effective_fast_first_wait_until = (fast_first_wait_until or _pdf_fast_first_wait_until()).strip().lower()
+        if effective_fast_first_wait_until not in {"load", "domcontentloaded", "networkidle"}:
+            effective_fast_first_wait_until = _pdf_fast_first_wait_until()
+        # Track in-flight jobs for lightweight observability.
+        async with _PDF_ACTIVE_LOCK:
+            global _PDF_ACTIVE_JOBS
+            _PDF_ACTIVE_JOBS += 1
+            active_jobs = _PDF_ACTIVE_JOBS
+        chromium_count = _chromium_process_count_best_effort()
+
         async with atimed(
             "pdf.chromium",
             html_len=len(html_str or "") if html_str else 0,
             has_url=bool(url),
-            wait_until=wait_until,
-            timeout_ms=timeout_ms,
+            wait_until=effective_wait_until,
+            timeout_ms=effective_timeout_ms,
             block_types=",".join(block_types),
             fast_first=fast_first,
-            fast_first_timeout_ms=fast_first_timeout_ms,
+            fast_first_timeout_ms=effective_fast_first_timeout_ms,
+            active_jobs=active_jobs,
+            chromium_procs=chromium_count if chromium_count is not None else "na",
         ):
             sem_acquired = False
             try:
@@ -383,12 +508,14 @@ async def html_to_pdf_bytes_chromium(
                     sem_acquired = True
 
                 page = await _acquire_page()
+                if page is None:
+                    raise RuntimeError("pdf_page_unavailable")
                 try:
                     await _ensure_page_configured(page)
                     if url:
                         if fast_first:
                             try:
-                                await page.goto(url, wait_until=fast_first_wait_until, timeout=fast_first_timeout_ms)
+                                await page.goto(url, wait_until=effective_fast_first_wait_until, timeout=effective_fast_first_timeout_ms)
                                 pdf_bytes = await page.pdf(
                                     format="A4",
                                     print_background=True,
@@ -399,7 +526,7 @@ async def html_to_pdf_bytes_chromium(
                             except Exception:
                                 pass
                         try:
-                            await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                            await page.goto(url, wait_until=effective_wait_until, timeout=effective_timeout_ms)
                         except PlaywrightTimeoutError:
                             # If we timed out waiting for the chosen load state (often networkidle),
                             # the DOM may still be sufficiently rendered for printing.
@@ -416,7 +543,7 @@ async def html_to_pdf_bytes_chromium(
                             )
                         if fast_first:
                             try:
-                                await page.set_content(clean, wait_until=fast_first_wait_until, timeout=fast_first_timeout_ms)
+                                await page.set_content(clean, wait_until=effective_fast_first_wait_until, timeout=effective_fast_first_timeout_ms)
                                 pdf_bytes = await page.pdf(
                                     format="A4",
                                     print_background=True,
@@ -427,7 +554,7 @@ async def html_to_pdf_bytes_chromium(
                             except Exception:
                                 pass
                         try:
-                            await page.set_content(clean, wait_until=wait_until, timeout=timeout_ms)
+                            await page.set_content(clean, wait_until=effective_wait_until, timeout=effective_timeout_ms)
                         except PlaywrightTimeoutError:
                             # Same idea as goto(): don't fail the whole render just because
                             # a load-state condition didn't settle.
@@ -449,15 +576,36 @@ async def html_to_pdf_bytes_chromium(
                         _PDF_RENDER_SEM.release()
                     except Exception:
                         pass
+        return None
+    try:
+        return await _once()
     except PdfBusyError:
         # Don't reset Chromium for load shedding; let caller decide how to report.
         raise
     except Exception as e:
+        # Recover from driver/browser crashes by resetting and retrying once.
+        LOGGER.warning("pdf render failed (attempt 1); resetting engine", exc_info=True)
         await _reset_browser()
-        with open("pdf_errors.log", "a", encoding="utf-8") as f:
-            f.write(f"Runtime Error: {repr(e)}\n")
-            f.write(traceback.format_exc() + "\n")
-        return None
+        try:
+            LOGGER.info("Retrying PDF render (attempt 2)")
+            return await _once()
+        except PdfBusyError:
+            raise
+        except Exception as e2:
+            with open("pdf_errors.log", "a", encoding="utf-8") as f:
+                f.write(f"Runtime Error: {repr(e)}\n")
+                f.write(traceback.format_exc() + "\n")
+                f.write(f"Retry Error: {repr(e2)}\n")
+                f.write(traceback.format_exc() + "\n")
+            await _reset_browser()
+            return None
+    finally:
+        try:
+            async with _PDF_ACTIVE_LOCK:
+                global _PDF_ACTIVE_JOBS
+                _PDF_ACTIVE_JOBS = max(0, _PDF_ACTIVE_JOBS - 1)
+        except Exception:
+            pass
 
 
 async def fetch_page_html_chromium(
@@ -474,24 +622,25 @@ async def fetch_page_html_chromium(
 
     if not url:
         return None
-    try:
+
+    async def _once() -> Optional[str]:
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
         except Exception:  # pragma: no cover
             PlaywrightTimeoutError = Exception  # type: ignore[assignment]
 
-        wait_until = (wait_until or _get_pdf_wait_until()).strip().lower()
-        if wait_until not in {"load", "domcontentloaded", "networkidle"}:
-            wait_until = _get_pdf_wait_until()
+        effective_wait_until = (wait_until or _get_pdf_wait_until()).strip().lower()
+        if effective_wait_until not in {"load", "domcontentloaded", "networkidle"}:
+            effective_wait_until = _get_pdf_wait_until()
 
-        timeout_ms = int(timeout_ms) if timeout_ms is not None else _get_pdf_timeout_ms()
-        timeout_ms = max(1_000, min(timeout_ms, 300_000))
+        effective_timeout_ms = int(timeout_ms) if timeout_ms is not None else _get_pdf_timeout_ms()
+        effective_timeout_ms = max(1_000, min(effective_timeout_ms, 300_000))
         block_types = sorted(_get_pdf_block_resource_types())
         async with atimed(
             "pdf.chromium.fetch_html",
             has_url=True,
-            wait_until=wait_until,
-            timeout_ms=timeout_ms,
+            wait_until=effective_wait_until,
+            timeout_ms=effective_timeout_ms,
             block_types=",".join(block_types),
         ):
             sem_acquired = False
@@ -508,10 +657,12 @@ async def fetch_page_html_chromium(
                     sem_acquired = True
 
                 page = await _acquire_page()
+                if page is None:
+                    raise RuntimeError("pdf_page_unavailable")
                 try:
                     await _ensure_page_configured(page)
                     try:
-                        await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                        await page.goto(url, wait_until=effective_wait_until, timeout=effective_timeout_ms)
                     except PlaywrightTimeoutError:
                         pass
                     return await page.content()
@@ -523,7 +674,20 @@ async def fetch_page_html_chromium(
                         _PDF_RENDER_SEM.release()
                     except Exception:
                         pass
+        return None
+
+    try:
+        return await _once()
     except PdfBusyError:
         raise
     except Exception:
-        return None
+        LOGGER.warning("fetch_html failed (attempt 1); resetting engine", exc_info=True)
+        await _reset_browser()
+        try:
+            LOGGER.info("Retrying Chromium fetch_html (attempt 2)")
+            return await _once()
+        except PdfBusyError:
+            raise
+        except Exception:
+            await _reset_browser()
+            return None

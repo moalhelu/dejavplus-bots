@@ -5713,24 +5713,61 @@ async def _post_shutdown_cleanup(app: Application) -> None:
     except Exception:
         pass
 
+    # Reports module also keeps a shared aiohttp session; close it on shutdown.
+    try:
+        await _close_reports_session()
+    except Exception:
+        pass
+
+    # Close the shared Chromium/Playwright engine to avoid orphan processes on restart.
+    try:
+        from bot_core.services.pdf import close_pdf_engine
+
+        await close_pdf_engine()
+    except Exception:
+        pass
+
+
+_BG_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _track_bg_task(task: asyncio.Task[Any], *, name: str) -> None:
+    """Track background tasks so exceptions are never lost (prevents 'Future exception was never retrieved')."""
+
+    _BG_TASKS.add(task)
+
+    def _done(t: asyncio.Task[Any]) -> None:
+        _BG_TASKS.discard(t)
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        if exc:
+            logger.warning("background task failed: %s", name, exc_info=exc)
+
+    task.add_done_callback(_done)
+
 
 async def _post_init_warmup(app: Application) -> None:
     # Prewarm Chromium so the first report doesn't pay Playwright cold-start.
     try:
         from bot_core.services.pdf import prewarm_pdf_engine
 
-        asyncio.create_task(prewarm_pdf_engine())
-    except Exception:
-        pass
-
-    try:
-        await _close_reports_session()
+        _track_bg_task(asyncio.create_task(prewarm_pdf_engine()), name="pdf_prewarm")
     except Exception:
         pass
 
     try:
         bot_session = getattr(app.bot, "session", None)
         if bot_session and not bot_session.closed:
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning("progress task failed", exc_info=True)
             await bot_session.close()
     except Exception:
         pass

@@ -427,6 +427,7 @@ async def _call_carfax_api(
                 for t in tasks:
                     if not t.done():
                         t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             return await _try_post_base()
 
         parsed = await _try_get()
@@ -658,6 +659,7 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
             for t in (t1, t2):
                 if not t.done():
                     t.cancel()
+            await asyncio.gather(t1, t2, return_exceptions=True)
 
         # If still empty, fall back to full Chromium fetch (default wait_until).
         if not html:
@@ -753,6 +755,7 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 for t in (http_task, url_task):
                     if not t.done():
                         t.cancel()
+                await asyncio.gather(http_task, url_task, return_exceptions=True)
         else:
             # Non-English or hedging disabled: keep existing behavior.
             if _prefer_http_fetch_for_en_enabled() and lang_code == "en":
@@ -895,6 +898,7 @@ async def _maybe_translate_html(html: Optional[str], lang: str, *, deadline: Opt
         for t in (t1, t2):
             if not t.done():
                 t.cancel()
+        await asyncio.gather(t1, t2, return_exceptions=True)
 
 
 async def _fetch_page_html(url: str) -> Optional[str]:

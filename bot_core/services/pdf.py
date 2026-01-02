@@ -11,6 +11,10 @@ from typing import Optional, List
 from bot_core.telemetry import atimed
 
 
+class PdfBusyError(RuntimeError):
+    """Raised when the PDF engine is saturated (queue timeout waiting for a slot)."""
+
+
 def _get_pdf_wait_until() -> str:
     value = (os.getenv("PDF_WAIT_UNTIL", "networkidle") or "").strip().lower()
     if value in {"load", "domcontentloaded", "networkidle"}:
@@ -372,7 +376,10 @@ async def html_to_pdf_bytes_chromium(
                     sem_acquired = True
                 else:
                     acquire_s = max(0.001, min(float(acquire_timeout_ms) / 1000.0, 120.0))
-                    await asyncio.wait_for(_PDF_RENDER_SEM.acquire(), timeout=acquire_s)
+                    try:
+                        await asyncio.wait_for(_PDF_RENDER_SEM.acquire(), timeout=acquire_s)
+                    except asyncio.TimeoutError as exc:
+                        raise PdfBusyError("pdf_queue_timeout") from exc
                     sem_acquired = True
 
                 page = await _acquire_page()
@@ -442,6 +449,9 @@ async def html_to_pdf_bytes_chromium(
                         _PDF_RENDER_SEM.release()
                     except Exception:
                         pass
+    except PdfBusyError:
+        # Don't reset Chromium for load shedding; let caller decide how to report.
+        raise
     except Exception as e:
         await _reset_browser()
         with open("pdf_errors.log", "a", encoding="utf-8") as f:
@@ -491,7 +501,10 @@ async def fetch_page_html_chromium(
                     sem_acquired = True
                 else:
                     acquire_s = max(0.001, min(float(acquire_timeout_ms) / 1000.0, 120.0))
-                    await asyncio.wait_for(_PDF_RENDER_SEM.acquire(), timeout=acquire_s)
+                    try:
+                        await asyncio.wait_for(_PDF_RENDER_SEM.acquire(), timeout=acquire_s)
+                    except asyncio.TimeoutError as exc:
+                        raise PdfBusyError("pdf_queue_timeout") from exc
                     sem_acquired = True
 
                 page = await _acquire_page()
@@ -510,5 +523,7 @@ async def fetch_page_html_chromium(
                         _PDF_RENDER_SEM.release()
                     except Exception:
                         pass
+    except PdfBusyError:
+        raise
     except Exception:
         return None

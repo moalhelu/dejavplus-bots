@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, cast
 import aiohttp
 
 from bot_core.config import get_env
-from bot_core.services.pdf import html_to_pdf_bytes_chromium, fetch_page_html_chromium
+from bot_core.services.pdf import html_to_pdf_bytes_chromium, fetch_page_html_chromium, PdfBusyError
 from bot_core.services.translation import inject_rtl, translate_html, translate_html_google_free, _latin_ku_to_arabic  # type: ignore
 from bot_core.telemetry import atimed
 
@@ -327,8 +327,17 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> Rep
             # If non-English but only PDF is available, treat as not ok to push fallback rendering.
             api_response = {"ok": False, "error": "pdf_only_non_translatable"}
 
-        async with atimed("report.render_pdf", vin=normalized_vin, lang=lang_code):
-            pdf_bytes = await _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline)
+        try:
+            async with atimed("report.render_pdf", vin=normalized_vin, lang=lang_code):
+                pdf_bytes = await _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline)
+        except PdfBusyError:
+            return ReportResult(
+                success=False,
+                user_message=_t("report.error.busy", lang_code, "⚠️ السيرفر مشغول حالياً. جرّب بعد قليل."),
+                errors=["busy"],
+                vin=normalized_vin,
+                raw_response=api_response,
+            )
         if not pdf_bytes:
             return ReportResult(
                 success=False,

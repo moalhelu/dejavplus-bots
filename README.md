@@ -200,6 +200,18 @@ ENABLE_TIMING_LOGS=1
 4. المسارات المحتملة:
 	- `pdf_bytes` حاضر → إرسال الملف فورًا.
 	- `json/html/url` → تحويل HTML مع Playwright (ويدعم الترجمة للغات RTL).
+
+## ملاحظة مهمة (PDF للغات RTL)
+
+إذا لاحظت أن ملفات PDF بالعربي/الكردي تظهر بحروف ملخبطة أو مربعات، فالمشكلة عادةً من **عدم وجود خطوط عربية على السيرفر** (خصوصًا على Linux).
+
+- على Ubuntu/Debian ثبّت الخطوط:
+	- `sudo apt-get update`
+	- `sudo apt-get install -y fonts-noto-core fonts-noto-extra fonts-dejavu-core`
+	- (اختياري لكن مفيد للعربي): `sudo apt-get install -y fonts-noto-naskh-arabic`
+
+- يمكنك أيضًا تعديل ستاك الخطوط للـRTL عبر متغير البيئة:
+	- `RTL_FONT_STACK="\"Noto Naskh Arabic\",\"Noto Sans Arabic\",\"DejaVu Sans\",sans-serif"`
 5. بعد التسليم: عرض أزرار صور BadVin/Apicar حسب الخدمات المفعلة.
 6. كل حدث (نجاح، فشل، استرداد رصيد) يسجل في لوحة السوبر.
 

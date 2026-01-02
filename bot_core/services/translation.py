@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import os
 import time
 import asyncio
 from typing import Any, Dict, List, Match, Optional, Tuple, cast
@@ -81,17 +82,23 @@ async def close_http_session() -> None:
 
 def _rtl_css_block(lang_code: str = "ar") -> str:
     lang = _lang_family(lang_code or "ar")
-    # Use a local-only font stack. If 'Omar Athkar' is installed on the host,
-    # Chromium will pick it instantly; otherwise it falls back without delay.
-    font_stack = "\"Omar Athkar\",\"Arial\",\"Tahoma\",sans-serif"
+    # Use a local-only font stack (no remote font fetch). If some fonts are installed on
+    # the host, Chromium will pick them instantly; otherwise it falls back without delay.
+    default_stack = (
+        '"Omar Athkar","Noto Naskh Arabic","Noto Sans Arabic","Amiri","DejaVu Sans",'
+        '"Arial","Tahoma",sans-serif'
+    )
+    font_stack = (os.getenv("RTL_FONT_STACK") or "").strip() or default_stack
     line_height = "1.9" if lang in {"ku", "ckb"} else "1.7"
     return (
         "\n<style>\n"
         "  @font-face { font-family: \"Omar Athkar\"; src: local(\"Omar Athkar\"), local(\"OmarAthkar\"); font-display: swap; }\n"
-        "  html, body { direction: rtl !important; unicode-bidi: isolate-override; }\n"
+        # Avoid isolate-override because it can scramble mixed RTL/LTR content.
+        "  html, body { direction: rtl !important; unicode-bidi: plaintext; }\n"
         # Force the RTL font stack even if upstream HTML provides its own CSS.
         f"  body {{ font-family: {font_stack} !important; line-height: {line_height}; font-size: 15px; word-break: break-word; }}\n"
         f"  body * {{ font-family: {font_stack} !important; }}\n"
+        "  p, div, li, td, th, span { unicode-bidi: plaintext; }\n"
         "  table { direction: rtl; width: 100%; border-collapse: collapse; }\n"
         "  td, th { text-align: right; vertical-align: top; padding: 4px; }\n"
         "  img { max-width: 100%; height: auto; }\n"
@@ -118,7 +125,14 @@ def inject_rtl(html_str: str, lang: str = "ar") -> str:
         html = re.sub(r"(?i)<html([^>]*)>", _apply_html, html, count=1)
 
         if re.search(r"(?i)<head[^>]*>", html):
-            html = re.sub(r"(?i)<head([^>]*)>", lambda m: f"<head" + m.group(1) + ">" + _rtl_css_block(lang_code), html, count=1)
+            def _inject_head(m: Match[str]) -> str:
+                head_open = f"<head{m.group(1)}>"
+                # Ensure UTF-8 meta is present to avoid garbled characters in some renderers.
+                if not re.search(r"(?i)<meta\s+charset\s*=", html) and not re.search(r"(?i)http-equiv\s*=\s*(['\"])content-type\1", html):
+                    return head_open + "<meta charset='utf-8'>" + _rtl_css_block(lang_code)
+                return head_open + _rtl_css_block(lang_code)
+
+            html = re.sub(r"(?i)<head([^>]*)>", _inject_head, html, count=1)
         else:
             html = re.sub(r"(?i)(<html[^>]*>)", lambda m: m.group(1) + f"<head>{_rtl_css_block(lang_code)}</head>", html, count=1)
         return html

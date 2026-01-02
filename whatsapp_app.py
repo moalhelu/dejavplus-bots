@@ -1595,9 +1595,15 @@ async def handle_incoming_whatsapp_message(
     delivered_pdfs = 0
     delivery_refunded = False
     delivery_committed = False
+    sla_total_s = float(os.getenv("TOTAL_BUDGET_SEC", "10") or 10)
+    sla_total_s = max(5.0, min(sla_total_s, 30.0))
+    sla_t0 = time.perf_counter()
+
+    def _sla_remaining_s(floor: float = 0.25) -> float:
+        return max(floor, sla_total_s - (time.perf_counter() - sla_t0))
     try:
         if send_tasks:
-            results = await asyncio.gather(*send_tasks, return_exceptions=True)
+            results = await asyncio.wait_for(asyncio.gather(*send_tasks, return_exceptions=True), timeout=_sla_remaining_s())
             for r in results:
                 if isinstance(r, Exception):
                     send_failures += 1
@@ -1605,7 +1611,7 @@ async def handle_incoming_whatsapp_message(
                 else:
                     send_successes += 1
         if doc_tasks:
-            results = await asyncio.gather(*doc_tasks, return_exceptions=True)
+            results = await asyncio.wait_for(asyncio.gather(*doc_tasks, return_exceptions=True), timeout=_sla_remaining_s())
             for r in results:
                 if isinstance(r, Exception):
                     send_failures += 1
@@ -1617,7 +1623,7 @@ async def handle_incoming_whatsapp_message(
                     send_failures += 1
                     LOGGER.warning("whatsapp: document send reported failure (no exception)")
         if image_tasks:
-            results = await asyncio.gather(*image_tasks, return_exceptions=True)
+            results = await asyncio.wait_for(asyncio.gather(*image_tasks, return_exceptions=True), timeout=_sla_remaining_s())
             for r in results:
                 if isinstance(r, Exception):
                     send_failures += 1
@@ -1625,7 +1631,8 @@ async def handle_incoming_whatsapp_message(
                 else:
                     send_successes += 1
         if photo_tasks:
-            results = await asyncio.gather(*photo_tasks, return_exceptions=True)
+            # Photo batches are optional; do not let them block the SLA.
+            results = await asyncio.wait_for(asyncio.gather(*photo_tasks, return_exceptions=True), timeout=min(1.0, _sla_remaining_s()))
             for r in results:
                 if isinstance(r, Exception):
                     send_failures += 1
@@ -1662,13 +1669,41 @@ async def handle_incoming_whatsapp_message(
                 try:
                     parts: List[str] = []
                     if fast_skipped_translation and (user_ctx.language or "en").lower() != "en":
-                        parts.append("🌐 Sent English due to time budget. You can request a localized version.")
+                        parts.append(f"Full {(user_ctx.language or 'en').upper()} version will be sent shortly")
                     if fast_used_fallback_pdf:
                         parts.append("⚡ Fast/light PDF (assets skipped).")
                     parts.append("✅ Delivered (PDF)")
                     await send_whatsapp_text(msisdn, "\n".join(parts), client=client)
                 except Exception:
                     pass
+
+                # Asynchronously generate + send FULL localized PDF if Fast Mode delivered English.
+                if fast_skipped_translation and (user_ctx.language or "en").lower() != "en":
+                    async def _send_full_localized_wa() -> None:
+                        try:
+                            from bot_core.services.reports import generate_vin_report as _gen
+                        except Exception:
+                            return
+                        try:
+                            full = await _gen(vin_from_response or "", language=(user_ctx.language or "en"), fast_mode=False)
+                            if full and getattr(full, "success", False) and getattr(full, "pdf_bytes", None):
+                                await _relay_pdf_document(
+                                    client,
+                                    msisdn,
+                                    {
+                                        "type": "pdf",
+                                        "bytes": bytes(full.pdf_bytes),
+                                        "filename": getattr(full, "pdf_filename", None) or f"{vin_from_response}.pdf",
+                                        "caption": f"📄 Full {(user_ctx.language or 'en').upper()} VIN report {vin_from_response}",
+                                    },
+                                )
+                        except Exception:
+                            LOGGER.info("whatsapp: full localized send failed", exc_info=True)
+
+                    try:
+                        asyncio.create_task(_send_full_localized_wa())
+                    except Exception:
+                        pass
             else:
                 try:
                     if not delivery_refunded:
@@ -1699,6 +1734,22 @@ async def handle_incoming_whatsapp_message(
                 await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", user_ctx.language), client=client)
             except Exception:
                 pass
+
+    except asyncio.TimeoutError:
+        # SLA timeout during sending tasks.
+        send_failures += 1
+        try:
+            if report_success and credit_commit_required and not delivery_refunded:
+                refund_credit(user_ctx.user_id)
+                delivery_refunded = True
+        except Exception:
+            pass
+        try:
+            msg = _bridge.t("report.error.timeout", user_ctx.language)
+            await send_whatsapp_text(msisdn, f"{msg}\n\n❌ Failed + refunded", client=client)
+        except Exception:
+            pass
+        return {"status": "error", "reason": "sla_timeout"}
 
     except UltraMsgError as exc:
         # Keep legacy error return for logging/observability, but do not leave user hanging.

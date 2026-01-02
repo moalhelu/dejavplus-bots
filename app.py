@@ -5037,18 +5037,39 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report_result: Optional[_ReportResult] = None
         bridge_pdf_path: Optional[str] = None
         bridge_temp_files: List[str] = []
-        # Hard end-to-end budget so the UX never hangs indefinitely at 90%.
-        # Note: sending the PDF to Telegram can add a few seconds beyond generation.
-        tg_total_timeout_s = float(os.getenv("TG_REPORT_TOTAL_TIMEOUT_SEC", "120") or 120)
-        tg_total_timeout_s = max(10.0, min(tg_total_timeout_s, 600.0))
-        tg_send_timeout_s = float(os.getenv("TG_REPORT_SEND_TIMEOUT_SEC", "60") or 60)
-        tg_send_timeout_s = max(10.0, min(tg_send_timeout_s, 300.0))
+        # Strict user-visible SLA (Fast PDF delivery).
+        sla_total_s = float(os.getenv("TOTAL_BUDGET_SEC", "10") or 10)
+        sla_total_s = max(5.0, min(sla_total_s, 30.0))
+
+        # Keep Telegram-specific knobs but clamp to SLA by default.
+        tg_total_timeout_s = float(os.getenv("TG_REPORT_TOTAL_TIMEOUT_SEC", str(sla_total_s)) or sla_total_s)
+        tg_total_timeout_s = max(5.0, min(tg_total_timeout_s, sla_total_s))
+        tg_send_timeout_s = float(os.getenv("TG_REPORT_SEND_TIMEOUT_SEC", str(max(5.0, sla_total_s))) or max(5.0, sla_total_s))
+        tg_send_timeout_s = max(5.0, min(tg_send_timeout_s, sla_total_s))
         tg_t0 = time.perf_counter()
 
         def _tg_remaining_s(floor: float = 1.0) -> float:
             return max(floor, tg_total_timeout_s - (time.perf_counter() - tg_t0))
 
+        # Correlate all timing logs for this request.
         try:
+            from bot_core.telemetry import new_rid as _new_rid, set_rid as _set_rid
+        except Exception:
+            _new_rid = None  # type: ignore
+            _set_rid = None  # type: ignore
+
+        rid = (_new_rid("tg-") if _new_rid else None)
+
+        rid_cm = None
+        try:
+            if _set_rid and rid:
+                rid_cm = _set_rid(rid)
+            else:
+                rid_cm = None
+
+            if rid_cm:
+                rid_cm.__enter__()
+
             if bridge_user_ctx:
                 try:
                     bridge_user_ctx.language = report_lang
@@ -5086,7 +5107,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not report_result:
                 try:
                     report_result = await asyncio.wait_for(
-                        _generate_vin_report(vin, language=report_lang),
+                        _generate_vin_report(vin, language=report_lang, fast_mode=True),
                         timeout=_tg_remaining_s(),
                     )
                 except asyncio.TimeoutError:
@@ -5098,7 +5119,20 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as exc:
                     report_result = _ReportResult(success=False, user_message=str(exc), errors=[str(exc)], vin=vin)
+        except asyncio.TimeoutError:
+            # SLA timeout anywhere in the fast pipeline.
+            report_result = _ReportResult(
+                success=False,
+                user_message=_bridge.t("report.error.timeout", report_lang),
+                errors=["sla_timeout"],
+                vin=vin,
+            )
         finally:
+            try:
+                if rid_cm:
+                    rid_cm.__exit__(None, None, None)
+            except Exception:
+                pass
             stop_event.set()
             try:
                 await asyncio.wait_for(progress_task, timeout=2)
@@ -5139,7 +5173,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Terminal finalizer: always end with the exact failure marker.
                 failure_note = f"\n\n{escape(err_text)}{refund_note}\n\n❌ Failed + refunded"
                 try:
-                    await msg.edit_text(refreshed_header + "\n" + _make_progress_bar(100) + failure_note, parse_mode=ParseMode.HTML)
+                    await asyncio.wait_for(
+                        msg.edit_text(
+                            refreshed_header + "\n" + _make_progress_bar(100) + failure_note,
+                            parse_mode=ParseMode.HTML,
+                        ),
+                        timeout=_tg_remaining_s(floor=1.0),
+                    )
                 except Exception:
                     pass
                 context.chat_data["progress_header"] = refreshed_header
@@ -5153,6 +5193,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delivered = False
             delivery_note = ""
             pdf_local_path: Optional[str] = None
+            requested_lang = (report_lang or "en").lower()
+            delivered_lang = requested_lang
+            fast_skipped_translation = False
 
             if report_result.pdf_bytes:
                 if bridge_pdf_path and os.path.exists(bridge_pdf_path):
@@ -5178,20 +5221,26 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             atimed = None
                         if atimed:
                             async with atimed("tg.send_document", bytes=len(report_result.pdf_bytes), via="bytes"):
-                                await context.bot.send_document(
+                                await asyncio.wait_for(
+                                    context.bot.send_document(
+                                        chat_id=update.effective_chat.id,
+                                        document=bio,
+                                        filename=bio.name,
+                                        caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                        parse_mode=ParseMode.HTML,
+                                    ),
+                                    timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
+                                )
+                        else:
+                            await asyncio.wait_for(
+                                context.bot.send_document(
                                     chat_id=update.effective_chat.id,
                                     document=bio,
                                     filename=bio.name,
                                     caption=f"📄 تقرير VIN <code>{vin}</code>",
                                     parse_mode=ParseMode.HTML,
-                                )
-                        else:
-                            await context.bot.send_document(
-                                chat_id=update.effective_chat.id,
-                                document=bio,
-                                filename=bio.name,
-                                caption=f"📄 تقرير VIN <code>{vin}</code>",
-                                parse_mode=ParseMode.HTML,
+                                ),
+                                timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
                             )
                 except asyncio.TimeoutError:
                     report_result = _ReportResult(
@@ -5209,6 +5258,18 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 delivery_note = _bridge.t("report.success.pdf_note", report_lang)
                 delivered = bool(report_result and report_result.success)
+
+            # Determine Fast Mode translation decision from reports metadata.
+            try:
+                rr = getattr(report_result, "raw_response", None)
+                if isinstance(rr, dict):
+                    dv = rr.get("_dv_fast") or {}
+                    if isinstance(dv, dict):
+                        fast_skipped_translation = bool(dv.get("skipped_translation"))
+                        delivered_lang = str(dv.get("delivered_lang") or delivered_lang).lower()
+                        requested_lang = str(dv.get("requested_lang") or requested_lang).lower()
+            except Exception:
+                pass
 
             if delivered:
                 finalize_snapshot = await _finalize_report_request(context, tg_id, delivered=True)
@@ -5229,8 +5290,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     rr = getattr(report_result, "raw_response", None)
                     if isinstance(rr, dict):
                         dv = rr.get("_dv_fast") or {}
-                        if isinstance(dv, dict) and dv.get("skipped_translation") and (report_lang or "en").lower() != "en":
-                            extra_notes.append("🌐 Sent English due to time budget. You can request a localized version.")
+                        if isinstance(dv, dict) and dv.get("skipped_translation") and (requested_lang or "en") != "en":
+                            extra_notes.append(f"Full {requested_lang.upper()} version will be sent shortly")
                         if isinstance(dv, dict) and dv.get("used_fallback_pdf"):
                             extra_notes.append("⚡ Fast/light PDF (assets skipped).")
                 except Exception:
@@ -5242,9 +5303,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     # Always end on an explicit "completed" state.
                     # We edit the same progress message to avoid leaving it at 90%.
-                    await msg.edit_text(
-                        success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block + "\n\n✅ Delivered (PDF)",
-                        parse_mode=ParseMode.HTML,
+                    await asyncio.wait_for(
+                        msg.edit_text(
+                            success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block + "\n\n✅ Delivered (PDF)",
+                            parse_mode=ParseMode.HTML,
+                        ),
+                        timeout=_tg_remaining_s(floor=1.0),
                     )
                 except Exception:
                     # If editing fails (e.g., message no longer editable), send a final
@@ -5268,6 +5332,44 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
+                # Asynchronously generate + send FULL localized PDF if Fast Mode delivered English.
+                if fast_skipped_translation and requested_lang != "en" and delivered_lang == "en":
+                    async def _send_full_localized() -> None:
+                        try:
+                            from bot_core.telemetry import new_rid as _new_rid2, set_rid as _set_rid2
+                        except Exception:
+                            _new_rid2 = None  # type: ignore
+                            _set_rid2 = None  # type: ignore
+                        rid2 = (_new_rid2("tg-full-") if _new_rid2 else None)
+                        cm = _set_rid2(rid2) if (_set_rid2 and rid2) else None
+                        try:
+                            if cm:
+                                cm.__enter__()
+                            full = await _generate_vin_report(vin, language=requested_lang, fast_mode=False)
+                            if full and getattr(full, "success", False) and getattr(full, "pdf_bytes", None):
+                                bio2 = BytesIO(bytes(full.pdf_bytes))
+                                bio2.name = getattr(full, "pdf_filename", None) or f"{vin}.pdf"
+                                await context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=bio2,
+                                    filename=bio2.name,
+                                    caption=f"📄 Full {requested_lang.upper()} VIN report <code>{vin}</code>",
+                                    parse_mode=ParseMode.HTML,
+                                )
+                        except Exception:
+                            logger.info("tg full localized send failed", exc_info=True)
+                        finally:
+                            try:
+                                if cm:
+                                    cm.__exit__(None, None, None)
+                            except Exception:
+                                pass
+
+                    try:
+                        asyncio.create_task(_send_full_localized())
+                    except Exception:
+                        pass
+
                 return
             else:
                 refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False)
@@ -5282,9 +5384,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 try:
                     pdf_failure_note = "\n\n" + _bridge.t("report.error.pdf", report_lang) + _bridge.t("report.refund.note", report_lang) + "\n\n❌ Failed + refunded"
-                    await msg.edit_text(
-                        refreshed_header + "\n" + _make_progress_bar(100) + pdf_failure_note,
-                        parse_mode=ParseMode.HTML,
+                    await asyncio.wait_for(
+                        msg.edit_text(
+                            refreshed_header + "\n" + _make_progress_bar(100) + pdf_failure_note,
+                            parse_mode=ParseMode.HTML,
+                        ),
+                        timeout=_tg_remaining_s(floor=1.0),
                     )
                 except Exception:
                     pass

@@ -20,7 +20,7 @@ import aiohttp
 from bot_core.config import get_env
 from bot_core.services.pdf import html_to_pdf_bytes_chromium, fetch_page_html_chromium, PdfBusyError
 from bot_core.services.translation import inject_rtl, translate_html, translate_html_google_free, _latin_ku_to_arabic  # type: ignore
-from bot_core.telemetry import atimed
+from bot_core.telemetry import atimed, get_rid
 
 try:  # optional dependency (used for quick HTML translation fallback)
     from bs4 import BeautifulSoup  # type: ignore
@@ -65,8 +65,11 @@ _INFLIGHT_LOCK = asyncio.Lock()
 _INFLIGHT: Dict[str, asyncio.Task[ReportResult]] = {}
 
 
-def _cache_key(vin: str, lang_code: str) -> str:
-    base = f"{normalize_vin(vin) or vin}:{(lang_code or 'en').lower()}"
+def _cache_key(vin: str, lang_code: str, variant: str) -> str:
+    v = (variant or "fast").strip().lower()
+    if v not in {"fast", "full"}:
+        v = "fast"
+    base = f"{normalize_vin(vin) or vin}:{(lang_code or 'en').lower()}:{v}"
     return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
 
 
@@ -125,9 +128,9 @@ def _cache_cleanup_best_effort() -> None:
         return
 
 
-def _cache_get(vin: str, lang_code: str) -> Optional[bytes]:
+def _cache_get(vin: str, lang_code: str, variant: str) -> Optional[bytes]:
     try:
-        key = _cache_key(vin, lang_code)
+        key = _cache_key(vin, lang_code, variant)
         pdf_path, meta_path = _cache_paths(key)
         if not pdf_path.exists() or not meta_path.exists():
             return None
@@ -151,13 +154,13 @@ def _cache_get(vin: str, lang_code: str) -> Optional[bytes]:
         return None
 
 
-def _cache_put(vin: str, lang_code: str, pdf_bytes: bytes) -> None:
+def _cache_put(vin: str, lang_code: str, variant: str, pdf_bytes: bytes) -> None:
     if not _pdf_bytes_looks_ok(pdf_bytes):
         return
     try:
         base = Path(_REPORT_CACHE_DIR)
         base.mkdir(parents=True, exist_ok=True)
-        key = _cache_key(vin, lang_code)
+        key = _cache_key(vin, lang_code, variant)
         pdf_path, meta_path = _cache_paths(key)
         pdf_path.write_bytes(pdf_bytes)
         meta_path.write_text(
@@ -346,7 +349,9 @@ async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool
     if not normalized_vin:
         return ReportResult(success=False, user_message=_t("report.invalid_vin", lang_code, "❌ رقم VIN غير صالح."), errors=["invalid_vin"])
 
-    cached = _cache_get(normalized_vin, lang_code)
+    effective_fast = bool(fast_mode) and _FAST_MODE_ENABLED
+
+    cached = _cache_get(normalized_vin, lang_code, "fast" if effective_fast else "full")
     if cached:
         return ReportResult(
             success=True,
@@ -355,16 +360,21 @@ async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool
             vin=normalized_vin,
         )
 
-    effective_fast = bool(fast_mode) and _FAST_MODE_ENABLED
     inflight_key = f"{normalized_vin}:{lang_code}:{'fast' if effective_fast else 'full'}"
     async with _INFLIGHT_LOCK:
         task = _INFLIGHT.get(inflight_key)
         if task is None:
             async def _runner() -> ReportResult:
                 try:
-                    result = await _generate_vin_report_inner(normalized_vin, lang_code, effective_fast)
+                    if effective_fast:
+                        result = await asyncio.wait_for(
+                            _generate_vin_report_inner(normalized_vin, lang_code, True),
+                            timeout=float(_TOTAL_BUDGET_SEC),
+                        )
+                    else:
+                        result = await _generate_vin_report_inner(normalized_vin, lang_code, False)
                     if result.success and result.pdf_bytes:
-                        _cache_put(normalized_vin, lang_code, result.pdf_bytes)
+                        _cache_put(normalized_vin, lang_code, "fast" if effective_fast else "full", result.pdf_bytes)
                     return result
                 finally:
                     async with _INFLIGHT_LOCK:
@@ -406,10 +416,15 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
     pdf_bytes: Optional[bytes] = None
     skipped_translation = False
     used_fallback_pdf = False
+    delivered_lang = lang_code
+    requested_lang = lang_code
+    fetch_sec = 0.0
+    pdf_sec = 0.0
 
     try:
         prefer_non_pdf = lang_code != "en"
         fetch_budget = _budget_s(_remaining_s(), _FETCH_BUDGET_SEC) if fast_mode else _remaining_s()
+        t_fetch0 = time.perf_counter()
         async with atimed("report.fetch", vin=normalized_vin, lang=lang_code, prefer_non_pdf=prefer_non_pdf, budget_s=fetch_budget, fast=bool(fast_mode)):
             api_response = await _call_carfax_api(
                 normalized_vin,
@@ -417,6 +432,7 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
                 total_timeout_s=fetch_budget,
                 deadline=deadline,
             )
+        fetch_sec = max(0.0, time.perf_counter() - t_fetch0)
 
         LOGGER.info(
             "report.fastmode fetch_done vin=%s lang=%s fast=%s remaining=%.2fs",
@@ -460,8 +476,9 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
             # If non-English but only PDF is available, treat as not ok to push fallback rendering.
             api_response = {"ok": False, "error": "pdf_only_non_translatable"}
 
+        pdf_budget = _budget_s(_remaining_s(), _PDF_BUDGET_SEC) if fast_mode else _remaining_s()
+        t_pdf0 = time.perf_counter()
         try:
-            pdf_budget = _budget_s(_remaining_s(), _PDF_BUDGET_SEC) if fast_mode else _remaining_s()
             async with atimed("report.render_pdf", vin=normalized_vin, lang=lang_code, budget_s=pdf_budget, fast=bool(fast_mode)):
                 if fast_mode:
                     pdf_bytes, skipped_translation = await asyncio.wait_for(
@@ -471,13 +488,28 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
                 else:
                     pdf_bytes, _ = await _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline, fast_mode=False)
         except PdfBusyError:
-            return ReportResult(
-                success=False,
-                user_message=_t("report.error.timeout", lang_code, "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد. جرّب مرة أخرى."),
-                errors=["pdf_busy"],
-                vin=normalized_vin,
-                raw_response=api_response,
-            )
+            # Fast SLA: perform ONE reset+retry if the PDF engine is saturated.
+            if fast_mode:
+                try:
+                    from bot_core.services.pdf import close_pdf_engine
+
+                    await close_pdf_engine()
+                    retry_budget = _budget_s(_remaining_s(), _PDF_BUDGET_SEC)
+                    async with atimed("report.render_pdf_retry", vin=normalized_vin, lang=lang_code, budget_s=retry_budget):
+                        pdf_bytes, skipped_translation = await asyncio.wait_for(
+                            _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline, fast_mode=True),
+                            timeout=max(0.25, retry_budget),
+                        )
+                except Exception:
+                    pdf_bytes = None
+            if not pdf_bytes:
+                return ReportResult(
+                    success=False,
+                    user_message=_t("report.error.timeout", lang_code, "⚠️ تعذّر إكمال الطلب ضمن SLA الوقت."),
+                    errors=["pdf_busy"],
+                    vin=normalized_vin,
+                    raw_response=api_response,
+                )
         except asyncio.TimeoutError:
             # Last-ditch: minimal local HTML (no external assets) within remaining time.
             try:
@@ -499,6 +531,8 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
                     used_fallback_pdf = bool(pdf_bytes)
             except Exception:
                 pdf_bytes = None
+        finally:
+            pdf_sec = max(0.0, time.perf_counter() - t_pdf0)
         if not pdf_bytes:
             return ReportResult(
                 success=False,
@@ -508,6 +542,27 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
                 raw_response=api_response,
             )
 
+        # Language SLA policy:
+        # If translation isn't ready within budget, deliver English FAST PDF + note (delivery layers).
+        if fast_mode and requested_lang != "en" and skipped_translation:
+            delivered_lang = "en"
+            try:
+                cached_en = _cache_get(normalized_vin, "en", "fast")
+                if cached_en:
+                    pdf_bytes = cached_en
+                else:
+                    rem = max(0.25, _budget_s(_remaining_s(), _PDF_BUDGET_SEC))
+                    pdf_bytes_en, _ = await asyncio.wait_for(
+                        _render_pdf_from_response(api_response, normalized_vin, "en", deadline=deadline, fast_mode=True),
+                        timeout=rem,
+                    )
+                    if pdf_bytes_en:
+                        pdf_bytes = pdf_bytes_en
+                        _cache_put(normalized_vin, "en", "fast", pdf_bytes_en)
+            except Exception:
+                # If English fallback can't be produced, keep the existing PDF.
+                delivered_lang = requested_lang
+
         # Stash Fast Mode decisions into raw_response so delivery layers can message consistently
         # *after* the PDF is actually delivered.
         try:
@@ -515,11 +570,31 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
                 "fast_mode": bool(fast_mode),
                 "skipped_translation": bool(skipped_translation),
                 "used_fallback_pdf": bool(used_fallback_pdf),
+                "requested_lang": requested_lang,
+                "delivered_lang": delivered_lang,
                 "fetch_budget_s": float(_FETCH_BUDGET_SEC),
                 "translate_budget_s": float(_TRANSLATE_BUDGET_SEC),
                 "pdf_budget_s": float(_PDF_BUDGET_SEC),
                 "total_budget_s": float(_TOTAL_BUDGET_SEC if fast_mode else _REPORT_TOTAL_TIMEOUT_SEC),
+                "fetch_sec": round(float(fetch_sec), 3),
+                "pdf_sec": round(float(pdf_sec), 3),
+                "total_sec": round(float(time.perf_counter() - start_t), 3),
             }
+        except Exception:
+            pass
+
+        try:
+            LOGGER.info(
+                "sla.fast_report rid=%s vin=%s req_lang=%s del_lang=%s fast=%s fetch_sec=%.3f pdf_sec=%.3f total_sec=%.3f outcome=success",
+                get_rid() or "-",
+                normalized_vin,
+                requested_lang,
+                delivered_lang,
+                bool(fast_mode),
+                float(fetch_sec),
+                float(pdf_sec),
+                float(time.perf_counter() - start_t),
+            )
         except Exception:
             pass
 
@@ -974,7 +1049,8 @@ async def _render_pdf_from_url(
             html, translated_ok = await _maybe_translate_html(html, language, deadline=deadline, budget_s=_TRANSLATE_BUDGET_SEC if fast_mode else None)
             if not translated_ok:
                 translation_skipped = True
-            if (language or "en").lower() in {"ar", "ku", "ckb"}:
+            # Only RTL-wrap if we actually translated (Fast Mode) or if this is full mode.
+            if (language or "en").lower() in {"ar", "ku", "ckb"} and (translated_ok or not fast_mode):
                 html = inject_rtl(html, lang=language)
                 if fast_mode:
                     pdf_bytes = await html_to_pdf_bytes_chromium(
@@ -1174,9 +1250,10 @@ async def _render_pdf_from_html(
             translation_skipped = True
     else:
         translated = html
-    # Enforce RTL wrapper for Arabic/Kurdish even if translation fell back to original
+    # Only RTL-wrap if we actually translated (Fast Mode) or if this is full mode.
     if (language or "en").lower() in {"ar", "ku", "ckb"}:
-        translated = inject_rtl(translated, lang=language)
+        if not fast_mode or not translation_skipped:
+            translated = inject_rtl(translated, lang=language)
     # Chromium-only renderer.
     if fast_mode:
         pdf_bytes = await html_to_pdf_bytes_chromium(
@@ -1268,8 +1345,9 @@ async def _maybe_translate_html(
                         p.cancel()
                     return candidate, True
 
-        # If neither produced a real translation, fall back to original with RTL wrapper.
-        return inject_rtl(html, lang=lang_code), False
+                # If neither produced a real translation, fall back to original (English).
+                # Delivery layers can then send English FAST PDF and optionally follow up with the full localized version.
+                return html, False
     finally:
         for t in (t1, t2):
             if not t.done():

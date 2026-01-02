@@ -1233,14 +1233,14 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ku": "⚠️ هێنانی ڕاپۆرت شکستی هێنا.",
     },
     "report.error.busy": {
-        "ar": "⚠️ السيرفر مشغول حالياً. جرّب بعد قليل.",
-        "en": "⚠️ Server is busy right now. Please try again shortly.",
-        "ku": "⚠️ سێرڤەر ئێستا سەرقاڵە. تکایە دووبارە هەوڵ بدە دوای کەمێک.",
+        "ar": "⚠️ تعذّر إكمال الطلب ضمن SLA الوقت.",
+        "en": "⚠️ Could not complete within the SLA time.",
+        "ku": "⚠️ نەتوانرا لە ماوەی SLA تەواوبکرێت.",
     },
     "report.error.timeout": {
-        "ar": "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد. جرّب مرة أخرى.",
-        "en": "⚠️ Could not complete within the time limit. Please try again.",
-        "ku": "⚠️ نەتوانرا لە ماوەی دیاریکراو تەواوبکرێت. تکایە دووبارە هەوڵبدە.",
+        "ar": "⚠️ تعذّر إكمال الطلب ضمن SLA الوقت.",
+        "en": "⚠️ Could not complete within the SLA time.",
+        "ku": "⚠️ نەتوانرا لە ماوەی SLA تەواوبکرێت.",
     },
     "report.error.fetch_detailed": {
         "ar": "⚠️ فشل جلب تقرير VIN: {error}",

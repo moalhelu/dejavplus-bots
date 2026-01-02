@@ -5078,6 +5078,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.wait_for(progress_task, timeout=2)
             except Exception:
                 progress_task.cancel()
+                # IMPORTANT: always await/capture the task after cancellation.
+                # Otherwise its last in-flight edit (often 90%) can race and overwrite
+                # the final 100% message, leaving the UX stuck at 90%.
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.warning("progress task failed", exc_info=True)
 
         if not report_result:
             report_result = _ReportResult(
@@ -5143,9 +5152,19 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 note = delivery_note or _bridge.t("report.success.note", report_lang)
                 try:
-                    await msg.edit_text(success_header + "\n" + _make_progress_bar(100) + note, parse_mode=ParseMode.HTML)
+                    # Always end on an explicit "completed" state.
+                    # We edit the same progress message to avoid leaving it at 90%.
+                    await msg.edit_text(
+                        success_header + "\n" + _make_progress_bar(100) + "\n\n✅ Report ready (100%)" + note,
+                        parse_mode=ParseMode.HTML,
+                    )
                 except Exception:
-                    pass
+                    # If editing fails (e.g., message no longer editable), send a final
+                    # completion message anyway so the user always sees 100%.
+                    try:
+                        await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Report ready (100%)")
+                    except Exception:
+                        pass
                 context.chat_data["progress_header"] = success_header
                 remaining_credit = finalize_snapshot["monthly_remaining"]
                 remaining_txt = _bridge.t("report.summary.unlimited", report_lang) if remaining_credit is None else str(remaining_credit)

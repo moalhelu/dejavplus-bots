@@ -199,17 +199,15 @@ def _budget_s(remaining_s: float, stage_budget_s: float) -> float:
 
 
 def _make_fast_fallback_html(*, vin: str, language: str) -> str:
-    # Minimal, no external assets, renders fast even if the upstream HTML is slow.
+    # Deprecated: do not use placeholder PDFs.
+    # Kept for backwards compatibility in case any external code imports it.
     lang_label = escape((language or "en").upper())
     vin_safe = escape(vin)
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<title>VIN Report</title>"
-        "<style>body{font-family:Arial,sans-serif;margin:24px;}h1{font-size:18px;}p{font-size:12px;}</style>"
         "</head><body>"
         f"<h1>VIN Report</h1><p><b>VIN:</b> {vin_safe}</p><p><b>Language:</b> {lang_label}</p>"
-        "<p>This is a fast/light PDF delivered within a strict time budget. "
-        "If you need the localized version or photos, request the full report/options.</p>"
         "</body></html>"
     )
 
@@ -476,8 +474,10 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
             # If non-English but only PDF is available, treat as not ok to push fallback rendering.
             api_response = {"ok": False, "error": "pdf_only_non_translatable"}
 
-        pdf_budget = _budget_s(_remaining_s(), _PDF_BUDGET_SEC) if fast_mode else _remaining_s()
+        # In Fast Mode, prefer using the full remaining SLA time for PDF rendering.
+        pdf_budget = _remaining_s()
         t_pdf0 = time.perf_counter()
+        pdf_timed_out = False
         try:
             async with atimed("report.render_pdf", vin=normalized_vin, lang=lang_code, budget_s=pdf_budget, fast=bool(fast_mode)):
                 if fast_mode:
@@ -494,7 +494,7 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
                     from bot_core.services.pdf import close_pdf_engine
 
                     await close_pdf_engine()
-                    retry_budget = _budget_s(_remaining_s(), _PDF_BUDGET_SEC)
+                    retry_budget = _remaining_s()
                     async with atimed("report.render_pdf_retry", vin=normalized_vin, lang=lang_code, budget_s=retry_budget):
                         pdf_bytes, skipped_translation = await asyncio.wait_for(
                             _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline, fast_mode=True),
@@ -511,28 +511,17 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
                     raw_response=api_response,
                 )
         except asyncio.TimeoutError:
-            # Last-ditch: minimal local HTML (no external assets) within remaining time.
-            try:
-                rem = _remaining_s()
-                if rem > 0.25:
-                    fallback_html = _make_fast_fallback_html(vin=normalized_vin, language=lang_code)
-                    pdf_bytes = await asyncio.wait_for(
-                        html_to_pdf_bytes_chromium(
-                            html_str=fallback_html,
-                            timeout_ms=int(max(500, min(rem, 3.0)) * 1000),
-                            acquire_timeout_ms=_PDF_QUEUE_TIMEOUT_MS,
-                            wait_until="load",
-                            fast_first_timeout_ms=700,
-                            fast_first_wait_until="domcontentloaded",
-                            block_resource_types={"image", "media"},
-                        ),
-                        timeout=max(0.25, min(rem, 3.0)),
-                    )
-                    used_fallback_pdf = bool(pdf_bytes)
-            except Exception:
-                pdf_bytes = None
+            pdf_timed_out = True
         finally:
             pdf_sec = max(0.0, time.perf_counter() - t_pdf0)
+        if pdf_timed_out and not pdf_bytes:
+            return ReportResult(
+                success=False,
+                user_message=_t("report.error.timeout", lang_code, "⚠️ تعذّر إكمال الطلب ضمن SLA الوقت."),
+                errors=["pdf_timeout"],
+                vin=normalized_vin,
+                raw_response=api_response,
+            )
         if not pdf_bytes:
             return ReportResult(
                 success=False,
@@ -1056,7 +1045,7 @@ async def _render_pdf_from_url(
                     pdf_bytes = await html_to_pdf_bytes_chromium(
                         html_str=html,
                         base_url=url,
-                        timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)),
+                        timeout_ms=_deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000),
                         acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                         wait_until="domcontentloaded",
                         fast_first_timeout_ms=700,
@@ -1075,7 +1064,7 @@ async def _render_pdf_from_url(
             if fast_mode:
                 pdf_bytes = await html_to_pdf_bytes_chromium(
                     url=url,
-                    timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)),
+                    timeout_ms=_deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000),
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                     wait_until="domcontentloaded",
                     fast_first_timeout_ms=700,
@@ -1108,7 +1097,7 @@ async def _render_pdf_from_url(
                         base_url=url,
                         acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                         wait_until="domcontentloaded" if fast_mode else None,
-                        timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)) if fast_mode else None,
+                        timeout_ms=_deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000) if fast_mode else None,
                         fast_first_timeout_ms=700 if fast_mode else None,
                         fast_first_wait_until="domcontentloaded" if fast_mode else None,
                         block_resource_types={"image", "media"} if fast_mode else None,
@@ -1202,33 +1191,6 @@ async def _render_pdf_from_url(
             timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
             acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
         )
-    if not pdf_bytes:
-        fallback = (
-            f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3>"
-            f"<a href='{escape(url)}'>{escape(url)}</a></body></html>"
-        )
-        if needs_translation:
-            fallback, translated_ok = await _maybe_translate_html(fallback, language, deadline=deadline, budget_s=_TRANSLATE_BUDGET_SEC if fast_mode else None)
-            if not translated_ok:
-                translation_skipped = True
-        if fast_mode:
-            pdf_bytes = await html_to_pdf_bytes_chromium(
-                html_str=fallback,
-                base_url=url,
-                timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)),
-                acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
-                wait_until="domcontentloaded",
-                fast_first_timeout_ms=700,
-                fast_first_wait_until="domcontentloaded",
-                block_resource_types={"image", "media"},
-            )
-        else:
-            pdf_bytes = await html_to_pdf_bytes_chromium(
-                html_str=fallback,
-                base_url=url,
-                timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
-                acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
-            )
     return pdf_bytes, bool(translation_skipped)
 
 
@@ -1259,7 +1221,7 @@ async def _render_pdf_from_html(
         pdf_bytes = await html_to_pdf_bytes_chromium(
             html_str=translated,
             base_url=base_url,
-            timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)),
+            timeout_ms=_deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000),
             acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
             wait_until="domcontentloaded",
             fast_first_timeout_ms=700,

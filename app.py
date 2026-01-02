@@ -5292,8 +5292,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         dv = rr.get("_dv_fast") or {}
                         if isinstance(dv, dict) and dv.get("skipped_translation") and (requested_lang or "en") != "en":
                             extra_notes.append(f"Full {requested_lang.upper()} version will be sent shortly")
-                        if isinstance(dv, dict) and dv.get("used_fallback_pdf"):
-                            extra_notes.append("⚡ Fast/light PDF (assets skipped).")
+                        # No placeholder/"fast-light" PDFs are allowed; we either render the real report or fail.
                 except Exception:
                     pass
 

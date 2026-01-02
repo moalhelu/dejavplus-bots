@@ -1409,7 +1409,7 @@ async def handle_incoming_whatsapp_message(
     credit_commit_required = False
     activation_prompt: Optional[str] = None
     fast_skipped_translation = False
-    fast_used_fallback_pdf = False
+    # Placeholder/fast-light fallback PDFs are disabled.
 
     for batch in response_batches:
         _extend_payloads(batch)
@@ -1443,7 +1443,7 @@ async def handle_incoming_whatsapp_message(
                             dv = rr_raw.get("_dv_fast") or {}
                             if isinstance(dv, dict):
                                 fast_skipped_translation = bool(dv.get("skipped_translation"))
-                                fast_used_fallback_pdf = bool(dv.get("used_fallback_pdf"))
+                                pass
                     except Exception:
                         pass
 
@@ -1670,8 +1670,7 @@ async def handle_incoming_whatsapp_message(
                     parts: List[str] = []
                     if fast_skipped_translation and (user_ctx.language or "en").lower() != "en":
                         parts.append(f"Full {(user_ctx.language or 'en').upper()} version will be sent shortly")
-                    if fast_used_fallback_pdf:
-                        parts.append("⚡ Fast/light PDF (assets skipped).")
+                    # No placeholder/"fast-light" PDFs are allowed; we either render the real report or fail.
                     parts.append("✅ Delivered (PDF)")
                     await send_whatsapp_text(msisdn, "\n".join(parts), client=client)
                 except Exception:

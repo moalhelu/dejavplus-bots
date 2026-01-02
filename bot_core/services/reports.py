@@ -61,6 +61,10 @@ _REPORT_CACHE_TTL_SEC = max(60.0, min(_REPORT_CACHE_TTL_SEC, 7 * 86400.0))
 _REPORT_CACHE_MAX_BYTES = int(os.getenv("REPORT_CACHE_MAX_BYTES", str(250 * 1024 * 1024)) or (250 * 1024 * 1024))
 _REPORT_CACHE_MAX_BYTES = max(10 * 1024 * 1024, min(_REPORT_CACHE_MAX_BYTES, 5 * 1024 * 1024 * 1024))
 
+# Cache schema version (bump to invalidate previously cached PDFs).
+# This prevents serving any legacy/placeholder outputs.
+_REPORT_CACHE_SCHEMA = os.getenv("REPORT_CACHE_SCHEMA", "2") or "2"
+
 _INFLIGHT_LOCK = asyncio.Lock()
 _INFLIGHT: Dict[str, asyncio.Task[ReportResult]] = {}
 
@@ -69,7 +73,7 @@ def _cache_key(vin: str, lang_code: str, variant: str) -> str:
     v = (variant or "fast").strip().lower()
     if v not in {"fast", "full"}:
         v = "fast"
-    base = f"{normalize_vin(vin) or vin}:{(lang_code or 'en').lower()}:{v}"
+    base = f"{_REPORT_CACHE_SCHEMA}:{normalize_vin(vin) or vin}:{(lang_code or 'en').lower()}:{v}"
     return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
 
 
@@ -196,20 +200,6 @@ _TOTAL_BUDGET_SEC = max(1.0, min(_TOTAL_BUDGET_SEC, 120.0))
 
 def _budget_s(remaining_s: float, stage_budget_s: float) -> float:
     return max(0.0, min(float(remaining_s), float(stage_budget_s)))
-
-
-def _make_fast_fallback_html(*, vin: str, language: str) -> str:
-    # Deprecated: do not use placeholder PDFs.
-    # Kept for backwards compatibility in case any external code imports it.
-    lang_label = escape((language or "en").upper())
-    vin_safe = escape(vin)
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        "<title>VIN Report</title>"
-        "</head><body>"
-        f"<h1>VIN Report</h1><p><b>VIN:</b> {vin_safe}</p><p><b>Language:</b> {lang_label}</p>"
-        "</body></html>"
-    )
 
 
 def _carfax_parallel_primary_enabled() -> bool:
@@ -413,7 +403,6 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
     api_response: Dict[str, Any] = {}
     pdf_bytes: Optional[bytes] = None
     skipped_translation = False
-    used_fallback_pdf = False
     delivered_lang = lang_code
     requested_lang = lang_code
     fetch_sec = 0.0
@@ -558,7 +547,6 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
             api_response["_dv_fast"] = {
                 "fast_mode": bool(fast_mode),
                 "skipped_translation": bool(skipped_translation),
-                "used_fallback_pdf": bool(used_fallback_pdf),
                 "requested_lang": requested_lang,
                 "delivered_lang": delivered_lang,
                 "fetch_budget_s": float(_FETCH_BUDGET_SEC),
@@ -593,7 +581,7 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_m
             lang_code,
             bool(fast_mode),
             bool(skipped_translation),
-            bool(used_fallback_pdf),
+            False,
         )
 
         result = ReportResult(

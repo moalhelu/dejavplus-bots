@@ -3,6 +3,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,9 @@ def _repo_root() -> Path:
 def _load_sample_html() -> str:
     html_path = _repo_root() / "tests" / "sample.html"
     return html_path.read_text(encoding="utf-8")
+
+
+_PLACEHOLDER_PHRASE = "This is a fast/light PDF"
 
 
 async def _render_one(i: int, html_template: str) -> bytes:
@@ -34,7 +38,48 @@ async def _render_one(i: int, html_template: str) -> bytes:
     return pdf_bytes
 
 
+def _bytes_contain_token(pdf_bytes: bytes, token: str) -> bool:
+    if not token:
+        return False
+    try:
+        return token.encode("utf-8") in pdf_bytes
+    except Exception:
+        return False
+
+
+async def _check_fast_report(vin: str, lang: str) -> None:
+    from bot_core.services import reports
+
+    res = await reports.generate_vin_report(vin, language=lang, fast_mode=True)
+    if not res or not res.success or not res.pdf_bytes:
+        raise RuntimeError(f"FAST report failed (success={getattr(res,'success',None)} errors={getattr(res,'errors',None)})")
+
+    pdf_bytes = bytes(res.pdf_bytes)
+
+    # Must contain VIN somewhere (basic sanity).
+    if not _bytes_contain_token(pdf_bytes, vin):
+        raise RuntimeError("FAST PDF does not contain VIN token (possible wrong/blank content)")
+
+    # Must never contain placeholder phrase.
+    if _bytes_contain_token(pdf_bytes, _PLACEHOLDER_PHRASE):
+        raise RuntimeError("PLACEHOLDER detected in FAST PDF output")
+
+
 async def _main() -> int:
+    # Mode switch:
+    # - Default: stress-test pdf engine
+    # - report <VIN> [LANG]: generate FAST VIN report and assert no placeholder
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "report":
+        if len(sys.argv) < 3:
+            raise SystemExit("Usage: python tools/pdf_selfcheck.py report <VIN> [LANG]")
+        vin = sys.argv[2].strip()
+        lang = (sys.argv[3].strip() if len(sys.argv) >= 4 else os.getenv("SELFCHECK_LANG", "en")).strip() or "en"
+        await _check_fast_report(vin, lang)
+        print("FAST report self-check OK")
+        print(f"- vin: {vin}")
+        print(f"- lang: {lang}")
+        return 0
+
     sequential_n = int(os.getenv("PDF_SELFCHECK_SEQUENTIAL", "20"))
     concurrent_n = int(os.getenv("PDF_SELFCHECK_CONCURRENT", "10"))
 

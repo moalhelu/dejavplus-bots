@@ -1237,6 +1237,11 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "⚠️ Server is busy right now. Please try again shortly.",
         "ku": "⚠️ سێرڤەر ئێستا سەرقاڵە. تکایە دووبارە هەوڵ بدە دوای کەمێک.",
     },
+    "report.error.timeout": {
+        "ar": "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد. جرّب مرة أخرى.",
+        "en": "⚠️ Could not complete within the time limit. Please try again.",
+        "ku": "⚠️ نەتوانرا لە ماوەی دیاریکراو تەواوبکرێت. تکایە دووبارە هەوڵبدە.",
+    },
     "report.error.fetch_detailed": {
         "ar": "⚠️ فشل جلب تقرير VIN: {error}",
         "en": "⚠️ Failed to fetch VIN report: {error}",
@@ -3847,10 +3852,6 @@ async def _handle_vin_request(
 
     try:
         report_result = await generate_vin_report(vin, language=language)
-        
-        # If successful, commit the credit usage
-        if deduct_credit and credit_reserved:
-            commit_credit(user.user_id)
             
     except Exception as exc:  # pylint: disable=broad-except
         # If failed, refund the credit
@@ -3866,6 +3867,12 @@ async def _handle_vin_request(
     response.actions["report_result"] = report_result
     response.actions["vin"] = report_result.vin or vin
     response.actions["source_text"] = message.text or ""
+
+    # For platforms that pre-reserve credit (e.g., WhatsApp), commit/refund must happen
+    # only after delivery succeeds. We surface an explicit flag so the transport layer
+    # can finalize accurately.
+    if deduct_credit and credit_reserved and report_result.success:
+        response.actions["credit_commit_required"] = True
 
     user_message = report_result.user_message or "📄 تم تجهيز تقرير VIN الخاص بك."
     response.messages.append(user_message)

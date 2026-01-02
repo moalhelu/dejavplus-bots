@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import time
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
@@ -51,6 +52,7 @@ from bot_core.storage import (
     now_str as _now_str,
     reserve_credit,
     refund_credit,
+    commit_credit,
 )
 from bot_core.utils.vin import is_valid_vin
 from bot_core.telemetry import atimed, new_rid, set_rid
@@ -65,6 +67,54 @@ load_dotenv(override=True)
 configure_logging()
 
 LOGGER = logging.getLogger(__name__)
+
+# Deduplicate inbound webhooks (providers can retry). Keep a bounded TTL cache.
+_WA_SEEN_MSGS: "OrderedDict[str, float]" = OrderedDict()
+_WA_DEDUP_TTL_SEC = float(os.getenv("WA_DEDUP_TTL_SEC", "600") or 600)  # 10 min
+_WA_DEDUP_TTL_SEC = max(60.0, min(_WA_DEDUP_TTL_SEC, 86400.0))
+_WA_DEDUP_MAX = int(os.getenv("WA_DEDUP_MAX", "5000") or 5000)
+_WA_DEDUP_MAX = max(100, min(_WA_DEDUP_MAX, 50000))
+
+
+def _wa_event_message_id(event: Dict[str, Any]) -> Optional[str]:
+    for key in ("id", "messageId", "message_id", "msgId", "msg_id", "idMessage", "_id"):
+        val = event.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    data = event.get("data")
+    if isinstance(data, dict):
+        for key in ("id", "messageId", "msgId", "idMessage"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _wa_seen_before(sender: str, msg_id: Optional[str]) -> bool:
+    if not sender or not msg_id:
+        return False
+    now = time.time()
+    try:
+        while _WA_SEEN_MSGS:
+            _, ts = next(iter(_WA_SEEN_MSGS.items()))
+            if (now - ts) <= _WA_DEDUP_TTL_SEC:
+                break
+            _WA_SEEN_MSGS.popitem(last=False)
+    except Exception:
+        pass
+
+    key = f"{sender}:{msg_id}"
+    if key in _WA_SEEN_MSGS:
+        _WA_SEEN_MSGS.move_to_end(key)
+        return True
+    _WA_SEEN_MSGS[key] = now
+    _WA_SEEN_MSGS.move_to_end(key)
+    try:
+        while len(_WA_SEEN_MSGS) > _WA_DEDUP_MAX:
+            _WA_SEEN_MSGS.popitem(last=False)
+    except Exception:
+        pass
+    return False
 
 
 def _wa_handler_timeout_sec() -> float:
@@ -1023,6 +1073,8 @@ async def handle_incoming_whatsapp_message(
 ) -> Dict[str, Any]:
     # Debug trace for incoming state/text
     LOGGER.debug("whatsapp inbound raw event=%s", event)
+
+    msg_id = _wa_event_message_id(event)
     normalized_event_type = (event_type or str(event.get("event_type") or "")).strip().lower()
     if normalized_event_type and normalized_event_type != "message_received":
         LOGGER.debug("Skipping webhook: unsupported event_type=%s", normalized_event_type)
@@ -1065,6 +1117,10 @@ async def handle_incoming_whatsapp_message(
     if not bridge_sender or not msisdn:
         LOGGER.warning("Skipping webhook: unable to normalize sender JID=%s", raw_sender)
         return {"status": "ignored", "reason": "invalid_sender"}
+
+    if _wa_seen_before(bridge_sender, msg_id):
+        LOGGER.info("whatsapp: duplicate webhook ignored sender=%s msg_id=%s", bridge_sender, msg_id)
+        return {"status": "ignored", "reason": "duplicate"}
 
     text_body = (event.get("body") or event.get("text") or "").strip()
     LOGGER.debug("whatsapp inbound normalized text='%s'", text_body)
@@ -1349,7 +1405,11 @@ async def handle_incoming_whatsapp_message(
 
     vin_from_response: Optional[str] = None
     pdf_present = False
+    report_success = False
+    credit_commit_required = False
     activation_prompt: Optional[str] = None
+    fast_skipped_translation = False
+    fast_used_fallback_pdf = False
 
     for batch in response_batches:
         _extend_payloads(batch)
@@ -1359,6 +1419,37 @@ async def handle_incoming_whatsapp_message(
                 activation_prompt = _bridge.t("activation.prompt.cc", user_ctx.language)
             if not vin_from_response:
                 vin_from_response = actions.get("vin")
+
+            rr = actions.get("report_result")
+            if rr is not None:
+                rr_success: Optional[bool] = None
+                try:
+                    rr_success = bool(getattr(rr, "success"))
+                except Exception:
+                    rr_success = None
+                if rr_success is None and isinstance(rr, dict):
+                    rr_success = bool(rr.get("success"))
+                if rr_success is True:
+                    report_success = True
+
+                    # Pull Fast Mode decisions from reports layer (if present).
+                    try:
+                        rr_raw = None
+                        if isinstance(rr, dict):
+                            rr_raw = rr.get("raw_response")
+                        else:
+                            rr_raw = getattr(rr, "raw_response", None)
+                        if isinstance(rr_raw, dict):
+                            dv = rr_raw.get("_dv_fast") or {}
+                            if isinstance(dv, dict):
+                                fast_skipped_translation = bool(dv.get("skipped_translation"))
+                                fast_used_fallback_pdf = bool(dv.get("used_fallback_pdf"))
+                    except Exception:
+                        pass
+
+            if actions.get("credit_commit_required"):
+                credit_commit_required = True
+
             photos_action = actions.get("photos")
             if photos_action:
                 vin_for_photos = None
@@ -1482,7 +1573,7 @@ async def handle_incoming_whatsapp_message(
         LOGGER.debug("whatsapp: sending menu after language update (single render, lang=%s)", user_ctx.language)
         send_tasks.append(asyncio.create_task(_send_bridge_menu(msisdn, user_ctx, client)))
 
-    doc_tasks: List[asyncio.Task[Any]] = []
+    doc_tasks: List[asyncio.Task[bool]] = []
     LOGGER.info("Found %d documents to send", len(documents))
     for doc in documents:
         if not isinstance(doc, dict) or doc.get("type") != "pdf":
@@ -1501,6 +1592,9 @@ async def handle_incoming_whatsapp_message(
     # Never allow a single send failure to abort the whole WhatsApp response batch.
     send_failures = 0
     send_successes = 0
+    delivered_pdfs = 0
+    delivery_refunded = False
+    delivery_committed = False
     try:
         if send_tasks:
             results = await asyncio.gather(*send_tasks, return_exceptions=True)
@@ -1516,8 +1610,12 @@ async def handle_incoming_whatsapp_message(
                 if isinstance(r, Exception):
                     send_failures += 1
                     LOGGER.warning("whatsapp: document send task failed: %s", r)
-                else:
+                elif r is True:
                     send_successes += 1
+                    delivered_pdfs += 1
+                else:
+                    send_failures += 1
+                    LOGGER.warning("whatsapp: document send reported failure (no exception)")
         if image_tasks:
             results = await asyncio.gather(*image_tasks, return_exceptions=True)
             for r in results:
@@ -1537,12 +1635,66 @@ async def handle_incoming_whatsapp_message(
         if pdf_present and vin_from_response:
             try:
                 await _send_report_options_menu(msisdn, user_ctx.user_id, vin_from_response, client)
+                send_successes += 1
             except Exception as exc:
                 send_failures += 1
                 LOGGER.warning("whatsapp: failed to send report options menu: %s", exc)
 
-        if send_failures and send_successes == 0:
-            # If *everything* failed to send, attempt one last minimal message.
+        # Guarantee: if a VIN report was successfully generated, we must either deliver it
+        # (then commit credit) or explicitly fail + refund credit.
+        if report_success and vin_from_response and credit_commit_required:
+            delivery_ok = False
+            if pdf_present:
+                delivery_ok = delivered_pdfs > 0
+            else:
+                delivery_ok = send_successes > 0
+
+            if delivery_ok:
+                try:
+                    if not delivery_committed:
+                        commit_credit(user_ctx.user_id)
+                        delivery_committed = True
+                        LOGGER.info("whatsapp: committed credit after successful delivery user=%s vin=%s", user_ctx.user_id, vin_from_response)
+                except Exception:
+                    LOGGER.exception("whatsapp: failed to commit credit after delivery user=%s", user_ctx.user_id)
+
+                # Terminal success message (never leave user with only 'fetching...').
+                try:
+                    parts: List[str] = []
+                    if fast_skipped_translation and (user_ctx.language or "en").lower() != "en":
+                        parts.append("🌐 Sent English due to time budget. You can request a localized version.")
+                    if fast_used_fallback_pdf:
+                        parts.append("⚡ Fast/light PDF (assets skipped).")
+                    parts.append("✅ Delivered (PDF)")
+                    await send_whatsapp_text(msisdn, "\n".join(parts), client=client)
+                except Exception:
+                    pass
+            else:
+                try:
+                    if not delivery_refunded:
+                        refund_credit(user_ctx.user_id)
+                        delivery_refunded = True
+                        LOGGER.info(
+                            "whatsapp: refunded credit due to delivery failure user=%s vin=%s pdf_present=%s delivered_pdfs=%s send_successes=%s send_failures=%s",
+                            user_ctx.user_id,
+                            vin_from_response,
+                            pdf_present,
+                            delivered_pdfs,
+                            send_successes,
+                            send_failures,
+                        )
+                except Exception:
+                    LOGGER.exception("whatsapp: failed to refund credit after delivery failure user=%s", user_ctx.user_id)
+
+                # Send an explicit failure message so the user isn't left guessing.
+                try:
+                    err = _bridge.t("report.error.generic", user_ctx.language)
+                    await send_whatsapp_text(msisdn, f"{err}\n\n❌ Failed + refunded", client=client)
+                except Exception:
+                    pass
+
+        elif send_failures and send_successes == 0:
+            # If *everything* failed to send (non-report flow), attempt one last minimal message.
             try:
                 await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", user_ctx.language), client=client)
             except Exception:
@@ -1583,7 +1735,7 @@ def _encode_file_to_base64(path: str) -> Optional[str]:
     return None
 
 
-async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dict[str, Any]) -> None:
+async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dict[str, Any]) -> bool:
     filename = document.get("filename") or document.get("file_name") or "report.pdf"
     caption = document.get("caption")
     payload: Dict[str, Any] = {"filename": filename}
@@ -1647,7 +1799,7 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                         )
                     except Exception:
                         pass
-                    return
+                    return False
                 token = await _put_one_shot_blob(raw_bytes, filename=filename, media_type="application/pdf")
                 url_value = f"{public_url}/download/{token}"
                 LOGGER.info("Serving PDF via one-shot URL: %s", url_value)
@@ -1663,7 +1815,7 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                 raw_bytes = b""
             if not raw_bytes:
                 LOGGER.warning("Skipping pdf document: failed to read path=%s", path_value)
-                return
+                return False
             if len(raw_bytes) >= wa_max_b64_bytes:
                 if not public_url:
                     public_url = await _ensure_public_url()
@@ -1682,7 +1834,7 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                         )
                     except Exception:
                         pass
-                    return
+                    return False
                 token = await _put_one_shot_blob(raw_bytes, filename=filename, media_type="application/pdf")
                 url_value = f"{public_url}/download/{token}"
                 LOGGER.info("Serving PDF via one-shot URL: %s", url_value)
@@ -1695,7 +1847,7 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
         payload["document_base64"] = base64_payload
     else:
         LOGGER.warning("Skipping pdf document without path/url/base64: %s", document)
-        return
+        return False
 
     if caption:
         payload["caption"] = caption
@@ -1712,6 +1864,7 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
         ):
             resp = await client.send_document(msisdn, **payload)
         LOGGER.info("UltraMsg send_document response: %s", resp)
+        return True
     except Exception as e:
         LOGGER.error("Failed to send document: %s", e, exc_info=True)
         # Notify user once (no spam) so failure is visible.
@@ -1724,6 +1877,7 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
             )
         except Exception:
             pass
+        return False
 
 
 async def _relay_image_document(client: UltraMsgClient, msisdn: str, media: Dict[str, Any]) -> None:
@@ -1912,8 +2066,8 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                             refund_credit(user_ctx.user_id)
                         except Exception:
                             pass
-                        msg = _bridge.t("report.error.busy", user_ctx.language)
-                        await send_whatsapp_text(msisdn, msg, client=client)
+                        msg = _bridge.t("report.error.timeout", user_ctx.language)
+                        await send_whatsapp_text(msisdn, f"{msg}\n\n❌ Failed + refunded", client=client)
                 except Exception:
                     pass
             except Exception:
@@ -1929,7 +2083,8 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                             refund_credit(user_ctx.user_id)
                         except Exception:
                             pass
-                        await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", user_ctx.language), client=client)
+                        msg = _bridge.t("report.error.generic", user_ctx.language)
+                        await send_whatsapp_text(msisdn, f"{msg}\n\n❌ Failed + refunded", client=client)
                 except Exception:
                     pass
 

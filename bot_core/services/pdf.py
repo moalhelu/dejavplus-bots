@@ -129,7 +129,7 @@ def _get_pdf_block_resource_types() -> set[str]:
     return {p for p in parts if p in allowed}
 
 
-async def _ensure_page_configured(page) -> None:
+async def _ensure_page_configured(page, *, block_types_override: Optional[set[str]] = None) -> None:
     """Configure a pooled Playwright page once (idempotent)."""
 
     if not page:
@@ -141,13 +141,21 @@ async def _ensure_page_configured(page) -> None:
         # If we can't set attributes, just fall through and try config.
         pass
 
-    block_types = _get_pdf_block_resource_types()
+    block_types = block_types_override if block_types_override is not None else _get_pdf_block_resource_types()
     if not block_types:
         try:
             setattr(page, "_dv_pdf_configured", True)
         except Exception:
             pass
         return
+
+    # If already configured for a superset, don't redo routing.
+    try:
+        existing = getattr(page, "_dv_pdf_block_types", None)
+        if isinstance(existing, set) and existing.issuperset(block_types) and getattr(page, "_dv_pdf_configured", False):
+            return
+    except Exception:
+        pass
 
     async def _route_handler(route, request) -> None:  # pragma: no cover
         try:
@@ -171,6 +179,7 @@ async def _ensure_page_configured(page) -> None:
 
     try:
         setattr(page, "_dv_pdf_configured", True)
+        setattr(page, "_dv_pdf_block_types", set(block_types))
     except Exception:
         pass
 
@@ -179,7 +188,8 @@ _PDF_BROWSER = None
 _PDF_BROWSER_LOCK = asyncio.Lock()
 
 # Hard cap on total pages (idle + in-flight). Default is intentionally small.
-_PDF_PAGE_MAX = int(os.getenv("PDF_PAGE_MAX", "3") or 3)
+# Requirement: PDF render concurrency capped to 2 (env can override).
+_PDF_PAGE_MAX = int(os.getenv("PDF_PAGE_MAX", "2") or 2)
 _PDF_PAGE_MAX = max(1, min(_PDF_PAGE_MAX, 8))
 
 # Limit concurrent renders to the available page capacity.
@@ -446,6 +456,7 @@ async def html_to_pdf_bytes_chromium(
     wait_until: Optional[str] = None,
     fast_first_timeout_ms: Optional[int] = None,
     fast_first_wait_until: Optional[str] = None,
+    block_resource_types: Optional[set[str]] = None,
 ) -> Optional[bytes]:
     async def _once() -> Optional[bytes]:
         try:
@@ -459,7 +470,8 @@ async def html_to_pdf_bytes_chromium(
 
         effective_timeout_ms = int(timeout_ms) if timeout_ms is not None else _get_pdf_timeout_ms()
         effective_timeout_ms = max(1_000, min(effective_timeout_ms, 300_000))
-        block_types = sorted(_get_pdf_block_resource_types())
+        eff_block_types = block_resource_types if block_resource_types is not None else _get_pdf_block_resource_types()
+        block_types = sorted(eff_block_types)
         fast_first = _pdf_fast_first_enabled() and not _pdf_wait_until_was_explicitly_set()
         effective_fast_first_timeout_ms: Optional[int] = None
         if fast_first_timeout_ms is not None:
@@ -511,7 +523,7 @@ async def html_to_pdf_bytes_chromium(
                 if page is None:
                     raise RuntimeError("pdf_page_unavailable")
                 try:
-                    await _ensure_page_configured(page)
+                    await _ensure_page_configured(page, block_types_override=eff_block_types)
                     if url:
                         if fast_first:
                             try:
@@ -614,6 +626,7 @@ async def fetch_page_html_chromium(
     wait_until: Optional[str] = None,
     timeout_ms: Optional[int] = None,
     acquire_timeout_ms: Optional[int] = None,
+    block_resource_types: Optional[set[str]] = None,
 ) -> Optional[str]:
     """Fetch fully-rendered page HTML using the shared Chromium instance.
 
@@ -635,7 +648,8 @@ async def fetch_page_html_chromium(
 
         effective_timeout_ms = int(timeout_ms) if timeout_ms is not None else _get_pdf_timeout_ms()
         effective_timeout_ms = max(1_000, min(effective_timeout_ms, 300_000))
-        block_types = sorted(_get_pdf_block_resource_types())
+        eff_block_types = block_resource_types if block_resource_types is not None else _get_pdf_block_resource_types()
+        block_types = sorted(eff_block_types)
         async with atimed(
             "pdf.chromium.fetch_html",
             has_url=True,
@@ -660,7 +674,7 @@ async def fetch_page_html_chromium(
                 if page is None:
                     raise RuntimeError("pdf_page_unavailable")
                 try:
-                    await _ensure_page_configured(page)
+                    await _ensure_page_configured(page, block_types_override=eff_block_types)
                     try:
                         await page.goto(url, wait_until=effective_wait_until, timeout=effective_timeout_ms)
                     except PlaywrightTimeoutError:

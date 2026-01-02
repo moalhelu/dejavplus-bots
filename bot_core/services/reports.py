@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import aiohttp
+import hashlib
 import json
+import logging
 import os
 import re
 import time
 from dataclasses import dataclass, field
 from html import escape, unescape
+from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
 import aiohttp
@@ -26,6 +29,9 @@ except Exception:  # pragma: no cover - optional
 from bot_core.utils.vin import normalize_vin
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def _empty_errors() -> List[str]:
     return []
 
@@ -35,7 +41,7 @@ _HTTP_SESSION_LOCK = asyncio.Lock()
 _CARFAX_SEM = asyncio.Semaphore(15)
 _CARFAX_TIMEOUT = float(os.getenv("CARFAX_HTTP_TIMEOUT", "20") or 20)
 
-_REPORT_TOTAL_TIMEOUT_SEC = float(os.getenv("REPORT_TOTAL_TIMEOUT_SEC", "10") or 10)
+_REPORT_TOTAL_TIMEOUT_SEC = float(os.getenv("REPORT_TOTAL_TIMEOUT_SEC", "25") or 25)
 _REPORT_TOTAL_TIMEOUT_SEC = max(3.0, min(_REPORT_TOTAL_TIMEOUT_SEC, 60.0))
 
 # Backpressure: bound concurrent end-to-end report generation so heavy load doesn't
@@ -44,14 +50,165 @@ _REPORT_MAX_CONCURRENCY = int(os.getenv("REPORT_MAX_CONCURRENCY", "6") or 6)
 _REPORT_MAX_CONCURRENCY = max(1, min(_REPORT_MAX_CONCURRENCY, 50))
 _REPORT_GEN_SEM = asyncio.Semaphore(_REPORT_MAX_CONCURRENCY)
 
-_REPORT_QUEUE_TIMEOUT_SEC = float(os.getenv("REPORT_QUEUE_TIMEOUT_SEC", "1.0") or 1.0)
+_REPORT_QUEUE_TIMEOUT_SEC = float(os.getenv("REPORT_QUEUE_TIMEOUT_SEC", "15.0") or 15.0)
 _REPORT_QUEUE_TIMEOUT_SEC = max(0.05, min(_REPORT_QUEUE_TIMEOUT_SEC, 10.0))
+
+# Success-cache + in-flight de-dupe to avoid repeated expensive fetch/render when users retry
+# (e.g., due to impatience or webhook retries).
+_REPORT_CACHE_DIR = (os.getenv("REPORT_CACHE_DIR", "temp_static/report_cache") or "temp_static/report_cache").strip() or "temp_static/report_cache"
+_REPORT_CACHE_TTL_SEC = float(os.getenv("REPORT_CACHE_TTL_SEC", "86400") or 86400)  # 24h
+_REPORT_CACHE_TTL_SEC = max(60.0, min(_REPORT_CACHE_TTL_SEC, 7 * 86400.0))
+_REPORT_CACHE_MAX_BYTES = int(os.getenv("REPORT_CACHE_MAX_BYTES", str(250 * 1024 * 1024)) or (250 * 1024 * 1024))
+_REPORT_CACHE_MAX_BYTES = max(10 * 1024 * 1024, min(_REPORT_CACHE_MAX_BYTES, 5 * 1024 * 1024 * 1024))
+
+_INFLIGHT_LOCK = asyncio.Lock()
+_INFLIGHT: Dict[str, asyncio.Task[ReportResult]] = {}
+
+
+def _cache_key(vin: str, lang_code: str) -> str:
+    base = f"{normalize_vin(vin) or vin}:{(lang_code or 'en').lower()}"
+    return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _cache_paths(key: str) -> tuple[Path, Path]:
+    base = Path(_REPORT_CACHE_DIR)
+    return base / f"{key}.pdf", base / f"{key}.json"
+
+
+def _cache_cleanup_best_effort() -> None:
+    try:
+        base = Path(_REPORT_CACHE_DIR)
+        if not base.exists() or not base.is_dir():
+            return
+
+        entries: List[tuple[float, int, Path, Path]] = []
+        total = 0
+        now = time.time()
+        for meta_path in base.glob("*.json"):
+            try:
+                pdf_path = meta_path.with_suffix(".pdf")
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                ts = float(meta.get("ts") or 0.0)
+                if ts and (now - ts) > _REPORT_CACHE_TTL_SEC:
+                    try:
+                        meta_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        pdf_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue
+                size = int(meta.get("bytes") or (pdf_path.stat().st_size if pdf_path.exists() else 0))
+                total += size
+                entries.append((ts, size, pdf_path, meta_path))
+            except Exception:
+                continue
+
+        if total <= _REPORT_CACHE_MAX_BYTES:
+            return
+        # Evict oldest first.
+        entries.sort(key=lambda x: x[0] or 0.0)
+        for ts, size, pdf_path, meta_path in entries:
+            if total <= _REPORT_CACHE_MAX_BYTES:
+                break
+            try:
+                meta_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                pdf_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            total -= max(0, int(size))
+    except Exception:
+        return
+
+
+def _cache_get(vin: str, lang_code: str) -> Optional[bytes]:
+    try:
+        key = _cache_key(vin, lang_code)
+        pdf_path, meta_path = _cache_paths(key)
+        if not pdf_path.exists() or not meta_path.exists():
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        ts = float(meta.get("ts") or 0.0)
+        if not ts or (time.time() - ts) > _REPORT_CACHE_TTL_SEC:
+            try:
+                meta_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                pdf_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+        data = pdf_path.read_bytes()
+        if not _pdf_bytes_looks_ok(data):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _cache_put(vin: str, lang_code: str, pdf_bytes: bytes) -> None:
+    if not _pdf_bytes_looks_ok(pdf_bytes):
+        return
+    try:
+        base = Path(_REPORT_CACHE_DIR)
+        base.mkdir(parents=True, exist_ok=True)
+        key = _cache_key(vin, lang_code)
+        pdf_path, meta_path = _cache_paths(key)
+        pdf_path.write_bytes(pdf_bytes)
+        meta_path.write_text(
+            json.dumps({"ts": time.time(), "bytes": len(pdf_bytes)}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        _cache_cleanup_best_effort()
+    except Exception:
+        return
 
 _CARFAX_QUEUE_TIMEOUT_SEC = float(os.getenv("CARFAX_QUEUE_TIMEOUT_SEC", "1.0") or 1.0)
 _CARFAX_QUEUE_TIMEOUT_SEC = max(0.05, min(_CARFAX_QUEUE_TIMEOUT_SEC, 10.0))
 
 _PDF_QUEUE_TIMEOUT_MS = int(os.getenv("PDF_QUEUE_TIMEOUT_MS", "1500") or 1500)
 _PDF_QUEUE_TIMEOUT_MS = max(50, min(_PDF_QUEUE_TIMEOUT_MS, 30_000))
+
+# ---------------------------------------------------------------------------
+# Fast Mode budgets (strict per-stage timeboxes)
+# ---------------------------------------------------------------------------
+
+_FAST_MODE_ENABLED = (os.getenv("FAST_MODE_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "off"}
+
+_FETCH_BUDGET_SEC = float(os.getenv("FETCH_BUDGET_SEC", "8") or 8)
+_PDF_BUDGET_SEC = float(os.getenv("PDF_BUDGET_SEC", "3") or 3)
+_TRANSLATE_BUDGET_SEC = float(os.getenv("TRANSLATE_BUDGET_SEC", "2") or 2)
+_TOTAL_BUDGET_SEC = float(os.getenv("TOTAL_BUDGET_SEC", "10") or 10)
+
+_FETCH_BUDGET_SEC = max(0.5, min(_FETCH_BUDGET_SEC, 60.0))
+_PDF_BUDGET_SEC = max(0.5, min(_PDF_BUDGET_SEC, 60.0))
+_TRANSLATE_BUDGET_SEC = max(0.25, min(_TRANSLATE_BUDGET_SEC, 30.0))
+_TOTAL_BUDGET_SEC = max(1.0, min(_TOTAL_BUDGET_SEC, 120.0))
+
+
+def _budget_s(remaining_s: float, stage_budget_s: float) -> float:
+    return max(0.0, min(float(remaining_s), float(stage_budget_s)))
+
+
+def _make_fast_fallback_html(*, vin: str, language: str) -> str:
+    # Minimal, no external assets, renders fast even if the upstream HTML is slow.
+    lang_label = escape((language or "en").upper())
+    vin_safe = escape(vin)
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>VIN Report</title>"
+        "<style>body{font-family:Arial,sans-serif;margin:24px;}h1{font-size:18px;}p{font-size:12px;}</style>"
+        "</head><body>"
+        f"<h1>VIN Report</h1><p><b>VIN:</b> {vin_safe}</p><p><b>Language:</b> {lang_label}</p>"
+        "<p>This is a fast/light PDF delivered within a strict time budget. "
+        "If you need the localized version or photos, request the full report/options.</p>"
+        "</body></html>"
+    )
 
 
 def _carfax_parallel_primary_enabled() -> bool:
@@ -181,7 +338,7 @@ class ReportResult:
     raw_response: Optional[Dict[str, Any]] = None
 
 
-async def generate_vin_report(vin: str, *, language: str = "en") -> ReportResult:
+async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool = True) -> ReportResult:
     """Fetch a VIN report from the upstream API and return a PDF (if possible)."""
 
     lang_code = (language or "en").strip().lower()
@@ -189,50 +346,92 @@ async def generate_vin_report(vin: str, *, language: str = "en") -> ReportResult
     if not normalized_vin:
         return ReportResult(success=False, user_message=_t("report.invalid_vin", lang_code, "❌ رقم VIN غير صالح."), errors=["invalid_vin"])
 
-    # No caching / de-dupe: always fetch from upstream per request.
-    return await _generate_vin_report_inner(normalized_vin, lang_code)
+    cached = _cache_get(normalized_vin, lang_code)
+    if cached:
+        return ReportResult(
+            success=True,
+            pdf_bytes=cached,
+            pdf_filename=f"{normalized_vin}.pdf",
+            vin=normalized_vin,
+        )
+
+    effective_fast = bool(fast_mode) and _FAST_MODE_ENABLED
+    inflight_key = f"{normalized_vin}:{lang_code}:{'fast' if effective_fast else 'full'}"
+    async with _INFLIGHT_LOCK:
+        task = _INFLIGHT.get(inflight_key)
+        if task is None:
+            async def _runner() -> ReportResult:
+                try:
+                    result = await _generate_vin_report_inner(normalized_vin, lang_code, effective_fast)
+                    if result.success and result.pdf_bytes:
+                        _cache_put(normalized_vin, lang_code, result.pdf_bytes)
+                    return result
+                finally:
+                    async with _INFLIGHT_LOCK:
+                        existing = _INFLIGHT.get(inflight_key)
+                        if existing is not None and existing.done():
+                            _INFLIGHT.pop(inflight_key, None)
+
+            task = asyncio.create_task(_runner())
+            _INFLIGHT[inflight_key] = task
+
+    # Do not let a single waiter cancellation cancel the shared generation.
+    return await asyncio.shield(task)
 
 
-async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> ReportResult:
+async def _generate_vin_report_inner(normalized_vin: str, lang_code: str, fast_mode: bool) -> ReportResult:
     """Inner implementation for generate_vin_report (no caching)."""
 
     start_t = time.perf_counter()
-    deadline = start_t + _REPORT_TOTAL_TIMEOUT_SEC
+    total_budget = _TOTAL_BUDGET_SEC if fast_mode else _REPORT_TOTAL_TIMEOUT_SEC
+    deadline = start_t + float(total_budget)
 
     def _remaining_s() -> float:
         return max(0.0, deadline - time.perf_counter())
 
     # Fail fast under load instead of timing out late after progress reaches ~90%.
     try:
-        acquire_s = min(_REPORT_QUEUE_TIMEOUT_SEC, max(0.05, _remaining_s()))
+        queue_cap = 1.0 if fast_mode else _REPORT_QUEUE_TIMEOUT_SEC
+        acquire_s = min(queue_cap, max(0.05, _remaining_s()))
         await asyncio.wait_for(_REPORT_GEN_SEM.acquire(), timeout=acquire_s)
     except Exception:
         return ReportResult(
             success=False,
-            user_message=_t("report.error.busy", lang_code, "⚠️ السيرفر مشغول حالياً. جرّب بعد قليل."),
-            errors=["busy"],
+            user_message=_t("report.error.timeout", lang_code, "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد. جرّب مرة أخرى."),
+            errors=["queue_timeout"],
             vin=normalized_vin,
         )
 
     api_response: Dict[str, Any] = {}
     pdf_bytes: Optional[bytes] = None
+    skipped_translation = False
+    used_fallback_pdf = False
 
     try:
         prefer_non_pdf = lang_code != "en"
-        async with atimed("report.fetch", vin=normalized_vin, lang=lang_code, prefer_non_pdf=prefer_non_pdf):
+        fetch_budget = _budget_s(_remaining_s(), _FETCH_BUDGET_SEC) if fast_mode else _remaining_s()
+        async with atimed("report.fetch", vin=normalized_vin, lang=lang_code, prefer_non_pdf=prefer_non_pdf, budget_s=fetch_budget, fast=bool(fast_mode)):
             api_response = await _call_carfax_api(
                 normalized_vin,
                 prefer_non_pdf=prefer_non_pdf,
-                total_timeout_s=_remaining_s(),
+                total_timeout_s=fetch_budget,
                 deadline=deadline,
             )
+
+        LOGGER.info(
+            "report.fastmode fetch_done vin=%s lang=%s fast=%s remaining=%.2fs",
+            normalized_vin,
+            lang_code,
+            bool(fast_mode),
+            _remaining_s(),
+        )
 
         if not api_response.get("ok"):
             err = api_response.get("error") or f"HTTP_{api_response.get('status','NA')}"
             if str(err).lower() in {"busy", "queue_timeout", "deadline_exceeded"}:
                 return ReportResult(
                     success=False,
-                    user_message=_t("report.error.busy", lang_code, "⚠️ السيرفر مشغول حالياً. جرّب بعد قليل."),
+                    user_message=_t("report.error.timeout", lang_code, "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد. جرّب مرة أخرى."),
                     errors=[str(err)],
                     vin=normalized_vin,
                     raw_response=api_response,
@@ -262,16 +461,44 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> Rep
             api_response = {"ok": False, "error": "pdf_only_non_translatable"}
 
         try:
-            async with atimed("report.render_pdf", vin=normalized_vin, lang=lang_code):
-                pdf_bytes = await _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline)
+            pdf_budget = _budget_s(_remaining_s(), _PDF_BUDGET_SEC) if fast_mode else _remaining_s()
+            async with atimed("report.render_pdf", vin=normalized_vin, lang=lang_code, budget_s=pdf_budget, fast=bool(fast_mode)):
+                if fast_mode:
+                    pdf_bytes, skipped_translation = await asyncio.wait_for(
+                        _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline, fast_mode=True),
+                        timeout=max(0.25, pdf_budget),
+                    )
+                else:
+                    pdf_bytes, _ = await _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline, fast_mode=False)
         except PdfBusyError:
             return ReportResult(
                 success=False,
-                user_message=_t("report.error.busy", lang_code, "⚠️ السيرفر مشغول حالياً. جرّب بعد قليل."),
-                errors=["busy"],
+                user_message=_t("report.error.timeout", lang_code, "⚠️ تعذّر إكمال الطلب ضمن الوقت المحدد. جرّب مرة أخرى."),
+                errors=["pdf_busy"],
                 vin=normalized_vin,
                 raw_response=api_response,
             )
+        except asyncio.TimeoutError:
+            # Last-ditch: minimal local HTML (no external assets) within remaining time.
+            try:
+                rem = _remaining_s()
+                if rem > 0.25:
+                    fallback_html = _make_fast_fallback_html(vin=normalized_vin, language=lang_code)
+                    pdf_bytes = await asyncio.wait_for(
+                        html_to_pdf_bytes_chromium(
+                            html_str=fallback_html,
+                            timeout_ms=int(max(500, min(rem, 3.0)) * 1000),
+                            acquire_timeout_ms=_PDF_QUEUE_TIMEOUT_MS,
+                            wait_until="load",
+                            fast_first_timeout_ms=700,
+                            fast_first_wait_until="domcontentloaded",
+                            block_resource_types={"image", "media"},
+                        ),
+                        timeout=max(0.25, min(rem, 3.0)),
+                    )
+                    used_fallback_pdf = bool(pdf_bytes)
+            except Exception:
+                pdf_bytes = None
         if not pdf_bytes:
             return ReportResult(
                 success=False,
@@ -280,6 +507,30 @@ async def _generate_vin_report_inner(normalized_vin: str, lang_code: str) -> Rep
                 vin=normalized_vin,
                 raw_response=api_response,
             )
+
+        # Stash Fast Mode decisions into raw_response so delivery layers can message consistently
+        # *after* the PDF is actually delivered.
+        try:
+            api_response["_dv_fast"] = {
+                "fast_mode": bool(fast_mode),
+                "skipped_translation": bool(skipped_translation),
+                "used_fallback_pdf": bool(used_fallback_pdf),
+                "fetch_budget_s": float(_FETCH_BUDGET_SEC),
+                "translate_budget_s": float(_TRANSLATE_BUDGET_SEC),
+                "pdf_budget_s": float(_PDF_BUDGET_SEC),
+                "total_budget_s": float(_TOTAL_BUDGET_SEC if fast_mode else _REPORT_TOTAL_TIMEOUT_SEC),
+            }
+        except Exception:
+            pass
+
+        LOGGER.info(
+            "report.fastmode done vin=%s lang=%s fast=%s skipped_translation=%s fallback_pdf=%s",
+            normalized_vin,
+            lang_code,
+            bool(fast_mode),
+            bool(skipped_translation),
+            bool(used_fallback_pdf),
+        )
 
         result = ReportResult(
             success=True,
@@ -584,8 +835,16 @@ def _deadline_remaining_ms(deadline: Optional[float], *, floor_ms: int = 1_000, 
     return max(floor_ms, min(ms, cap_ms))
 
 
-async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language: str, *, deadline: Optional[float] = None) -> Optional[bytes]:
+async def _render_pdf_from_response(
+    response: Dict[str, Any],
+    vin: str,
+    language: str,
+    *,
+    deadline: Optional[float] = None,
+    fast_mode: bool = False,
+) -> tuple[Optional[bytes], bool]:
     pdf_bytes: Optional[bytes] = None
+    translation_skipped = False
     needs_translation = _needs_translation(language)
     json_payload = response.get("json")
 
@@ -593,29 +852,65 @@ async def _render_pdf_from_response(response: Dict[str, Any], vin: str, language
         extracted = _extract_html_or_url_from_json(json_payload)
         extracted_url = extracted.get("url")
         if extracted_url:
-            pdf_bytes = await _render_pdf_from_url(extracted_url, needs_translation, language, vin, deadline=deadline)
+            pdf_bytes, translation_skipped = await _render_pdf_from_url(
+                extracted_url,
+                needs_translation,
+                language,
+                vin,
+                deadline=deadline,
+                fast_mode=bool(fast_mode),
+            )
         else:
             html = extracted.get("html")
             if not html:
                 html = _json_to_html_report(json_payload, vin)
             # If the JSON included embedded HTML but no URL, base_url remains None.
-            pdf_bytes = await _render_pdf_from_html(html, needs_translation, language, base_url=extracted_url, deadline=deadline)
+            pdf_bytes, translation_skipped = await _render_pdf_from_html(
+                html,
+                needs_translation,
+                language,
+                base_url=extracted_url,
+                deadline=deadline,
+                fast_mode=bool(fast_mode),
+            )
     elif response.get("text"):
         text_payload = str(response["text"]).strip()
         if text_payload.startswith(("http://", "https://")):
-            pdf_bytes = await _render_pdf_from_url(text_payload, needs_translation, language, vin, deadline=deadline)
+            pdf_bytes, translation_skipped = await _render_pdf_from_url(
+                text_payload,
+                needs_translation,
+                language,
+                vin,
+                deadline=deadline,
+                fast_mode=bool(fast_mode),
+            )
         else:
             html = text_payload if text_payload.lower().startswith("<html") else (
                 f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3><pre style='white-space:pre-wrap'>{escape(text_payload)}</pre></body></html>"
             )
-            pdf_bytes = await _render_pdf_from_html(html, needs_translation, language, deadline=deadline)
+            pdf_bytes, translation_skipped = await _render_pdf_from_html(
+                html,
+                needs_translation,
+                language,
+                deadline=deadline,
+                fast_mode=bool(fast_mode),
+            )
 
-    return pdf_bytes
+    return pdf_bytes, bool(translation_skipped)
 
 
-async def _render_pdf_from_url(url: str, needs_translation: bool, language: str, vin: str, *, deadline: Optional[float] = None) -> Optional[bytes]:
+async def _render_pdf_from_url(
+    url: str,
+    needs_translation: bool,
+    language: str,
+    vin: str,
+    *,
+    deadline: Optional[float] = None,
+    fast_mode: bool = False,
+) -> tuple[Optional[bytes], bool]:
     html = None
     pdf_bytes = None
+    translation_skipped = False
 
     if needs_translation:
         # Chromium-only: fetch rendered HTML via Chromium (keeps styling + logo),
@@ -624,9 +919,10 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
             try:
                 return await fetch_page_html_chromium(
                     url,
-                    wait_until=_translated_fetch_wait_until(),
+                    wait_until=("domcontentloaded" if fast_mode else _translated_fetch_wait_until()),
                     timeout_ms=min(_translated_fetch_timeout_ms(), _deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=30_000)),
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+                    block_resource_types={"image", "media"} if fast_mode else None,
                 )
             except Exception:
                 return None
@@ -667,27 +963,55 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                 html = await fetch_page_html_chromium(
                     url,
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+                    wait_until=("domcontentloaded" if fast_mode else None),
+                    timeout_ms=(min(int(_FETCH_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=30_000)) if fast_mode else None),
+                    block_resource_types={"image", "media"} if fast_mode else None,
                 )
             except Exception:
                 html = None
 
         if html:
-            html = await _maybe_translate_html(html, language, deadline=deadline)
+            html, translated_ok = await _maybe_translate_html(html, language, deadline=deadline, budget_s=_TRANSLATE_BUDGET_SEC if fast_mode else None)
+            if not translated_ok:
+                translation_skipped = True
             if (language or "en").lower() in {"ar", "ku", "ckb"}:
                 html = inject_rtl(html, lang=language)
+                if fast_mode:
+                    pdf_bytes = await html_to_pdf_bytes_chromium(
+                        html_str=html,
+                        base_url=url,
+                        timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)),
+                        acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+                        wait_until="domcontentloaded",
+                        fast_first_timeout_ms=700,
+                        fast_first_wait_until="domcontentloaded",
+                        block_resource_types={"image", "media"},
+                    )
+                else:
+                    pdf_bytes = await html_to_pdf_bytes_chromium(
+                        html_str=html,
+                        base_url=url,
+                        timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
+                        acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+                    )
+        if not pdf_bytes:
+            # Last-resort: print the original URL without translation.
+            if fast_mode:
                 pdf_bytes = await html_to_pdf_bytes_chromium(
-                    html_str=html,
-                    base_url=url,
+                    url=url,
+                    timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)),
+                    acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+                    wait_until="domcontentloaded",
+                    fast_first_timeout_ms=700,
+                    fast_first_wait_until="domcontentloaded",
+                    block_resource_types={"image", "media"},
+                )
+            else:
+                pdf_bytes = await html_to_pdf_bytes_chromium(
+                    url=url,
                     timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                 )
-        if not pdf_bytes:
-            # Last-resort: print the original URL without translation.
-            pdf_bytes = await html_to_pdf_bytes_chromium(
-                url=url,
-                timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
-                acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
-            )
     else:
         lang_code = (language or "en").lower()
 
@@ -707,6 +1031,11 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                         html_str=html,
                         base_url=url,
                         acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+                        wait_until="domcontentloaded" if fast_mode else None,
+                        timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)) if fast_mode else None,
+                        fast_first_timeout_ms=700 if fast_mode else None,
+                        fast_first_wait_until="domcontentloaded" if fast_mode else None,
+                        block_resource_types={"image", "media"} if fast_mode else None,
                     )
                 return None
 
@@ -721,6 +1050,10 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
                     url=url,
                     timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+                    wait_until="domcontentloaded" if fast_mode else None,
+                    fast_first_timeout_ms=700 if fast_mode else None,
+                    fast_first_wait_until="domcontentloaded" if fast_mode else None,
+                    block_resource_types={"image", "media"} if fast_mode else None,
                 )
 
             http_task = asyncio.create_task(_http_html_render())
@@ -798,14 +1131,29 @@ async def _render_pdf_from_url(url: str, needs_translation: bool, language: str,
             f"<html><meta charset='utf-8'><body><h3>CarFax – {vin}</h3>"
             f"<a href='{escape(url)}'>{escape(url)}</a></body></html>"
         )
-        fallback = await _maybe_translate_html(fallback, language, deadline=deadline) if needs_translation else fallback
-        pdf_bytes = await html_to_pdf_bytes_chromium(
-            html_str=fallback,
-            base_url=url,
-            timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
-            acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
-        )
-    return pdf_bytes
+        if needs_translation:
+            fallback, translated_ok = await _maybe_translate_html(fallback, language, deadline=deadline, budget_s=_TRANSLATE_BUDGET_SEC if fast_mode else None)
+            if not translated_ok:
+                translation_skipped = True
+        if fast_mode:
+            pdf_bytes = await html_to_pdf_bytes_chromium(
+                html_str=fallback,
+                base_url=url,
+                timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)),
+                acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+                wait_until="domcontentloaded",
+                fast_first_timeout_ms=700,
+                fast_first_wait_until="domcontentloaded",
+                block_resource_types={"image", "media"},
+            )
+        else:
+            pdf_bytes = await html_to_pdf_bytes_chromium(
+                html_str=fallback,
+                base_url=url,
+                timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
+                acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+            )
+    return pdf_bytes, bool(translation_skipped)
 
 
 async def _render_pdf_from_html(
@@ -815,28 +1163,54 @@ async def _render_pdf_from_html(
     base_url: Optional[str] = None,
     *,
     deadline: Optional[float] = None,
-) -> Optional[bytes]:
+    fast_mode: bool = False,
+) -> tuple[Optional[bytes], bool]:
     if not html:
-        return None
-    translated = await _maybe_translate_html(html, language, deadline=deadline) if needs_translation else html
+        return None, False
+    translation_skipped = False
+    if needs_translation:
+        translated, translated_ok = await _maybe_translate_html(html, language, deadline=deadline, budget_s=_TRANSLATE_BUDGET_SEC if fast_mode else None)
+        if not translated_ok:
+            translation_skipped = True
+    else:
+        translated = html
     # Enforce RTL wrapper for Arabic/Kurdish even if translation fell back to original
     if (language or "en").lower() in {"ar", "ku", "ckb"}:
         translated = inject_rtl(translated, lang=language)
     # Chromium-only renderer.
-    return await html_to_pdf_bytes_chromium(
-        html_str=translated,
-        base_url=base_url,
-        timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
-        acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
-    )
+    if fast_mode:
+        pdf_bytes = await html_to_pdf_bytes_chromium(
+            html_str=translated,
+            base_url=base_url,
+            timeout_ms=min(int(_PDF_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000)),
+            acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+            wait_until="domcontentloaded",
+            fast_first_timeout_ms=700,
+            fast_first_wait_until="domcontentloaded",
+            block_resource_types={"image", "media"},
+        )
+    else:
+        pdf_bytes = await html_to_pdf_bytes_chromium(
+            html_str=translated,
+            base_url=base_url,
+            timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
+            acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
+        )
+    return pdf_bytes, bool(translation_skipped)
 
 
-async def _maybe_translate_html(html: Optional[str], lang: str, *, deadline: Optional[float] = None) -> str:
+async def _maybe_translate_html(
+    html: Optional[str],
+    lang: str,
+    *,
+    deadline: Optional[float] = None,
+    budget_s: Optional[float] = None,
+) -> tuple[str, bool]:
     if not html:
-        return ""
+        return "", False
     lang_code = (lang or "en").lower()
     if lang_code == "en":
-        return html
+        return html, False
 
     def _translation_looks_ok(src: str, out: Optional[str], target: str) -> bool:
         if not out:
@@ -863,6 +1237,8 @@ async def _maybe_translate_html(html: Optional[str], lang: str, *, deadline: Opt
         timeout_s = min(timeout_s, max(2.0, (deadline - time.perf_counter()) - 1.0))
     # Give a tiny bit of headroom so we don't cancel the translator right before success.
     hard_timeout = max(2.0, min(timeout_s + 2.0, 15.0))
+    if budget_s is not None:
+        hard_timeout = max(0.25, min(float(budget_s), hard_timeout))
 
     async def _primary() -> Optional[str]:
         try:
@@ -872,7 +1248,7 @@ async def _maybe_translate_html(html: Optional[str], lang: str, *, deadline: Opt
 
     async def _google_free() -> Optional[str]:
         try:
-            return await asyncio.wait_for(translate_html_google_free(html, lang_code), timeout=max(2.0, min(hard_timeout, 10.0)))
+            return await asyncio.wait_for(translate_html_google_free(html, lang_code), timeout=max(0.25, min(hard_timeout, 10.0)))
         except Exception:
             return None
 
@@ -890,10 +1266,10 @@ async def _maybe_translate_html(html: Optional[str], lang: str, *, deadline: Opt
                 if _translation_looks_ok(html, candidate, lang_code):
                     for p in pending:
                         p.cancel()
-                    return candidate
+                    return candidate, True
 
         # If neither produced a real translation, fall back to original with RTL wrapper.
-        return inject_rtl(html, lang=lang_code)
+        return inject_rtl(html, lang=lang_code), False
     finally:
         for t in (t1, t2):
             if not t.done():

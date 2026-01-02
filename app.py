@@ -1549,15 +1549,24 @@ def _render_usercard_text(u: Dict[str, Any], lang: Optional[str] = None) -> str:
 
 async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, stop_event: asyncio.Event):
     try:
-        # Fast progress feel: advance 10% every 0.5s up to 90%.
-        # Avoid showing 100% before completion; caller sets 100% at the end.
-        # The initial message is sent at 0% by the caller.
-        for p in range(10, 100, 10):
+        # Smooth progress feel without misleading 90%: cap at 80% until the
+        # handler explicitly raises the cap when we start sending the PDF.
+        p = 0
+        while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=0.5)
                 break
             except asyncio.TimeoutError:
                 pass
+
+            cap = 80
+            try:
+                cap = int(context.chat_data.get("progress_cap", 80) or 80)
+            except Exception:
+                cap = 80
+            cap = max(10, min(cap, 95))
+            step = 5 if cap <= 80 else 3
+            p = min(cap, p + step)
 
             bar = _make_progress_bar(p)
             try:
@@ -1573,7 +1582,6 @@ async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, me
                 except Exception:
                     pass
                 try:
-                    # Retry without HTML in case markup caused 400
                     header_plain = re.sub(r"<[^>]+>", "", context.chat_data.get("progress_header", ""))
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
@@ -1592,17 +1600,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     chat_state = context.chat_data if isinstance(context.chat_data, dict) else {}
     force_keyboard = _should_force_reply_keyboard(chat_state, ttl_seconds=0)
-    await _ensure_main_reply_keyboard(
-        update,
-        context,
-        force=force_keyboard,
-        notice=None,
-    )
+    await _ensure_main_reply_keyboard(update, context, force=force_keyboard, notice=None)
 
     bridge_user_ctx = _build_bridge_user_context(update, context)
     raw_payload = _bridge_raw_payload(update)
     welcome_text = None
-    bridge_response = None
     menu_response = None
 
     if bridge_user_ctx:
@@ -5030,6 +5032,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cleanup_paths.append(path)
 
         stop_event = asyncio.Event()
+        context.chat_data["progress_cap"] = 80
         progress_task = asyncio.create_task(_progress_updater(context, update.effective_chat.id, msg.message_id, stop_event))
         report_result: Optional[_ReportResult] = None
         bridge_pdf_path: Optional[str] = None
@@ -5089,7 +5092,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except asyncio.TimeoutError:
                     report_result = _ReportResult(
                         success=False,
-                        user_message=_bridge.t("report.error.busy", report_lang),
+                        user_message=_bridge.t("report.error.timeout", report_lang),
                         errors=["timeout"],
                         vin=vin,
                     )
@@ -5133,7 +5136,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lang=report_lang,
                 )
                 refund_note = _bridge.t("report.refund.note", report_lang)
-                failure_note = f"\n\n{escape(err_text)}{refund_note}"
+                # Terminal finalizer: always end with the exact failure marker.
+                failure_note = f"\n\n{escape(err_text)}{refund_note}\n\n❌ Failed + refunded"
                 try:
                     await msg.edit_text(refreshed_header + "\n" + _make_progress_bar(100) + failure_note, parse_mode=ParseMode.HTML)
                 except Exception:
@@ -5154,19 +5158,45 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if bridge_pdf_path and os.path.exists(bridge_pdf_path):
                     pdf_local_path = bridge_pdf_path
                 else:
-                    pdf_local_path = report_result.pdf_filename or f"{vin}.pdf"
-                    with open(pdf_local_path, "wb") as f:
-                        f.write(report_result.pdf_bytes)
-                _register_cleanup(pdf_local_path)
+                    pdf_local_path = None
+
                 try:
-                    await asyncio.wait_for(
-                        _send_pdf_file(context, update.effective_chat.id, pdf_local_path, f"📄 تقرير VIN <code>{vin}</code>"),
-                        timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=10.0)),
-                    )
+                    # We are now past generation and entering the upload/send phase.
+                    context.chat_data["progress_cap"] = 95
+                    if pdf_local_path:
+                        _register_cleanup(pdf_local_path)
+                        await asyncio.wait_for(
+                            _send_pdf_file(context, update.effective_chat.id, pdf_local_path, f"📄 تقرير VIN <code>{vin}</code>"),
+                            timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=10.0)),
+                        )
+                    else:
+                        bio = BytesIO(bytes(report_result.pdf_bytes))
+                        bio.name = report_result.pdf_filename or f"{vin}.pdf"
+                        try:
+                            from bot_core.telemetry import atimed
+                        except Exception:
+                            atimed = None
+                        if atimed:
+                            async with atimed("tg.send_document", bytes=len(report_result.pdf_bytes), via="bytes"):
+                                await context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=bio,
+                                    filename=bio.name,
+                                    caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                    parse_mode=ParseMode.HTML,
+                                )
+                        else:
+                            await context.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=bio,
+                                filename=bio.name,
+                                caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                parse_mode=ParseMode.HTML,
+                            )
                 except asyncio.TimeoutError:
                     report_result = _ReportResult(
                         success=False,
-                        user_message=_bridge.t("report.error.busy", report_lang),
+                        user_message=_bridge.t("report.error.timeout", report_lang),
                         errors=["send_timeout"],
                         vin=vin,
                     )
@@ -5192,18 +5222,35 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lang=report_lang,
                 )
                 note = delivery_note or _bridge.t("report.success.note", report_lang)
+
+                # Fast Mode post-delivery notes (kept before the terminal line).
+                extra_notes: List[str] = []
+                try:
+                    rr = getattr(report_result, "raw_response", None)
+                    if isinstance(rr, dict):
+                        dv = rr.get("_dv_fast") or {}
+                        if isinstance(dv, dict) and dv.get("skipped_translation") and (report_lang or "en").lower() != "en":
+                            extra_notes.append("🌐 Sent English due to time budget. You can request a localized version.")
+                        if isinstance(dv, dict) and dv.get("used_fallback_pdf"):
+                            extra_notes.append("⚡ Fast/light PDF (assets skipped).")
+                except Exception:
+                    pass
+
+                extra_block = ""
+                if extra_notes:
+                    extra_block = "\n" + "\n".join(extra_notes)
                 try:
                     # Always end on an explicit "completed" state.
                     # We edit the same progress message to avoid leaving it at 90%.
                     await msg.edit_text(
-                        success_header + "\n" + _make_progress_bar(100) + "\n\n✅ Report ready (100%)" + note,
+                        success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block + "\n\n✅ Delivered (PDF)",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
                     # If editing fails (e.g., message no longer editable), send a final
                     # completion message anyway so the user always sees 100%.
                     try:
-                        await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Report ready (100%)")
+                        await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Delivered (PDF)")
                     except Exception:
                         pass
                 context.chat_data["progress_header"] = success_header
@@ -5234,7 +5281,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lang=report_lang,
                 )
                 try:
-                    pdf_failure_note = "\n\n" + _bridge.t("report.error.pdf", report_lang) + _bridge.t("report.refund.note", report_lang)
+                    pdf_failure_note = "\n\n" + _bridge.t("report.error.pdf", report_lang) + _bridge.t("report.refund.note", report_lang) + "\n\n❌ Failed + refunded"
                     await msg.edit_text(
                         refreshed_header + "\n" + _make_progress_bar(100) + pdf_failure_note,
                         parse_mode=ParseMode.HTML,

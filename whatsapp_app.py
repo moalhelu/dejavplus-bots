@@ -1868,9 +1868,9 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
         vin = _extract_first_vin(str(filename)) or _extract_first_vin(str(caption))
         if not vin:
             return True
-        ok, reason = validate_pdf_format(raw_bytes, expected_vin=vin)
-        if not ok:
-            LOGGER.warning("Blocked PDF send due to format mismatch vin=%s reason=%s", vin, reason)
+        chk = validate_pdf_format(raw_bytes, expected_vin=vin)
+        if not chk.ok:
+            LOGGER.warning("Blocked PDF send due to format mismatch vin=%s reason=%s", vin, chk.reason)
             return False
         return True
 

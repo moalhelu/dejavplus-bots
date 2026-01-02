@@ -68,26 +68,65 @@ def validate_pdf_format(
     head_text = _extract_first_page_text(pdf_bytes)
     low = _normalize_text(head_text)
 
-    # If we can't extract text at all, be conservative and fail.
-    if not low:
-        return PdfFormatCheck(False, "no_text_extracted", extracted_head=head_text)
+    # Fallback: when text extraction fails (missing pypdf, image-only, etc.),
+    # use raw-byte token checks to avoid false negatives that would break production.
+    raw_head = pdf_bytes[:400_000]
+    raw_low: Optional[bytes]
+    try:
+        raw_low = raw_head.lower()
+    except Exception:
+        raw_low = None
 
     for bad in _FORBIDDEN_PHRASES:
-        if bad and bad in low:
+        if not bad:
+            continue
+        if low and bad in low:
             return PdfFormatCheck(False, f"forbidden:{bad}", extracted_head=head_text)
+        if raw_low is not None:
+            try:
+                if bad.encode("utf-8", errors="ignore") in raw_low:
+                    return PdfFormatCheck(False, f"forbidden:{bad}", extracted_head=head_text)
+            except Exception:
+                pass
+
+    # Official tokens required for base report correctness.
+    # Prefer extracted text; fallback to raw bytes if extraction fails.
+    def _has_token(token: str) -> bool:
+        if not token:
+            return False
+        t = token.lower().strip()
+        if low and t in low:
+            return True
+        if raw_low is not None:
+            try:
+                return t.encode("utf-8", errors="ignore") in raw_low
+            except Exception:
+                return False
+        return False
 
     # Official tokens required for base report correctness.
     if require_official_tokens:
-        if "carfax" not in low:
+        if not _has_token("carfax"):
             return PdfFormatCheck(False, "missing:carfax", extracted_head=head_text)
-        if "vehicle history report" not in low:
+        if not _has_token("vehicle history report"):
             return PdfFormatCheck(False, "missing:vehicle_history_report", extracted_head=head_text)
 
     if expected_vin:
-        # VIN may appear with/without spaces; do a loose contains.
+        # VIN may appear with/without spaces; check text if available, else fall back to raw bytes.
         vin = re.sub(r"\s+", "", expected_vin).upper()
-        compact = re.sub(r"\s+", "", head_text).upper()
-        if vin and vin not in compact:
-            return PdfFormatCheck(False, "missing:vin", extracted_head=head_text)
+        if vin:
+            ok_vin = False
+            if head_text:
+                compact = re.sub(r"\s+", "", head_text).upper()
+                if vin in compact:
+                    ok_vin = True
+            if not ok_vin:
+                try:
+                    if vin.encode("ascii", errors="ignore") in raw_head.upper():
+                        ok_vin = True
+                except Exception:
+                    pass
+            if not ok_vin:
+                return PdfFormatCheck(False, "missing:vin", extracted_head=head_text)
 
     return PdfFormatCheck(True, "ok", extracted_head=head_text)

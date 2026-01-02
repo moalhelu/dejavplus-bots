@@ -5246,12 +5246,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     pdf_local_path = None
 
-                ok, reason = validate_pdf_format(bytes(report_result.pdf_bytes), expected_vin=vin)
-                if not ok:
+                chk = validate_pdf_format(bytes(report_result.pdf_bytes), expected_vin=vin)
+                if not chk.ok:
                     report_result = _ReportResult(
                         success=False,
                         user_message=_bridge.t("report.error.generic", report_lang),
-                        errors=[f"pdf_format:{reason}"],
+                        errors=[f"pdf_format:{chk.reason}"],
                         vin=vin,
                     )
                 else:
@@ -5399,8 +5399,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 cm.__enter__()
                             full = await _generate_vin_report(vin, language=requested_lang, fast_mode=False)
                             if full and getattr(full, "success", False) and getattr(full, "pdf_bytes", None):
-                                ok2, _ = validate_pdf_format(bytes(full.pdf_bytes), expected_vin=vin)
-                                if not ok2:
+                                chk2 = validate_pdf_format(bytes(full.pdf_bytes), expected_vin=vin)
+                                if not chk2.ok:
                                     return
                                 bio2 = BytesIO(bytes(full.pdf_bytes))
                                 bio2.name = getattr(full, "pdf_filename", None) or f"{vin}.pdf"

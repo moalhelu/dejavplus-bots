@@ -327,6 +327,19 @@ class ReportResult:
     vin: Optional[str] = None
     errors: List[str] = field(default_factory=_empty_errors)
     raw_response: Optional[Dict[str, Any]] = None
+    error_class: Optional[str] = None
+
+
+ERROR_UPSTREAM_FETCH_FAILED = "UPSTREAM_FETCH_FAILED"
+ERROR_PDF_RENDER_FAILED = "PDF_RENDER_FAILED"
+
+
+class UpstreamFetchFailed(RuntimeError):
+    pass
+
+
+class PdfRenderFailed(RuntimeError):
+    pass
 
 
 async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool = True) -> ReportResult:
@@ -417,17 +430,33 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
     cache_hit_lang = False
 
     try:
-        # Base FAST delivery: always fetch official PDF bytes.
-        prefer_non_pdf = False if fast_mode else ((requested_lang or "en") != "en")
+        # Primary path (ALL modes): fetch official upstream PDF bytes whenever possible.
+        # Playwright rendering is a last resort.
+        prefer_non_pdf = False
         fetch_budget = _budget_s(_remaining_s(), _FETCH_BUDGET_SEC) if fast_mode else _remaining_s()
         t_fetch0 = time.perf_counter()
         async with atimed("report.fetch", vin=normalized_vin, lang=requested_lang, prefer_non_pdf=prefer_non_pdf, budget_s=fetch_budget, fast=bool(fast_mode)):
-            api_response = await _call_carfax_api(
+            # First: try official PDF bytes.
+            pdf_primary = await fetch_report_pdf_bytes(
                 normalized_vin,
-                prefer_non_pdf=prefer_non_pdf,
+                options=None,
+                lang=(requested_lang or "en"),
                 total_timeout_s=fetch_budget,
                 deadline=deadline,
+                force_fresh=False,
             )
+
+            if pdf_primary:
+                api_response = {"ok": True, "pdf_bytes": pdf_primary, "filename": f"{normalized_vin}.pdf"}
+            else:
+                # Fallback: fetch JSON/HTML metadata from upstream.
+                prefer_non_pdf = (not fast_mode) and ((requested_lang or "en") != "en")
+                api_response = await _call_carfax_api(
+                    normalized_vin,
+                    prefer_non_pdf=prefer_non_pdf,
+                    total_timeout_s=fetch_budget,
+                    deadline=deadline,
+                )
         fetch_sec = max(0.0, time.perf_counter() - t_fetch0)
 
         LOGGER.info(
@@ -447,6 +476,7 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
                     errors=[str(err)],
                     vin=normalized_vin,
                     raw_response=api_response,
+                    error_class=ERROR_UPSTREAM_FETCH_FAILED,
                 )
             return ReportResult(
                 success=False,
@@ -454,19 +484,86 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
                 errors=[str(err)],
                 vin=normalized_vin,
                 raw_response=api_response,
+                error_class=ERROR_UPSTREAM_FETCH_FAILED,
             )
 
-        # FAST/base path: accept only official upstream PDF bytes.
-        if fast_mode:
-            pdf_bytes = api_response.get("pdf_bytes")
-            if not pdf_bytes:
+        # If we have official upstream PDF bytes, use them immediately for ALL modes.
+        pdf_bytes = api_response.get("pdf_bytes")
+        if pdf_bytes:
+            # Validate official format gate BEFORE returning.
+            chk = validate_pdf_format(bytes(pdf_bytes), expected_vin=normalized_vin, require_official_tokens=True)
+            if not chk.ok:
+                # One fresh retry (best-effort) to avoid cached/bad upstream variants.
+                retry_budget = max(0.25, _remaining_s())
+                try:
+                    pdf2 = await fetch_report_pdf_bytes(
+                        normalized_vin,
+                        options=None,
+                        lang=(requested_lang or "en"),
+                        total_timeout_s=retry_budget,
+                        deadline=deadline,
+                        force_fresh=True,
+                    )
+                    if pdf2:
+                        chk2 = validate_pdf_format(bytes(pdf2), expected_vin=normalized_vin, require_official_tokens=True)
+                        if chk2.ok:
+                            pdf_bytes = pdf2
+                            chk = chk2
+                except Exception:
+                    pass
+
+            if not chk.ok:
                 return ReportResult(
                     success=False,
-                    user_message=_t("report.error.timeout", requested_lang, "⚠️ تعذّر إكمال الطلب ضمن SLA الوقت."),
-                    errors=["no_pdf"],
+                    user_message=_t("report.error.generic", requested_lang, "⚠️ تعذّر إكمال الطلب."),
+                    errors=[f"format_mismatch:{chk.reason}"],
                     vin=normalized_vin,
                     raw_response=api_response,
+                    error_class=ERROR_UPSTREAM_FETCH_FAILED,
                 )
+
+            # If requested language != EN, deliver official report (EN) and mark translation as skipped.
+            if (requested_lang or "en") != "en":
+                skipped_translation = True
+                delivered_lang = "en"
+
+            try:
+                api_response.setdefault("_dv_fast", {})
+                api_response["_dv_fast"].update(
+                    {
+                        "fast_mode": bool(fast_mode),
+                        "skipped_translation": bool(skipped_translation),
+                        "requested_lang": (requested_lang or "en"),
+                        "delivered_lang": delivered_lang,
+                        "format_ok": True,
+                        "fetch_sec": round(float(fetch_sec), 3),
+                        "pdf_sec": 0.0,
+                        "total_sec": round(float(time.perf_counter() - start_t), 3),
+                    }
+                )
+            except Exception:
+                pass
+
+            filename = api_response.get("filename", f"{normalized_vin}.pdf")
+            return ReportResult(
+                success=True,
+                user_message=_t("report.success.pdf_direct", requested_lang, "✅ Report ready."),
+                pdf_bytes=bytes(pdf_bytes),
+                pdf_filename=filename,
+                vin=normalized_vin,
+                raw_response=api_response,
+            )
+
+        # FAST SLA: if upstream did not provide PDF bytes, treat as upstream fetch failure.
+        if fast_mode:
+            return ReportResult(
+                success=False,
+                user_message=_t("report.error.fetch", requested_lang, "⚠️ Failed to fetch report from upstream."),
+                errors=["no_pdf"],
+                vin=normalized_vin,
+                raw_response=api_response,
+                error_class=ERROR_UPSTREAM_FETCH_FAILED,
+            )
 
             # Validate official format gate BEFORE returning.
             chk = validate_pdf_format(bytes(pdf_bytes), expected_vin=normalized_vin, require_official_tokens=True)
@@ -558,6 +655,25 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
                     )
                 else:
                     pdf_bytes, _ = await _render_pdf_from_response(api_response, normalized_vin, lang_code, deadline=deadline, fast_mode=False)
+        except UpstreamFetchFailed as exc:
+            try:
+                LOGGER.warning(
+                    "report upstream fetch failed rid=%s vin=%s error_class=%s reason=%s",
+                    get_rid() or "-",
+                    normalized_vin,
+                    ERROR_UPSTREAM_FETCH_FAILED,
+                    str(exc),
+                )
+            except Exception:
+                pass
+            return ReportResult(
+                success=False,
+                user_message=_t("report.error.fetch", lang_code, "⚠️ Failed to fetch report from upstream."),
+                errors=["upstream_fetch_failed"],
+                vin=normalized_vin,
+                raw_response=api_response,
+                error_class=ERROR_UPSTREAM_FETCH_FAILED,
+            )
         except PdfBusyError:
             # Fast SLA: perform ONE reset+retry if the PDF engine is saturated.
             if fast_mode:
@@ -580,6 +696,7 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
                     errors=["pdf_busy"],
                     vin=normalized_vin,
                     raw_response=api_response,
+                    error_class=ERROR_PDF_RENDER_FAILED,
                 )
         except asyncio.TimeoutError:
             pdf_timed_out = True
@@ -592,14 +709,16 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
                 errors=["pdf_timeout"],
                 vin=normalized_vin,
                 raw_response=api_response,
+                error_class=ERROR_PDF_RENDER_FAILED,
             )
         if not pdf_bytes:
             return ReportResult(
                 success=False,
-                user_message=_t("report.error.pdf_render", lang_code, "⚠️ تعذّر تحويل التقرير إلى PDF."),
+                user_message=_t("report.error.pdf_render", lang_code, "⚠️ Failed to generate PDF."),
                 errors=["pdf_generation_failed"],
                 vin=normalized_vin,
                 raw_response=api_response,
+                error_class=ERROR_PDF_RENDER_FAILED,
             )
 
         # Language SLA policy:
@@ -733,26 +852,174 @@ async def _call_carfax_api(
     async def _handle(resp: aiohttp.ClientResponse) -> Dict[str, Any]:
         status = resp.status
         ctype = (resp.headers.get("Content-Type", "") or "").lower()
+        final_url = str(getattr(resp, "url", "") or "")
         if status not in (200, 201):
             try:
                 txt = await resp.text()
             except Exception:
                 txt = ""
-            return {"ok": False, "status": status, "ctype": ctype, "err_text": txt}
+            return {"ok": False, "status": status, "ctype": ctype, "err_text": txt, "final_url": final_url}
         if "application/pdf" in ctype:
             if prefer_non_pdf:
-                return {"ok": False, "status": status, "ctype": ctype, "error": "pdf_returned"}
+                return {"ok": False, "status": status, "ctype": ctype, "error": "pdf_returned", "final_url": final_url}
             data = await resp.read()
-            return {"ok": True, "pdf_bytes": data, "filename": f"{vin}.pdf"}
+            return {"ok": True, "pdf_bytes": data, "filename": f"{vin}.pdf", "status": status, "final_url": final_url}
         if "application/json" in ctype:
             try:
                 data = await resp.json()
-                return {"ok": True, "json": data}
+                return {"ok": True, "json": data, "status": status, "final_url": final_url}
             except Exception:
                 txt = await resp.text()
-                return {"ok": True, "text": txt}
+                return {"ok": True, "text": txt, "status": status, "final_url": final_url}
         txt = await resp.text()
-        return {"ok": True, "text": txt}
+        return {"ok": True, "text": txt, "status": status, "final_url": final_url}
+
+
+async def fetch_report_pdf_bytes(
+    vin: str,
+    options: Optional[Dict[str, Any]] = None,
+    lang: str = "en",
+    *,
+    total_timeout_s: Optional[float] = None,
+    deadline: Optional[float] = None,
+    force_fresh: bool = False,
+) -> Optional[bytes]:
+    """Primary path: request official upstream PDF bytes when possible.
+
+    Uses the same upstream API endpoint(s) as `_call_carfax_api` but forces
+    `Accept: application/pdf`.
+    """
+
+    rid = get_rid() or "-"
+    # NOTE: options/lang are currently best-effort metadata only. Upstream may ignore them.
+    try:
+        if options:
+            # Keep stable: do not mutate upstream payload format here.
+            pass
+    except Exception:
+        pass
+
+    api_response = await _call_carfax_api(
+        vin,
+        prefer_non_pdf=False,
+        total_timeout_s=total_timeout_s,
+        deadline=deadline,
+        force_fresh=force_fresh,
+    )
+
+    status = api_response.get("status")
+    final_url = api_response.get("final_url")
+    pdf_bytes = api_response.get("pdf_bytes")
+    try:
+        LOGGER.info(
+            "upstream_pdf_fetch rid=%s vin=%s fetch_status=%s fetch_final_url=%s pdf_bytes_len=%s",
+            rid,
+            vin,
+            status if status is not None else "na",
+            final_url or "-",
+            len(pdf_bytes) if isinstance(pdf_bytes, (bytes, bytearray)) else 0,
+        )
+    except Exception:
+        pass
+
+    if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes.startswith(b"%PDF"):
+        return bytes(pdf_bytes)
+    return None
+
+
+def _sanitize_html_head(text: str, limit: int = 200) -> str:
+    try:
+        raw = (text or "").strip()
+        raw = re.sub(r"\s+", " ", raw)
+        raw = raw.replace("\x00", "")
+        if len(raw) > limit:
+            raw = raw[:limit]
+        return raw
+    except Exception:
+        return ""
+
+
+def _looks_like_login_or_error_page(html: str) -> bool:
+    low = (html or "").lower()
+    tokens = (
+        "access denied",
+        "forbidden",
+        "unauthorized",
+        "login",
+        "sign in",
+        "cloudflare",
+        "captcha",
+        "human verification",
+        "not found",
+        "404",
+        "403",
+        "rate limited",
+        "temporarily unavailable",
+    )
+    return any(t in low for t in tokens)
+
+
+async def _fetch_html_http_validated(
+    url: str,
+    *,
+    deadline: Optional[float] = None,
+    timeout_s: float = 8.0,
+    max_bytes: int = 250_000,
+) -> Dict[str, Any]:
+    """HTTP-only HTML fetch with strict validation before rendering."""
+
+    rid = get_rid() or "-"
+    session = await _get_http_session()
+
+    # Timebox relative to deadline.
+    eff_timeout = float(timeout_s)
+    if deadline is not None:
+        rem = max(0.0, float(deadline) - time.perf_counter())
+        eff_timeout = min(eff_timeout, max(0.5, rem - 0.25))
+    eff_timeout = max(0.5, min(eff_timeout, 20.0))
+    request_timeout = aiohttp.ClientTimeout(total=eff_timeout)
+
+    try:
+        async with atimed("upstream.html_fetch", url_host=(url.split("/", 3)[2] if "//" in url else "")):
+            async with session.get(url, allow_redirects=True, timeout=request_timeout) as resp:
+                status = int(resp.status)
+                final_url = str(getattr(resp, "url", "") or "")
+                # Read limited bytes to avoid huge pages.
+                body = await resp.content.read(max_bytes)
+                try:
+                    html = body.decode(resp.charset or "utf-8", errors="ignore")
+                except Exception:
+                    html = body.decode("utf-8", errors="ignore")
+
+                head = _sanitize_html_head(html, limit=200)
+                try:
+                    LOGGER.info(
+                        "upstream_html rid=%s fetch_status=%s fetch_final_url=%s html_bytes_len=%s html_head=%s",
+                        rid,
+                        status,
+                        final_url or "-",
+                        len(body) if body is not None else 0,
+                        head,
+                    )
+                except Exception:
+                    pass
+
+                if status != 200:
+                    raise UpstreamFetchFailed(f"status_{status}")
+                if _looks_like_login_or_error_page(html):
+                    raise UpstreamFetchFailed("login_or_error_page")
+
+                return {
+                    "ok": True,
+                    "status": status,
+                    "final_url": final_url,
+                    "html": html,
+                    "html_bytes_len": len(body) if body is not None else 0,
+                }
+    except UpstreamFetchFailed:
+        raise
+    except Exception as exc:
+        raise UpstreamFetchFailed(str(exc))
 
     async def _try_get() -> Optional[Dict[str, Any]]:
         try:
@@ -1055,6 +1322,16 @@ async def _render_pdf_from_url(
     pdf_bytes = None
     translation_skipped = False
 
+    # Validate upstream URL fetch via HTTP (status, redirects, login/error pages) before rendering.
+    # This prevents misclassifying upstream 403/404/login pages as "PDF failed".
+    validated = await _fetch_html_http_validated(
+        url,
+        deadline=deadline,
+        timeout_s=(2.5 if fast_mode else 6.0),
+        max_bytes=250_000,
+    )
+    final_url = str(validated.get("final_url") or url)
+
     if needs_translation:
         # Chromium-only: fetch rendered HTML via Chromium (keeps styling + logo),
         # translate + inject RTL, then print to PDF.
@@ -1072,7 +1349,10 @@ async def _render_pdf_from_url(
 
         async def _http_only() -> Optional[str]:
             try:
-                return await _fetch_page_html_http_only(url)
+                # Reuse validated HTML first.
+                if validated.get("html"):
+                    return str(validated.get("html"))
+                return await _fetch_page_html_http_only(final_url)
             except Exception:
                 return None
 
@@ -1104,7 +1384,7 @@ async def _render_pdf_from_url(
         if not html:
             try:
                 html = await fetch_page_html_chromium(
-                    url,
+                    final_url,
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                     wait_until=("domcontentloaded" if fast_mode else None),
                     timeout_ms=(min(int(_FETCH_BUDGET_SEC * 1000), _deadline_remaining_ms(deadline, floor_ms=700, cap_ms=30_000)) if fast_mode else None),
@@ -1123,7 +1403,7 @@ async def _render_pdf_from_url(
                 if fast_mode:
                     pdf_bytes = await html_to_pdf_bytes_chromium(
                         html_str=html,
-                        base_url=url,
+                        base_url=final_url,
                         timeout_ms=_deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000),
                         acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                         wait_until="domcontentloaded",
@@ -1134,7 +1414,7 @@ async def _render_pdf_from_url(
                 else:
                     pdf_bytes = await html_to_pdf_bytes_chromium(
                         html_str=html,
-                        base_url=url,
+                        base_url=final_url,
                         timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
                         acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                     )
@@ -1142,7 +1422,7 @@ async def _render_pdf_from_url(
             # Last-resort: print the original URL without translation.
             if fast_mode:
                 pdf_bytes = await html_to_pdf_bytes_chromium(
-                    url=url,
+                    url=final_url,
                     timeout_ms=_deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000),
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                     wait_until="domcontentloaded",
@@ -1152,7 +1432,7 @@ async def _render_pdf_from_url(
                 )
             else:
                 pdf_bytes = await html_to_pdf_bytes_chromium(
-                    url=url,
+                    url=final_url,
                     timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                 )
@@ -1167,13 +1447,16 @@ async def _render_pdf_from_url(
                 nonlocal html
                 try:
                     async with atimed("report.fetch_html", vin=vin, lang=language, mode="http"):
-                        html = await _fetch_page_html_http_only(url)
+                        if validated.get("html"):
+                            html = str(validated.get("html"))
+                        else:
+                            html = await _fetch_page_html_http_only(final_url)
                 except Exception:
                     html = None
                 if html and _html_looks_renderable(html):
                     return await html_to_pdf_bytes_chromium(
                         html_str=html,
-                        base_url=url,
+                        base_url=final_url,
                         acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                         wait_until="domcontentloaded" if fast_mode else None,
                         timeout_ms=_deadline_remaining_ms(deadline, floor_ms=700, cap_ms=120_000) if fast_mode else None,
@@ -1191,7 +1474,7 @@ async def _render_pdf_from_url(
                     except Exception:
                         pass
                 return await html_to_pdf_bytes_chromium(
-                    url=url,
+                    url=final_url,
                     timeout_ms=_deadline_remaining_ms(deadline, floor_ms=2_000, cap_ms=120_000),
                     acquire_timeout_ms=min(_PDF_QUEUE_TIMEOUT_MS, _deadline_remaining_ms(deadline, floor_ms=100, cap_ms=30_000)),
                     wait_until="domcontentloaded" if fast_mode else None,

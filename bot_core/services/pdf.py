@@ -15,7 +15,7 @@ import logging
 from urllib.parse import urlparse
 from typing import Optional, List
 
-from bot_core.telemetry import atimed
+from bot_core.telemetry import atimed, get_rid
 
 
 LOGGER = logging.getLogger(__name__)
@@ -187,10 +187,12 @@ _PDF_PLAYWRIGHT = None
 _PDF_BROWSER = None
 _PDF_BROWSER_LOCK = asyncio.Lock()
 
-# Hard cap on total pages (idle + in-flight). Default is intentionally small.
-# Requirement: PDF render concurrency capped to 2 (env can override).
-_PDF_PAGE_MAX = int(os.getenv("PDF_PAGE_MAX", "2") or 2)
-_PDF_PAGE_MAX = max(1, min(_PDF_PAGE_MAX, 8))
+# Hard cap on total pages (idle + in-flight).
+# Production stability requirement: global PDF render concurrency must be 1.
+_PDF_PAGE_MAX = int(os.getenv("PDF_PAGE_MAX", "1") or 1)
+if _PDF_PAGE_MAX != 1:
+    # Enforce stability contract even if env overrides.
+    _PDF_PAGE_MAX = 1
 
 # Limit concurrent renders to the available page capacity.
 _PDF_RENDER_SEM = asyncio.Semaphore(_PDF_PAGE_MAX)
@@ -314,6 +316,12 @@ async def prewarm_pdf_engine() -> None:
                         await page.close()
                     except Exception:
                         pass
+                    finally:
+                        try:
+                            if getattr(page, "_dv_pdf_counted", False):
+                                _PDF_PAGE_CREATE_SEM.release()
+                        except Exception:
+                            pass
     except Exception:
         return
 
@@ -324,36 +332,40 @@ async def _reset_browser() -> None:
     global _PDF_BROWSER
     global _PDF_PAGE_POOL
     global _PDF_PLAYWRIGHT
-    try:
-        if _PDF_BROWSER and not _PDF_BROWSER.is_closed():
-            await _PDF_BROWSER.close()
-    except Exception:
-        pass
-    _PDF_BROWSER = None
-    # Close and drop any idle pages; release the page-cap permits.
-    pool = _PDF_PAGE_POOL
-    _PDF_PAGE_POOL = []
-    for page in list(pool):
+
+    # Serialize reset with browser creation to avoid races.
+    async with _PDF_BROWSER_LOCK:
         try:
-            await page.close()
+            if _PDF_BROWSER and not _PDF_BROWSER.is_closed():
+                await _PDF_BROWSER.close()
         except Exception:
             pass
-        finally:
+        _PDF_BROWSER = None
+
+        # Close and drop any idle pages; release the page-cap permits.
+        pool = _PDF_PAGE_POOL
+        _PDF_PAGE_POOL = []
+        for page in list(pool):
             try:
-                if getattr(page, "_dv_pdf_counted", False):
-                    _PDF_PAGE_CREATE_SEM.release()
+                await page.close()
             except Exception:
                 pass
+            finally:
+                try:
+                    if getattr(page, "_dv_pdf_counted", False):
+                        _PDF_PAGE_CREATE_SEM.release()
+                except Exception:
+                    pass
 
-    # Stop Playwright driver (prevents accumulating driver/node processes).
-    try:
-        if _PDF_PLAYWRIGHT is not None:
-            await _PDF_PLAYWRIGHT.stop()
-    except Exception:
-        pass
-    _PDF_PLAYWRIGHT = None
+        # Stop Playwright driver (prevents accumulating driver/node processes).
+        try:
+            if _PDF_PLAYWRIGHT is not None:
+                await _PDF_PLAYWRIGHT.stop()
+        except Exception:
+            pass
+        _PDF_PLAYWRIGHT = None
 
-    LOGGER.warning("PDF engine reset")
+    LOGGER.warning("pdf_reset rid=%s", get_rid() or "-")
 
 
 async def close_pdf_engine() -> None:
@@ -375,7 +387,13 @@ async def _acquire_page():
                 if page and not page.is_closed():
                     return page
             except Exception:
-                continue
+                pass
+            # If the page is closed/invalid, make sure we release its slot.
+            try:
+                if getattr(page, "_dv_pdf_counted", False):
+                    _PDF_PAGE_CREATE_SEM.release()
+            except Exception:
+                pass
 
         # No idle pages available; fall through and create a new one.
 
@@ -401,6 +419,11 @@ async def _release_page(page) -> None:
         return
     try:
         if page.is_closed():
+            try:
+                if getattr(page, "_dv_pdf_counted", False):
+                    _PDF_PAGE_CREATE_SEM.release()
+            except Exception:
+                pass
             return
     except Exception:
         return
@@ -458,6 +481,16 @@ async def html_to_pdf_bytes_chromium(
     fast_first_wait_until: Optional[str] = None,
     block_resource_types: Optional[set[str]] = None,
 ) -> Optional[bytes]:
+    global _PDF_ACTIVE_JOBS
+    # Track in-flight jobs for lightweight observability (must be per-call, even across retries).
+    active_jobs = 0
+    try:
+        async with _PDF_ACTIVE_LOCK:
+            _PDF_ACTIVE_JOBS += 1
+            active_jobs = _PDF_ACTIVE_JOBS
+    except Exception:
+        active_jobs = 0
+
     async def _once() -> Optional[bytes]:
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
@@ -487,11 +520,6 @@ async def html_to_pdf_bytes_chromium(
         effective_fast_first_wait_until = (fast_first_wait_until or _pdf_fast_first_wait_until()).strip().lower()
         if effective_fast_first_wait_until not in {"load", "domcontentloaded", "networkidle"}:
             effective_fast_first_wait_until = _pdf_fast_first_wait_until()
-        # Track in-flight jobs for lightweight observability.
-        async with _PDF_ACTIVE_LOCK:
-            global _PDF_ACTIVE_JOBS
-            _PDF_ACTIVE_JOBS += 1
-            active_jobs = _PDF_ACTIVE_JOBS
         chromium_count = _chromium_process_count_best_effort()
 
         async with atimed(
@@ -589,18 +617,26 @@ async def html_to_pdf_bytes_chromium(
                     except Exception:
                         pass
         return None
+    rid = get_rid() or "-"
     try:
-        return await _once()
+        LOGGER.info("pdf_attempt rid=%s attempt=1", rid)
+        result = await _once()
+        if result:
+            LOGGER.info("pdf_success rid=%s attempt=1 bytes=%s", rid, len(result))
+        return result
     except PdfBusyError:
         # Don't reset Chromium for load shedding; let caller decide how to report.
         raise
     except Exception as e:
         # Recover from driver/browser crashes by resetting and retrying once.
-        LOGGER.warning("pdf render failed (attempt 1); resetting engine", exc_info=True)
+        LOGGER.warning("pdf_render_failed rid=%s attempt=1; resetting", rid, exc_info=True)
         await _reset_browser()
         try:
-            LOGGER.info("Retrying PDF render (attempt 2)")
-            return await _once()
+            LOGGER.info("pdf_attempt rid=%s attempt=2", rid)
+            result2 = await _once()
+            if result2:
+                LOGGER.info("pdf_success rid=%s attempt=2 bytes=%s", rid, len(result2))
+            return result2
         except PdfBusyError:
             raise
         except Exception as e2:
@@ -609,12 +645,11 @@ async def html_to_pdf_bytes_chromium(
                 f.write(traceback.format_exc() + "\n")
                 f.write(f"Retry Error: {repr(e2)}\n")
                 f.write(traceback.format_exc() + "\n")
-            await _reset_browser()
+            # Do not cascade resets on retry failure; return clean failure.
             return None
     finally:
         try:
             async with _PDF_ACTIVE_LOCK:
-                global _PDF_ACTIVE_JOBS
                 _PDF_ACTIVE_JOBS = max(0, _PDF_ACTIVE_JOBS - 1)
         except Exception:
             pass
@@ -690,18 +725,26 @@ async def fetch_page_html_chromium(
                         pass
         return None
 
+    rid = get_rid() or "-"
     try:
-        return await _once()
+        LOGGER.info("pdf_fetch_html_attempt rid=%s attempt=1", rid)
+        html = await _once()
+        if html:
+            LOGGER.info("pdf_fetch_html_success rid=%s attempt=1 bytes=%s", rid, len(html))
+        return html
     except PdfBusyError:
         raise
     except Exception:
-        LOGGER.warning("fetch_html failed (attempt 1); resetting engine", exc_info=True)
+        LOGGER.warning("pdf_fetch_html_failed rid=%s attempt=1; resetting", rid, exc_info=True)
         await _reset_browser()
         try:
-            LOGGER.info("Retrying Chromium fetch_html (attempt 2)")
-            return await _once()
+            LOGGER.info("pdf_fetch_html_attempt rid=%s attempt=2", rid)
+            html2 = await _once()
+            if html2:
+                LOGGER.info("pdf_fetch_html_success rid=%s attempt=2 bytes=%s", rid, len(html2))
+            return html2
         except PdfBusyError:
             raise
         except Exception:
-            await _reset_browser()
+            # Do not cascade resets on retry failure; return clean failure.
             return None

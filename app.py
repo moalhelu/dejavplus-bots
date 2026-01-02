@@ -5034,6 +5034,16 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report_result: Optional[_ReportResult] = None
         bridge_pdf_path: Optional[str] = None
         bridge_temp_files: List[str] = []
+        # Hard end-to-end budget so the UX never hangs indefinitely at 90%.
+        # Note: sending the PDF to Telegram can add a few seconds beyond generation.
+        tg_total_timeout_s = float(os.getenv("TG_REPORT_TOTAL_TIMEOUT_SEC", "120") or 120)
+        tg_total_timeout_s = max(10.0, min(tg_total_timeout_s, 600.0))
+        tg_send_timeout_s = float(os.getenv("TG_REPORT_SEND_TIMEOUT_SEC", "60") or 60)
+        tg_send_timeout_s = max(10.0, min(tg_send_timeout_s, 300.0))
+        tg_t0 = time.perf_counter()
+
+        def _tg_remaining_s(floor: float = 1.0) -> float:
+            return max(floor, tg_total_timeout_s - (time.perf_counter() - tg_t0))
 
         try:
             if bridge_user_ctx:
@@ -5048,12 +5058,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raw=raw_payload,
                 )
                 try:
-                    vin_bridge_response = await _bridge.handle_text(
-                        bridge_user_ctx,
-                        vin_incoming,
-                        context=context,
-                        skip_limit_validation=True,
-                        deduct_credit=False,
+                    vin_bridge_response = await asyncio.wait_for(
+                        _bridge.handle_text(
+                            bridge_user_ctx,
+                            vin_incoming,
+                            context=context,
+                            skip_limit_validation=True,
+                            deduct_credit=False,
+                        ),
+                        timeout=_tg_remaining_s(),
                     )
                 except Exception as exc:
                     logger.error("Bridge VIN handler failed: %s", exc, exc_info=True)
@@ -5069,7 +5082,17 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not report_result:
                 try:
-                    report_result = await _generate_vin_report(vin, language=report_lang)
+                    report_result = await asyncio.wait_for(
+                        _generate_vin_report(vin, language=report_lang),
+                        timeout=_tg_remaining_s(),
+                    )
+                except asyncio.TimeoutError:
+                    report_result = _ReportResult(
+                        success=False,
+                        user_message=_bridge.t("report.error.busy", report_lang),
+                        errors=["timeout"],
+                        vin=vin,
+                    )
                 except Exception as exc:
                     report_result = _ReportResult(success=False, user_message=str(exc), errors=[str(exc)], vin=vin)
         finally:
@@ -5135,9 +5158,27 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     with open(pdf_local_path, "wb") as f:
                         f.write(report_result.pdf_bytes)
                 _register_cleanup(pdf_local_path)
-                await _send_pdf_file(context, update.effective_chat.id, pdf_local_path, f"📄 تقرير VIN <code>{vin}</code>")
+                try:
+                    await asyncio.wait_for(
+                        _send_pdf_file(context, update.effective_chat.id, pdf_local_path, f"📄 تقرير VIN <code>{vin}</code>"),
+                        timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=10.0)),
+                    )
+                except asyncio.TimeoutError:
+                    report_result = _ReportResult(
+                        success=False,
+                        user_message=_bridge.t("report.error.busy", report_lang),
+                        errors=["send_timeout"],
+                        vin=vin,
+                    )
+                except Exception as exc:
+                    report_result = _ReportResult(
+                        success=False,
+                        user_message=_bridge.t("report.error.generic", report_lang),
+                        errors=[f"send_failed:{exc}"],
+                        vin=vin,
+                    )
                 delivery_note = _bridge.t("report.success.pdf_note", report_lang)
-                delivered = True
+                delivered = bool(report_result and report_result.success)
 
             if delivered:
                 finalize_snapshot = await _finalize_report_request(context, tg_id, delivered=True)

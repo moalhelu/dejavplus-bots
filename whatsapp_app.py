@@ -1906,12 +1906,12 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                     msisdn = _normalize_recipient(raw_sender) or bridge_sender
                     if msisdn and bridge_sender:
                         user_ctx = _build_user_context(bridge_sender, entry)
-                        # If we reserved a slot, pending_reports > 0; refund one slot.
-                        if _get_pending_reports_count(user_ctx.user_id) > 0:
-                            try:
-                                refund_credit(user_ctx.user_id)
-                            except Exception:
-                                pass
+                        # Always best-effort refund on timeout. `refund_credit` is safe
+                        # even if nothing was reserved (it clamps counters at 0).
+                        try:
+                            refund_credit(user_ctx.user_id)
+                        except Exception:
+                            pass
                         msg = _bridge.t("report.error.busy", user_ctx.language)
                         await send_whatsapp_text(msisdn, msg, client=client)
                 except Exception:
@@ -1925,6 +1925,10 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                     msisdn = _normalize_recipient(raw_sender) or bridge_sender
                     if msisdn and bridge_sender:
                         user_ctx = _build_user_context(bridge_sender, entry)
+                        try:
+                            refund_credit(user_ctx.user_id)
+                        except Exception:
+                            pass
                         await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", user_ctx.language), client=client)
                 except Exception:
                     pass

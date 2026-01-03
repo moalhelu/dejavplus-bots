@@ -5,7 +5,6 @@ import asyncio
 import sys
 
 import copy
-import hashlib
 import json
 import logging
 
@@ -5237,6 +5236,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delivery_note = ""
             pdf_local_path: Optional[str] = None
             requested_lang = (report_lang or "en").lower()
+            delivered_lang = requested_lang
+            fast_skipped_translation = False
 
             if report_result.pdf_bytes:
                 if bridge_pdf_path and os.path.exists(bridge_pdf_path):
@@ -5244,34 +5245,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     pdf_local_path = None
 
-                is_upstream_pdf = bool(getattr(report_result, "is_upstream_pdf", False))
-                upstream_sha256 = getattr(report_result, "upstream_sha256", None)
-                delivered_sha256 = None
-                try:
-                    delivered_sha256 = hashlib.sha256(bytes(report_result.pdf_bytes)).hexdigest()
-                except Exception:
-                    delivered_sha256 = None
-
-                try:
-                    logger.info(
-                        "tg_pdf_delivery rid=%s vin=%s upstream_status=%s content_type=%s pdf_bytes_len=%s sha256=%s delivered_sha256=%s match=%s",
-                        rid_charge,
-                        vin,
-                        getattr(report_result, "upstream_status", None) if is_upstream_pdf else "na",
-                        getattr(report_result, "upstream_content_type", None) if is_upstream_pdf else "-",
-                        len(report_result.pdf_bytes) if report_result.pdf_bytes is not None else 0,
-                        upstream_sha256 or "-",
-                        delivered_sha256 or "-",
-                        bool(is_upstream_pdf and upstream_sha256 and delivered_sha256 and upstream_sha256 == delivered_sha256),
-                    )
-                except Exception:
-                    pass
-
-                if not bytes(report_result.pdf_bytes):
+                if not bytes(report_result.pdf_bytes).startswith(b"%PDF"):
                     report_result = _ReportResult(
                         success=False,
                         user_message=_bridge.t("report.error.generic", report_lang),
-                        errors=["empty_pdf"],
+                        errors=["invalid_pdf_header"],
                         vin=vin,
                     )
                 else:
@@ -5331,6 +5309,18 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 delivery_note = _bridge.t("report.success.pdf_note", report_lang)
                 delivered = bool(report_result and report_result.success)
 
+            # Determine Fast Mode translation decision from reports metadata.
+            try:
+                rr = getattr(report_result, "raw_response", None)
+                if isinstance(rr, dict):
+                    dv = rr.get("_dv_fast") or {}
+                    if isinstance(dv, dict):
+                        fast_skipped_translation = bool(dv.get("skipped_translation"))
+                        delivered_lang = str(dv.get("delivered_lang") or delivered_lang).lower()
+                        requested_lang = str(dv.get("requested_lang") or requested_lang).lower()
+            except Exception:
+                pass
+
             if delivered:
                 finalize_snapshot = await _finalize_report_request(context, tg_id, delivered=True, rid=rid_charge)
                 success_header = _build_vin_progress_header(
@@ -5344,12 +5334,27 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 note = delivery_note or _bridge.t("report.success.note", report_lang)
 
+                # Fast Mode post-delivery notes (kept before the terminal line).
+                extra_notes: List[str] = []
+                try:
+                    rr = getattr(report_result, "raw_response", None)
+                    if isinstance(rr, dict):
+                        dv = rr.get("_dv_fast") or {}
+                        if isinstance(dv, dict) and dv.get("skipped_translation") and (requested_lang or "en") != "en":
+                            extra_notes.append(f"Full {requested_lang.upper()} version will be sent shortly")
+                        # No placeholder/"fast-light" PDFs are allowed; we either render the real report or fail.
+                except Exception:
+                    pass
+
+                extra_block = ""
+                if extra_notes:
+                    extra_block = "\n" + "\n".join(extra_notes)
                 try:
                     # Always end on an explicit "completed" state.
                     # We edit the same progress message to avoid leaving it at 90%.
                     await asyncio.wait_for(
                         msg.edit_text(
-                            success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + "\n\n✅ Delivered (PDF)",
+                            success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block + "\n\n✅ Delivered (PDF)",
                             parse_mode=ParseMode.HTML,
                         ),
                         timeout=_tg_remaining_s(floor=1.0),
@@ -5376,19 +5381,45 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
-                # Language correctness (NO PDF TOUCHING): if user requested non-English,
-                # send a separate localized TEXT note (do not rebuild or translate the PDF).
-                try:
-                    lang = (requested_lang or "en").lower()
-                    if lang and lang != "en" and bool(getattr(report_result, "is_upstream_pdf", False)):
-                        note = (
-                            "ملاحظة: تم إرسال ملف PDF الرسمي كما هو من المصدر. لا يتم إنشاء نسخة PDF مترجمة."
-                            if lang == "ar"
-                            else "Note: Official upstream PDF delivered as-is. Localized PDF is not generated; this is a text note only."
-                        )
-                        await context.bot.send_message(chat_id=update.effective_chat.id, text=note)
-                except Exception:
-                    pass
+                # Asynchronously generate + send FULL localized PDF if Fast Mode delivered English.
+                if fast_skipped_translation and requested_lang != "en" and delivered_lang == "en":
+                    async def _send_full_localized() -> None:
+                        try:
+                            from bot_core.telemetry import new_rid as _new_rid2, set_rid as _set_rid2
+                        except Exception:
+                            _new_rid2 = None  # type: ignore
+                            _set_rid2 = None  # type: ignore
+                        rid2 = (_new_rid2("tg-full-") if _new_rid2 else None)
+                        cm = _set_rid2(rid2) if (_set_rid2 and rid2) else None
+                        try:
+                            if cm:
+                                cm.__enter__()
+                            full = await _generate_vin_report(vin, language=requested_lang, fast_mode=False)
+                            if full and getattr(full, "success", False) and getattr(full, "pdf_bytes", None):
+                                if not bytes(full.pdf_bytes).startswith(b"%PDF"):
+                                    return
+                                bio2 = BytesIO(bytes(full.pdf_bytes))
+                                bio2.name = getattr(full, "pdf_filename", None) or f"{vin}.pdf"
+                                await context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=bio2,
+                                    filename=bio2.name,
+                                    caption=f"📄 Full {requested_lang.upper()} VIN report <code>{vin}</code>",
+                                    parse_mode=ParseMode.HTML,
+                                )
+                        except Exception:
+                            logger.info("tg full localized send failed", exc_info=True)
+                        finally:
+                            try:
+                                if cm:
+                                    cm.__exit__(None, None, None)
+                            except Exception:
+                                pass
+
+                    try:
+                        asyncio.create_task(_send_full_localized())
+                    except Exception:
+                        pass
 
                 return
             else:

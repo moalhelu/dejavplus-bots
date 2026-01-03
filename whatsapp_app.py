@@ -1305,37 +1305,25 @@ async def handle_incoming_whatsapp_message(
     else:
         lower_text = (text_body or "").strip().lower()
 
-        # Guard: photo-options flow (report_options)
+        # Legacy: photo/report options flow is removed (report-only bot).
+        # Some users can still have old state in db.json; clear it to prevent crashes/stuck flows.
         if state_lower.startswith("report_options"):
-            LOGGER.debug("whatsapp: photo-options active vin=%s text=%s", report_vin, text_body)
-            if text_body and is_valid_vin(text_body):
-                LOGGER.info("whatsapp: recognized VIN inside photo flow -> restart report (vin=%s)", text_body)
+            LOGGER.info("whatsapp: clearing legacy report_options state user=%s", user_ctx.user_id)
+            _update_user_state(user_ctx.user_id, None)
+            user_ctx.state = None
+            state_lower = ""
+
+        # Show main menu on demand (dot and menu keywords already included)
+        if lower_text in MENU_SHOW_KEYWORDS or lower_text == "0":
+            if state_lower in {None, "", "main_menu"} or lower_text == ".":
+                if lower_text == "." and state_lower not in {None, "", "main_menu"}:
+                    LOGGER.debug("whatsapp: dot cancel clears active flow state=%s", state_lower)
                 _update_user_state(user_ctx.user_id, None)
-                user_ctx.state = None
-            elif lower_text in {"1", "2"}:
-                LOGGER.debug("whatsapp: photo option digit will be handled upstream (text=%s)", lower_text)
-                # Do nothing here; mapping/handlers already covered above.
-            else:
-                LOGGER.info(
-                    "whatsapp: invalid input in photo flow -> main menu (input=%s state=%s)",
-                    lower_text,
-                    state_lower,
-                )
-                _update_user_state(user_ctx.user_id, None)
+                LOGGER.debug("whatsapp: explicit menu request, sending menu (state cleared)")
                 await _send_bridge_menu(msisdn, user_ctx, client)
                 return {"status": "ok", "responses": 1}
-        else:
-            # Show main menu on demand (dot and menu keywords already included)
-            if lower_text in MENU_SHOW_KEYWORDS or lower_text == "0":
-                if state_lower in {None, "", "main_menu"} or lower_text == ".":
-                    if lower_text == "." and state_lower not in {None, "", "main_menu"}:
-                        LOGGER.debug("whatsapp: dot cancel clears active flow state=%s", state_lower)
-                    _update_user_state(user_ctx.user_id, None)
-                    LOGGER.debug("whatsapp: explicit menu request, sending menu (state cleared)")
-                    await _send_bridge_menu(msisdn, user_ctx, client)
-                    return {"status": "ok", "responses": 1}
-                else:
-                    LOGGER.debug("whatsapp: skipping fallback menu because state=%s is active", state_lower)
+            else:
+                LOGGER.debug("whatsapp: skipping fallback menu because state=%s is active", state_lower)
 
         # If user sent a VIN directly, send ONE processing message (no progress spam)
         if text_body and is_valid_vin(text_body):

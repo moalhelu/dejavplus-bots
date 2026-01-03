@@ -34,6 +34,20 @@ from bot_core.services.reports import (
 )
 
 
+def _extract_html_from_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    data = payload.get("data")
+    if isinstance(data, dict):
+        val = data.get("htmlContent")
+        if isinstance(val, str):
+            return val
+    val = payload.get("htmlContent")
+    if isinstance(val, str):
+        return val
+    return ""
+
+
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -83,22 +97,32 @@ async def _fetch_one(vin: str) -> Dict[str, Any]:
                     result["sha256"] = _sha256_hex(body)
 
                 if "application/pdf" in ctype and body:
-                    result["path"] = "pdf_200"
-                elif status != 200:
-                    result["path"] = "non_200"
-                    # Include a small body preview for HTML/JSON errors.
+                    result["path"] = "pdf"
+                elif status in (200, 201) and ("application/json" in ctype or (body[:1] == b"{")):
+                    result["path"] = f"json_{status}"
                     try:
-                        preview = body[:200].decode("utf-8", errors="ignore")
+                        payload = body.decode("utf-8", errors="ignore")
+                        data = __import__("json").loads(payload or "{}")
+                        html = _extract_html_from_payload(data)
+                        result["html_bytes_len"] = len(html.encode("utf-8", errors="ignore")) if html else 0
                     except Exception:
-                        preview = ""
-                    result["body_preview"] = preview
+                        result["html_bytes_len"] = 0
+                    try:
+                        result["body_preview"] = body[:200].decode("utf-8", errors="ignore")
+                    except Exception:
+                        result["body_preview"] = ""
+                elif status in (200, 201):
+                    result["path"] = f"non_pdf_{status}"
+                    try:
+                        result["body_preview"] = body[:200].decode("utf-8", errors="ignore")
+                    except Exception:
+                        result["body_preview"] = ""
                 else:
-                    result["path"] = "non_pdf_200"
+                    result["path"] = f"non_success_{status}"
                     try:
-                        preview = body[:200].decode("utf-8", errors="ignore")
+                        result["body_preview"] = body[:200].decode("utf-8", errors="ignore")
                     except Exception:
-                        preview = ""
-                    result["body_preview"] = preview
+                        result["body_preview"] = ""
 
                 return result
         except Exception as exc:
@@ -138,6 +162,9 @@ def _print_result(r: Dict[str, Any]) -> None:
     if r.get("sha256"):
         print(f"SHA256: {r.get('sha256')}")
     print(f"Path: {r.get('path')}")
+
+    if r.get("html_bytes_len") is not None:
+        print(f"HTML bytes: {r.get('html_bytes_len')}")
 
     if r.get("body_preview"):
         print("Body preview:")

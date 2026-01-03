@@ -35,16 +35,6 @@ from telegram import Bot
 from bot_core import bridge as _bridge
 from bot_core.clients.ultramsg import UltraMsgClient, UltraMsgCredentials, UltraMsgError
 from bot_core.config import get_report_default_lang, get_ultramsg_settings, is_super_admin
-from bot_core.services.images import (
-    get_badvin_images_media,
-    get_badvin_images,
-    get_apicar_current_images,
-    get_apicar_history_images,
-    get_apicar_accident_images,
-    get_hidden_vehicle_images,
-    download_image_bytes,
-    _select_images,
-)
 from bot_core.storage import (
     ensure_user as _ensure_user, 
     load_db as _load_db, 
@@ -487,10 +477,6 @@ async def _wa_run_vin_report_job(
                         commit_credit(user_id, rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin})
                     except Exception:
                         LOGGER.exception("whatsapp: failed to commit credit after delivery user=%s vin=%s", user_id, vin)
-                    try:
-                        await _send_report_options_menu(msisdn, user_id, vin, client)
-                    except Exception:
-                        pass
                     return
 
     # If generation never succeeded, attempt cached fallback.
@@ -510,10 +496,6 @@ async def _wa_run_vin_report_job(
                 commit_credit(user_id, rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin, "via": "cache"})
             except Exception:
                 LOGGER.exception("whatsapp: failed to commit credit after cached delivery user=%s vin=%s", user_id, vin)
-            try:
-                await _send_report_options_menu(msisdn, user_id, vin, client)
-            except Exception:
-                pass
             return
 
     # Give up: refund reserved credit once.
@@ -1096,296 +1078,6 @@ async def _send_broadcast_menu(to: str, user_id: str, client: UltraMsgClient):
         client=client
     )
 
-
-def _report_options_prompt(lang: str, vin: Optional[str] = None) -> str:
-    return _bridge.t("wa.photos.prompt", lang)
-
-
-def _photo_no_images_message(lang: str, choice: Optional[str] = None) -> str:
-    if choice == "wa_opt_accident":
-        return _bridge.t("wa.photos.none.accident", lang)
-    return _bridge.t("wa.photos.none.generic", lang)
-
-
-def _photo_send_error_message(lang: str) -> str:
-    return _bridge.t("wa.photos.send_error", lang)
-
-
-def _photo_fetch_error_message(lang: str, choice: Optional[str] = None) -> str:
-    if choice == "wa_opt_accident":
-        return _bridge.t("wa.photos.fetch_error.accident", lang)
-    return _bridge.t("wa.photos.fetch_error.generic", lang)
-
-
-async def _send_report_options_prompt(to: str, client: UltraMsgClient, vin: Optional[str] = None) -> None:
-    db = _load_db()
-    user = _ensure_user(db, to, None)
-    lang = (user.get("language") or user.get("report_lang") or "ar").lower()
-    await send_whatsapp_text(to, _report_options_prompt(lang, vin), client=client)
-
-
-async def _send_report_options_menu(to: str, user_id: str, vin: str, client: UltraMsgClient):
-    LOGGER.info("whatsapp: entering report_options flow vin=%s user=%s", vin, user_id)
-    _update_user_state(user_id, f"report_options:{vin}")
-    
-    db = _load_db()
-    user = _ensure_user(db, user_id, None)
-    lang = (user.get("language") or user.get("report_lang") or "ar").lower()
-
-    buttons = [
-        {"id": "wa_opt_accident", "title": _bridge.t("wa.photos.option.accident", lang)},
-        {"id": "wa_opt_badvin", "title": _bridge.t("wa.photos.option.hidden", lang)},
-    ]
-    
-    body_text = _report_options_prompt(lang)
-    
-    await send_whatsapp_buttons(
-        to,
-        body=body_text,
-        buttons=buttons,
-        footer=_bridge.t("wa.footer.brand", lang),
-        client=client
-    )
-
-
-async def _send_photo_batch(
-    msisdn: str,
-    user_ctx: _bridge.UserContext,
-    vin: str,
-    urls: List[str],
-    client: UltraMsgClient,
-    *,
-    choice: str,
-) -> Dict[str, Any]:
-    cleaned = _select_images(urls, limit=10)
-    LOGGER.info(
-        "whatsapp: photos fetched choice=%s vin=%s total_urls=%s cleaned=%s",
-        choice,
-        vin,
-        len(urls),
-        len(cleaned),
-    )
-
-    if not cleaned:
-        await send_whatsapp_text(
-            msisdn,
-            _photo_no_images_message(user_ctx.language, choice),
-            client=client,
-        )
-        await _send_report_options_prompt(msisdn, client, vin)
-        return {"status": "ok", "images": 0, "empty": True}
-
-    sent = 0
-    failed_urls: List[str] = []
-
-    async def _ensure_public_url() -> Optional[str]:
-        public = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip()
-        if public and _is_public_http_base(public):
-            return public
-        try:
-            public = await _get_ngrok_url()
-        except Exception:
-            public = None
-        if public and _is_public_http_base(public):
-            os.environ["WHATSAPP_PUBLIC_URL"] = public
-            return public
-        return None
-
-    async def _send_image_bytes_robust(data: bytes, *, filename: str, rid: str, src_url: str) -> bool:
-        # 1) Try base64 image (fast).
-        try:
-            b64 = base64.b64encode(data).decode("ascii")
-            await client.send_image(msisdn, image_base64=b64, filename=filename)
-            return True
-        except Exception as exc:  # pragma: no cover
-            LOGGER.debug(
-                "whatsapp: send_image base64 failed rid=%s vin=%s choice=%s file=%s bytes=%s error=%s",
-                rid,
-                vin,
-                choice,
-                filename,
-                len(data),
-                exc,
-            )
-
-        # 2) Host bytes via one-shot and send as public URL image.
-        public = await _ensure_public_url()
-        if public:
-            try:
-                token = await _put_one_shot_blob(data, filename=filename, media_type="image/jpeg")
-                url_value = f"{public}/download/{token}"
-                await client.send_image(msisdn, image_url=url_value, filename=filename)
-                return True
-            except Exception as exc:  # pragma: no cover
-                LOGGER.debug(
-                    "whatsapp: send_image one-shot url failed rid=%s vin=%s choice=%s url=%s src_url=%s error=%s",
-                    rid,
-                    vin,
-                    choice,
-                    url_value if 'url_value' in locals() else '-',
-                    src_url,
-                    exc,
-                )
-
-            # 3) Still failing: send as document via one-shot URL.
-            try:
-                token = await _put_one_shot_blob(data, filename=filename, media_type="application/octet-stream")
-                url_value = f"{public}/download/{token}"
-                await client.send_document(msisdn, document_url=url_value, filename=filename)
-                return True
-            except Exception as exc:  # pragma: no cover
-                LOGGER.warning(
-                    "whatsapp: send_document one-shot failed rid=%s vin=%s choice=%s src_url=%s error=%s",
-                    rid,
-                    vin,
-                    choice,
-                    src_url,
-                    exc,
-                )
-        else:
-            # No public URL available; last resort: document via base64.
-            try:
-                b64 = base64.b64encode(data).decode("ascii")
-                await client.send_document(msisdn, document_base64=b64, filename=filename)
-                return True
-            except Exception as exc:  # pragma: no cover
-                LOGGER.warning(
-                    "whatsapp: send_document base64 failed rid=%s vin=%s choice=%s file=%s error=%s",
-                    rid,
-                    vin,
-                    choice,
-                    filename,
-                    exc,
-                )
-
-        return False
-    for url in cleaned:
-        payload: Dict[str, Any] = {}
-
-        rid = f"wa-img-{user_ctx.user_id}-{vin}-{int(time.time())}"
-
-        try:
-            await client.send_image(msisdn, image_url=url, **payload)
-            sent += 1
-            continue
-        except Exception as exc:  # pragma: no cover - network dependent
-            LOGGER.debug(
-                "whatsapp: send_image via url failed vin=%s choice=%s url=%s error=%s",
-                vin,
-                choice,
-                url,
-                exc,
-            )
-
-        data = await download_image_bytes(url, rid=rid)
-        if not data:
-            failed_urls.append(url)
-            LOGGER.warning(
-                "whatsapp: failed to download image vin=%s choice=%s url=%s",
-                vin,
-                choice,
-                url,
-            )
-            continue
-
-        filename = url.split("?", 1)[0].split("/")[-1] or "photo.jpg"
-        if "." not in filename:
-            filename += ".jpg"
-        ok = await _send_image_bytes_robust(data, filename=filename, rid=rid, src_url=url)
-        if ok:
-            sent += 1
-        else:
-            failed_urls.append(url)
-
-    LOGGER.info(
-        "whatsapp: photo send summary vin=%s choice=%s sent=%s failed=%s total=%s",
-        vin,
-        choice,
-        sent,
-        len(failed_urls),
-        len(cleaned),
-    )
-
-    if sent > 0:
-        await send_whatsapp_text(msisdn, _bridge.t("wa.photos.sent_count", user_ctx.language, count=sent), client=client)
-        await _send_report_options_prompt(msisdn, client, vin)
-        return {"status": "ok", "images": sent}
-
-    # If nothing was sent, notify the user without sending raw URLs.
-    LOGGER.warning(
-        "whatsapp: all image sends failed vin=%s choice=%s total=%s failed=%s",
-        vin,
-        choice,
-        len(cleaned),
-        len(failed_urls),
-    )
-    await send_whatsapp_text(msisdn, _photo_send_error_message(user_ctx.language), client=client)
-    await _send_report_options_prompt(msisdn, client, vin)
-    return {"status": "ok", "images": 0, "failed": len(failed_urls) or len(cleaned)}
-
-
-async def _handle_report_option_choice(
-    msisdn: str,
-    user_ctx: _bridge.UserContext,
-    choice: str,
-    vin: str,
-    client: UltraMsgClient,
-) -> Dict[str, Any]:
-    """Fetch and send the chosen photo bundle (badvin/accident/auction)."""
-
-    fetchers = {
-        "wa_opt_accident": get_apicar_accident_images,
-        "wa_opt_badvin": get_hidden_vehicle_images,
-    }
-    fetcher = fetchers.get(choice)
-    if not fetcher:
-        LOGGER.warning("whatsapp: unknown photo choice=%s vin=%s", choice, vin)
-        await _send_report_options_prompt(msisdn, client, vin)
-        return {"status": "ignored", "reason": "unknown_choice"}
-
-    LOGGER.info("whatsapp: report photos choice=%s vin=%s user=%s", choice, vin, user_ctx.user_id)
-    rid = f"wa-img-{user_ctx.user_id}-{vin}-{int(time.time())}"
-    await send_whatsapp_text(msisdn, _bridge.t("wa.photos.fetching", user_ctx.language, vin=vin), client=client)
-
-    # BadVin images are frequently protected; prefer authenticated bytes.
-    if choice == "wa_opt_badvin":
-        try:
-            wa_limit = max(1, min(10, int(os.getenv("BADVIN_MEDIA_LIMIT", "30") or 30)))
-            media_items = await get_badvin_images_media(vin, limit=wa_limit)
-        except Exception as exc:  # pragma: no cover
-            LOGGER.warning("whatsapp: badvin media fetch failed vin=%s error=%s", vin, exc)
-            media_items = []
-
-        if media_items:
-            sent = 0
-            for _, data in media_items:
-                if not data:
-                    continue
-                try:
-                    filename = f"{vin}_hidden.jpg"
-                    ok = await _send_image_bytes_robust(bytes(data), filename=filename, rid=rid, src_url="badvin_media")
-                    if ok:
-                        sent += 1
-                except Exception as exc:  # pragma: no cover
-                    LOGGER.warning("whatsapp: failed to send badvin media_base64 vin=%s error=%s", vin, exc)
-
-            if sent > 0:
-                await send_whatsapp_text(msisdn, _bridge.t("wa.photos.sent_count", user_ctx.language, count=sent), client=client)
-                await _send_report_options_prompt(msisdn, client, vin)
-                return {"status": "ok", "images": sent}
-
-    try:
-        if choice == "wa_opt_accident":
-            LOGGER.info("whatsapp: fetching accident images via apicar vin=%s", vin)
-        urls = await fetcher(vin, rid=rid)
-    except Exception as exc:  # pragma: no cover - network dependent
-        LOGGER.warning("Failed to fetch images for choice=%s vin=%s: %s", choice, vin, exc)
-        await send_whatsapp_text(msisdn, _photo_fetch_error_message(user_ctx.language, choice), client=client)
-        await _send_report_options_prompt(msisdn, client, vin)
-        return {"status": "error", "reason": "fetch_failed"}
-
-    return await _send_photo_batch(msisdn, user_ctx, vin, urls or [], client, choice=choice)
-
 def _map_text_to_button(text: str, state: Optional[str], is_admin: bool) -> Optional[str]:
     if not text.isdigit():
         return None
@@ -1418,10 +1110,6 @@ def _map_text_to_button(text: str, state: Optional[str], is_admin: bool) -> Opti
         
     if state == "menu_broadcast":
         mapping = {1: "wa_broadcast_all", 2: "wa_broadcast_specific", 3: "wa_cancel"}
-        return mapping.get(idx)
-        
-    if state and state.startswith("report_options:"):
-        mapping = {1: "wa_opt_accident", 2: "wa_opt_badvin", 0: "menu:main"}
         return mapping.get(idx)
         
     return None
@@ -1503,15 +1191,9 @@ async def handle_incoming_whatsapp_message(
     msg_type = _detect_message_type(enriched_event)
     media_url = _detect_media_url(enriched_event)
     user_ctx = _build_user_context(bridge_sender, enriched_event)
-    report_vin = None
-    if (user_ctx.state or "").startswith("report_options:"):
-        report_vin = (user_ctx.state or "").split(":", 1)[1] or None
-    LOGGER.debug("whatsapp inbound state=%s vin_state=%s", user_ctx.state, report_vin)
+    LOGGER.debug("whatsapp inbound state=%s", user_ctx.state)
     pre_reserved_credit = False
     rid_for_request: Optional[str] = None
-
-    if (user_ctx.state or "").startswith("report_options"):
-        LOGGER.debug("whatsapp: entering photo-options handler (vin=%s text=%s)", report_vin, text_body)
 
     # Map text fallback to button_id (non-main-menu flows only; main menu handled via bridge menu items)
     state_lower = (user_ctx.state or "").lower()
@@ -1568,7 +1250,6 @@ async def handle_incoming_whatsapp_message(
         else:
             language_choice_handled = True  # Ignore other inputs inside language flow (no menu fallback)
 
-    report_option_choice: Optional[str] = None
     exit_to_main_menu = False
 
     if language_choice_handled:
@@ -1576,27 +1257,11 @@ async def handle_incoming_whatsapp_message(
     elif button_id:
         if button_id == "menu:main":
             exit_to_main_menu = True
-        elif button_id.startswith("wa_opt_") and report_vin:
-            report_option_choice = button_id
         else:
             tmp = _resolve_menu_selection(button_id, user_ctx)
             menu_selection_text = await tmp if asyncio.iscoroutine(tmp) else tmp
     elif text_body and text_body.isdigit():
-        if state_lower.startswith("report_options"):
-            mapped_id = _map_text_to_button(text_body, user_ctx.state, is_super_admin(user_ctx.user_id))
-            LOGGER.debug(
-                "whatsapp: report_options digit input=%s mapped_id=%s state=%s vin=%s",
-                text_body,
-                mapped_id,
-                user_ctx.state,
-                report_vin,
-            )
-            if mapped_id == "menu:main":
-                exit_to_main_menu = True
-            elif mapped_id:
-                report_option_choice = mapped_id
-                LOGGER.info("whatsapp: mapped digit %s to report option %s (vin=%s)", text_body, mapped_id, report_vin)
-        elif state_lower in {None, "", "main_menu"}:
+        if state_lower in {None, "", "main_menu"}:
             tmp = _resolve_menu_selection(text_body, user_ctx)
             mapped = await tmp if asyncio.iscoroutine(tmp) else tmp
             if mapped:
@@ -1606,13 +1271,10 @@ async def handle_incoming_whatsapp_message(
             LOGGER.debug("whatsapp: digit '%s' ignored because state=%s (flow active)", text_body, state_lower)
 
     if exit_to_main_menu:
-        LOGGER.info("whatsapp: exiting photo flow to main menu (state=%s vin=%s)", user_ctx.state, report_vin)
+        LOGGER.info("whatsapp: exiting to main menu (state=%s)", user_ctx.state)
         _update_user_state(user_ctx.user_id, None)
         await _send_bridge_menu(msisdn, user_ctx, client)
         return {"status": "ok", "responses": 1}
-
-    if report_option_choice and report_vin:
-        return await _handle_report_option_choice(msisdn, user_ctx, report_option_choice, report_vin, client)
 
     if menu_selection_text:
         selection_msg = _bridge.IncomingMessage(
@@ -1785,7 +1447,6 @@ async def handle_incoming_whatsapp_message(
     documents: List[Dict[str, Any]] = []
     media_payloads: List[Dict[str, Any]] = []
     temp_files: List[str] = []
-    photo_tasks: List[asyncio.Task[Any]] = []
 
     def _extend_payloads(resp: Any) -> None:
         if not resp:
@@ -1856,47 +1517,6 @@ async def handle_incoming_whatsapp_message(
 
             if actions.get("credit_commit_required"):
                 credit_commit_required = True
-
-            photos_action = actions.get("photos")
-            if photos_action:
-                vin_for_photos = None
-                urls: Optional[List[str]] = None
-                if isinstance(photos_action, dict):
-                    vin_for_photos = photos_action.get("vin") or photos_action.get("id") or photos_action.get("car_vin")
-                    candidate = (
-                        photos_action.get("urls")
-                        or photos_action.get("images")
-                        or photos_action.get("photos")
-                        or photos_action.get("data")
-                    )
-                    if isinstance(candidate, (list, tuple, set)):
-                        urls = list(candidate)
-                elif isinstance(photos_action, (list, tuple, set)):
-                    urls = list(photos_action)
-                elif isinstance(photos_action, str):
-                    urls = [photos_action]
-                if urls:
-                    vin_for_photos = vin_for_photos or report_vin or vin_from_response or ""
-                    LOGGER.info(
-                        "whatsapp: processing photos action from bridge (urls=%s vin=%s state=%s)",
-                        len(urls),
-                        vin_for_photos,
-                        user_ctx.state,
-                    )
-                    photo_tasks.append(
-                        asyncio.create_task(
-                            _send_photo_batch(
-                                msisdn,
-                                user_ctx,
-                                vin_for_photos or "UNKNOWN",
-                                urls,
-                                client,
-                                choice="bridge_photos",
-                            )
-                        )
-                    )
-                else:
-                    LOGGER.debug("whatsapp: photos action present but no urls extracted; skipping send")
             for doc in batch.documents:
                 if isinstance(doc, dict) and doc.get("type") == "pdf":
                     pdf_present = True
@@ -2038,22 +1658,6 @@ async def handle_incoming_whatsapp_message(
                     LOGGER.warning("whatsapp: image send task failed: %s", r)
                 else:
                     send_successes += 1
-        if photo_tasks:
-            # Photo batches are optional; do not let them block the SLA.
-            results = await asyncio.wait_for(asyncio.gather(*photo_tasks, return_exceptions=True), timeout=min(1.0, _sla_remaining_s()))
-            for r in results:
-                if isinstance(r, Exception):
-                    send_failures += 1
-                    LOGGER.warning("whatsapp: photo batch task failed: %s", r)
-                else:
-                    send_successes += 1
-        if pdf_present and vin_from_response:
-            try:
-                await _send_report_options_menu(msisdn, user_ctx.user_id, vin_from_response, client)
-                send_successes += 1
-            except Exception as exc:
-                send_failures += 1
-                LOGGER.warning("whatsapp: failed to send report options menu: %s", exc)
 
         # Guarantee: if a VIN report was successfully generated, we must either deliver it
         # (then commit credit) or explicitly fail + refund credit.

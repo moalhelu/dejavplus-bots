@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Tuple
 from bot_core.auth import is_admin_tg as _is_admin_tg, is_super_admin as _is_super_admin
 from bot_core.services.notifications import notify_supers
-from bot_core.services.images import download_image_bytes
 from bot_core.services.translation import translate_batch, _latin_ku_to_arabic as _ku_to_arabic  # type: ignore
 from bot_core.services.reports import ReportResult, generate_vin_report
 from bot_core.storage import (
@@ -348,54 +347,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ku": "⚠️ بەکارهێنەر نەناسراوە.",
         "ckb": "⚠️ بەکارهێنەر نەناسراوە.",
     },
-    "admin.user.already_stopped": {
-        "ar": "ℹ️ المستخدم متوقف بالفعل.",
-        "en": "ℹ️ User is already stopped.",
-        "ku": "ℹ️ بەکارهێنەر پێشتر وەستێنراوە.",
-        "ckb": "ℹ️ بەکارهێنەر پێشتر وەستێنراوە.",
-    },
-    "admin.user.suspend.notify": {
-        "ar": "⛔ تم إيقاف حسابك من قبل الإدارة.",
-        "en": "⛔ Your account has been suspended by admin.",
-        "ku": "⛔ هەژمارەکەت لەلایەن بەڕێوەبەرەوە وەستێنرا.",
-        "ckb": "⛔ هەژمارەکەت لەلایەن بەڕێوەبەرەوە وەستێنرا.",
-    },
-    "admin.user.suspend.toast": {
-        "ar": "✅ تم توقيف المستخدم.",
-        "en": "✅ User has been suspended.",
-        "ku": "✅ بەکارهێنەر وەستێنرا.",
-        "ckb": "✅ بەکارهێنەر وەستێنرا.",
-    },
-    "admin.user.suspend.log": {
-        "ar": "⛔ (Admin:{admin}) أوقف {user}.",
-        "en": "⛔ (Admin:{admin}) suspended {user}.",
-        "ku": "⛔ (ئادمین:{admin}) {user} وەستێناند.",
-        "ckb": "⛔ (ئادمین:{admin}) {user} وەستێناند.",
-    },
-    "admin.user.reactivate.prompt": {
-        "ar": "⛔ <b>{name}</b> متوقف.\n\nاختر طريقة لإعادة التفعيل:",
-        "en": "⛔ <b>{name}</b> is stopped.\n\nChoose how to reactivate:",
-        "ku": "⛔ <b>{name}</b> وەستێنراوە.\n\nڕێگای چالاککردن هەڵبژێرە:",
-        "ckb": "⛔ <b>{name}</b> وەستێنراوە.\n\nڕێگای چالاککردن هەڵبژێرە:",
-    },
-    "admin.user.reactivate.option.trial": {
-        "ar": "🧪 تجربة افتراضية",
-        "en": "🧪 Trial preset",
-        "ku": "🧪 تاقیکردنەوەی بنەڕەتی",
-        "ckb": "🧪 تاقیکردنەوەی بنەڕەتی",
-    },
-    "admin.user.reactivate.option.monthly": {
-        "ar": "🟢 اشتراك شهري",
-        "en": "🟢 Monthly plan",
-        "ku": "🟢 پلانی مانگانە",
-        "ckb": "🟢 پلانی مانگانە",
-    },
-    "admin.user.reactivate.option.custom": {
-        "ar": "🧾 تفعيل مخصّص",
-        "en": "🧾 Custom activation",
-        "ku": "🧾 چالاککردنی تایبەتی",
-        "ckb": "🧾 چالاککردنی تایبەتی",
-    },
     "admin.user.reactivate.option.open_card": {
         "ar": "🔎 فتح البطاقة",
         "en": "🔎 Open user card",
@@ -431,30 +382,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "📨 Limit options sent.",
         "ku": "📨 هەڵبژاردەکانی سنوور نێردران.",
         "ckb": "📨 هەڵبژاردەکانی سنوور نێردران.",
-    },
-    "admin.limit.prompt.daily": {
-        "ar": "📅 أرسل الحد اليومي الجديد (رقم):",
-        "en": "📅 Send the new daily limit (number):",
-        "ku": "📅 سنووری نوێی ڕۆژانە بنێرە (ژمارە):",
-        "ckb": "📅 سنووری نوێی ڕۆژانە بنێرە (ژمارە):",
-    },
-    "admin.limit.prompt.monthly": {
-        "ar": "📆 أرسل الحد الشهري الجديد (رقم):",
-        "en": "📆 Send the new monthly limit (number):",
-        "ku": "📆 سنووری نوێی مانگانە بنێرە (ژمارە):",
-        "ckb": "📆 سنووری نوێی مانگانە بنێرە (ژمارە):",
-    },
-    "admin.users.back": {
-        "ar": "↩️ رجوع",
-        "en": "↩️ Back",
-        "ku": "↩️ گەڕانەوە",
-        "ckb": "↩️ گەڕانەوە",
-    },
-    "admin.users.prev": {
-        "ar": "« السابق",
-        "en": "« Prev",
-        "ku": "« پێشوو",
-        "ckb": "« پێشوو",
     },
     "admin.users.next": {
         "ar": "التالي »",
@@ -533,30 +460,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "❌ Error: {error}\n\nUse /debug to check your permissions.",
         "ku": "❌ هەڵە: {error}\n\n/\u2026 بەکاربهێنە بۆ دڵنیابوون لە دەسەڵاتەکانت.",
         "ckb": "❌ هەڵە: {error}\n\n/\u2026 بەکاربهێنە بۆ دڵنیابوون لە دەسەڵاتەکانت.",
-    },
-    "photos.heading.hidden": {
-        "ar": "📷 صور السيارة المخفية",
-        "en": "📷 Hidden car photos",
-        "ku": "📷 وێنەکانی شاراوەی ئۆتۆمبێل",
-        "ckb": "📷 وێنەکانی شاراوەی ئۆتۆمبێل",
-    },
-    "photos.heading.auction": {
-        "ar": "🚗 صور المزاد الحالي",
-        "en": "🚗 Current auction photos",
-        "ku": "🚗 وێنەکانی مزاودەی ئێستا",
-        "ckb": "🚗 وێنەکانی مزاودەی ئێستا",
-    },
-    "photos.heading.accident": {
-        "ar": "💥 صور حادث سابق",
-        "en": "💥 Previous accident photos",
-        "ku": "💥 وێنەکانی پەڕینی پێشوو",
-        "ckb": "💥 وێنەکانی پەڕینی پێشوو",
-    },
-    "photos.not_enabled": {
-        "ar": "⛔ {label} غير مفعلة لحسابك.",
-        "en": "⛔ {label} is not enabled for your account.",
-        "ku": "⛔ {label} بۆ هەژمارەکەت چالاک نییە.",
-        "ckb": "⛔ {label} بۆ هەژمارەکەت چالاک نییە.",
     },
     "common.status.yes": {
         "ar": "✅ نعم",
@@ -886,29 +789,14 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ku": "بێ سنوور",
     },
     "usercard.services.line": {
-        "ar": "Carfax {carfax} | BadVin {badvin} | مزاد {auction} | حادث {accident}",
-        "en": "Carfax {carfax} | BadVin {badvin} | Auction {auction} | Accident {accident}",
-        "ku": "Carfax {carfax} | BadVin {badvin} | مزاد {auction} | ڕووداو {accident}",
+        "ar": "Carfax {carfax}",
+        "en": "Carfax {carfax}",
+        "ku": "Carfax {carfax}",
     },
     "usercard.service.carfax": {
         "ar": "Carfax",
         "en": "Carfax",
         "ku": "Carfax",
-    },
-    "usercard.service.photos_badvin": {
-        "ar": "صور السيارة المخفية",
-        "en": "Hidden car photos",
-        "ku": "وێنەکانی ئۆتۆمبیلی شاردراو",
-    },
-    "usercard.service.photos_auction": {
-        "ar": "صور المزاد الحالي",
-        "en": "Auction photos",
-        "ku": "وێنەکانی مزادی ئێستا",
-    },
-    "usercard.service.photos_accident": {
-        "ar": "صور حادث سابق",
-        "en": "Accident photos",
-        "ku": "وێنەکانی ڕووداوی پێشتر",
     },
     "usercard.buttons.contact": {
         "ar": "📬 مراسلة",
@@ -1322,65 +1210,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "✅ Sent {label} for VIN <code>{vin}</code>{expires}\n{credit}",
         "ku": "✅ {label} نێردرا بۆ VIN <code>{vin}</code>{expires}\n{credit}",
     },
-    "report.photos.toast": {
-        "ar": "✅ تم إرسال الصور وظهرت أسفل الرسائل.",
-        "en": "✅ Photos sent and shown below.",
-        "ku": "✅ وێنەکان نێردران و خوارەوە پیشان دراون.",
-    },
-    "report.photos.error": {
-        "ar": "⚠️ تعذّر تحميل الصور حالياً.",
-        "en": "⚠️ Unable to load photos right now.",
-        "ku": "⚠️ نەتوانرا ئێستا وێنەکان داونلۆد بکرێن.",
-        "ckb": "⚠️ نەتوانرا ئێستا وێنەکان داگرتە بکرێن.",
-    },
-    "report.photos.collecting": {
-        "ar": "⏳ <b>{label}</b>\nيتم الآن جمع الصور لـ VIN <code>{vin}</code>...",
-        "en": "⏳ <b>{label}</b>\nCollecting photos for VIN <code>{vin}</code>...",
-        "ku": "⏳ <b>{label}</b>\nخەزنکردنی وێنەکان بۆ VIN <code>{vin}</code>...",
-        "ckb": "⏳ <b>{label}</b>\nکۆکردنەوەی وێنەکان بۆ VIN <code>{vin}</code>...",
-    },
-    "photos.label.hidden": {
-        "ar": "صور السيارة المخفية",
-        "en": "Hidden car photos",
-        "ku": "وێنەکانی نەهێنراوی ئۆتۆمبێل",
-        "ckb": "وێنەکانی نەهێنراوی ئۆتۆمبێل",
-    },
-    "photos.label.auction": {
-        "ar": "صور المزاد الحالي",
-        "en": "Current auction photos",
-        "ku": "وێنەکانی مزاودەی ئێستا",
-        "ckb": "وێنەکانی مزایدەی ئێستا",
-    },
-    "photos.label.accident": {
-        "ar": "صور حادث سابق",
-        "en": "Accident photos",
-        "ku": "وێنەکانی ڕووداو",
-        "ckb": "وێنەکانی ڕووداو",
-    },
-    "report.photos.empty.hidden": {
-        "ar": "⚠️ لا توجد صور السيارة المخفية متاحة حالياً.",
-        "en": "⚠️ No hidden car photos are available right now.",
-        "ku": "⚠️ هیچ وێنەی نەشاردراوی ئۆتۆمبێل نییە لە ئێستا.",
-        "ckb": "⚠️ هیچ وێنەی نەهێنراوی ئۆتۆمبێل نییە لە ئێستا.",
-    },
-    "report.photos.empty.auction": {
-        "ar": "⚠️ لا توجد صور مزاد حالياً.",
-        "en": "⚠️ No auction photos are available right now.",
-        "ku": "⚠️ هیچ وێنەی مزاودە نییە لە ئێستا.",
-        "ckb": "⚠️ هیچ وێنەی مزایدە نییە لە ئێستا.",
-    },
-    "report.photos.empty.accident": {
-        "ar": "⚠️ لا توجد صور حادث متاحة لهذا رقم الشاصي.",
-        "en": "⚠️ No accident photos are available for this VIN.",
-        "ku": "⚠️ هیچ وێنەی ڕووداو بۆ ئەم VIN ـە نییە.",
-        "ckb": "⚠️ هیچ وێنەی ڕووداو بۆ ئەم VIN ـە نییە.",
-    },
-    "report.photos.accident.error": {
-        "ar": "⚠️ حدث خطأ أثناء جلب صور الحادث.",
-        "en": "⚠️ Error while fetching accident photos.",
-        "ku": "⚠️ هەڵە ڕوویدا لە هێنانى وێنەکانى ڕووداو.",
-        "ckb": "⚠️ هەڵە ڕوویدا لە هێنانی وێنەکانی ڕووداو.",
-    },
     "language.change.prompt": {
         "ar": "🌐 <b>تغيير لغة التقرير</b>\n\n━━━━━━━━━━━━━━━━━━━━\n<b>اللغة الحالية:</b> {current}\n\nاختر اللغة الجديدة:",
         "en": "🌐 <b>Change report language</b>\n\n━━━━━━━━━━━━━━━━━━━━\n<b>Current language:</b> {current}\n\nPick a new language:",
@@ -1441,19 +1270,19 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ar": (
             "🔒 <b>سياسة إدارة الأسرار</b>\n\n"
             "• يتم حفظ التوكنات وكلمات المرور داخل ملف <code>.env</code> فقط.\n"
-            "• المتغيرات المدعومة: <code>API_TOKEN</code>, <code>BADVIN_EMAIL</code>, <code>BADVIN_PASSWORD</code>.\n"
+            "• المتغيرات المدعومة: <code>API_TOKEN</code>.\n"
             "• بعد التعديل، استخدم زر <b>🔄 إعادة تحميل .env</b> لتطبيق التغييرات دون إعادة التشغيل."
         ),
         "en": (
             "🔒 <b>Secrets management</b>\n\n"
             "• Tokens and passwords must live in <code>.env</code>.\n"
-            "• Supported vars: <code>API_TOKEN</code>, <code>BADVIN_EMAIL</code>, <code>BADVIN_PASSWORD</code>.\n"
+            "• Supported vars: <code>API_TOKEN</code>.\n"
             "• After editing, press <b>🔄 Reload .env</b> to apply without restart."
         ),
         "ku": (
             "🔒 <b>سیاسەتی نهێنی</b>\n\n"
             "• تۆکەن و تێپەڕەوشەکان تەنها لە <code>.env</code> دەنوسرێن.\n"
-            "• گۆڕاوە پشتیوانی کراوەکان: <code>API_TOKEN</code>, <code>BADVIN_EMAIL</code>, <code>BADVIN_PASSWORD</code>.\n"
+            "• گۆڕاوە پشتیوانی کراوەکان: <code>API_TOKEN</code>.\n"
             "• دوای گۆڕان، دوگمەی <b>🔄 دووبارە .env</b> بەکاربەرە بێ گەڕاندنەوە."
         ),
     },
@@ -1467,8 +1296,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "⚙️ <b>إعدادات النظام</b>\n\n"
             "<b>📋 الإعدادات الحالية:</b>\n"
             "🪪 API Token (.env): <code>{api_token}</code>\n"
-            "📧 Badvin Email (.env): <code>{badvin_email}</code>\n"
-            "🔐 Badvin Password (.env): <code>{badvin_password}</code>\n\n"
+            "\n"
             "<b>👑 السوبر أدمن:</b>\n"
             "• من .env: <b>{env_count}</b>\n"
             "• من db.json: <b>{db_count}</b>\n"
@@ -1480,8 +1308,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "⚙️ <b>System settings</b>\n\n"
             "<b>📋 Current values:</b>\n"
             "🪪 API Token (.env): <code>{api_token}</code>\n"
-            "📧 Badvin Email (.env): <code>{badvin_email}</code>\n"
-            "🔐 Badvin Password (.env): <code>{badvin_password}</code>\n\n"
+            "\n"
             "<b>👑 Super admins:</b>\n"
             "• From .env: <b>{env_count}</b>\n"
             "• From db.json: <b>{db_count}</b>\n"
@@ -1493,8 +1320,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "⚙️ <b>ڕێکخستنی سیستەم</b>\n\n"
             "<b>📋 نرخەکانی ئێستا:</b>\n"
             "🪪 API Token (.env): <code>{api_token}</code>\n"
-            "📧 Badvin Email (.env): <code>{badvin_email}</code>\n"
-            "🔐 Badvin Password (.env): <code>{badvin_password}</code>\n\n"
+            "\n"
             "<b>👑 سوپەر ئادمینەکان:</b>\n"
             "• لە .env: <b>{env_count}</b>\n"
             "• لە db.json: <b>{db_count}</b>\n"
@@ -1704,8 +1530,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "💡 <i>تم تحديث:\n"
             "• BOT_TOKEN\n"
             "• TELEGRAM_SUPER_ADMINS\n"
-            "• BADVIN_EMAIL\n"
-            "• BADVIN_PASSWORD</i>"
+            "• API_TOKEN</i>"
         ),
         "en": (
             "✅ <b>.env reloaded successfully</b>\n\n"
@@ -1713,8 +1538,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "💡 <i>Updated:\n"
             "• BOT_TOKEN\n"
             "• TELEGRAM_SUPER_ADMINS\n"
-            "• BADVIN_EMAIL\n"
-            "• BADVIN_PASSWORD</i>"
+            "• API_TOKEN</i>"
         ),
         "ku": (
             "✅ <b>.env بە سەرکەوتووی نوێکرایەوە</b>\n\n"
@@ -1722,8 +1546,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "💡 <i>نوێکرانەوە:\n"
             "• BOT_TOKEN\n"
             "• TELEGRAM_SUPER_ADMINS\n"
-            "• BADVIN_EMAIL\n"
-            "• BADVIN_PASSWORD</i>"
+            "• API_TOKEN</i>"
         ),
     },
     "settings.reload.error": {
@@ -2127,10 +1950,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "• احصل على تقارير مفصلة لأي سيارة بإرسال رقم الشاصي (VIN)\n"
             "• التقارير متوفرة بصيغة PDF عالية الجودة\n"
             "• دعم اللغات: العربية، الإنجليزية، الكردية (بادينية وسورانية)\n\n"
-            "📷 <b>صور السيارات:</b>\n"
-            "• صور السيارة المخفية من BadVin\n"
-            "• صور المزاد الحالي من Apicar\n"
-            "• صور الحوادث السابقة\n\n"
             "💳 <b>إدارة الاشتراك:</b>\n"
             "• متابعة رصيدك الشهري واليومي\n"
             "• طلب تفعيل الحساب أو رفع الحدود\n"
@@ -2152,10 +1971,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "• Get detailed reports for any vehicle by sending the VIN\n"
             "• High-quality PDF reports\n"
             "• Language support: Arabic, English, Kurdish (Badini & Sorani)\n\n"
-            "📷 <b>Vehicle Images:</b>\n"
-            "• Hidden car photos from BadVin\n"
-            "• Current auction photos from Apicar\n"
-            "• Previous accident photos\n\n"
             "💳 <b>Subscription Management:</b>\n"
             "• Track your monthly and daily balance\n"
             "• Request account activation or limit increases\n"
@@ -2177,10 +1992,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "• ڕاپۆرتی ورد بۆ هەر ئۆتۆمبێلێک بە ناردنی VIN\n"
             "• ڕاپۆرتی PDF بە کوالێتی بەرز\n"
             "• پشتگیری زمان: عەرەبی، ئینگلیزی، کوردی (بادینی و سۆرانی)\n\n"
-            "📷 <b>وێنەکانی ئۆتۆمبێل:</b>\n"
-            "• وێنە شاراوەکان لە BadVin\n"
-            "• وێنەکانی مزایدەی ئێستا لە Apicar\n"
-            "• وێنەکانی ڕووداوی پێشوو\n\n"
             "💳 <b>بەڕێوەبردنی بەشداری:</b>\n"
             "• شوێنکەوتنی باڵانسی مانگانە و ڕۆژانە\n"
             "• داواکردنی چالاککردنی هەژمار یان زیادکردنی سنوور\n"
@@ -2202,10 +2013,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "• ڕاپۆرتی ورد بۆ هەر ئۆتۆمبێلێک بە ناردنی VIN\n"
             "• ڕاپۆرتی PDF بە کوالێتی بەرز\n"
             "• پشتگیری زمان: عەرەبی، ئینگلیزی، کوردی (بادینی و سۆرانی)\n\n"
-            "📷 <b>وێنەکانی ئۆتۆمبێل:</b>\n"
-            "• وێنە شاراوەکان لە BadVin\n"
-            "• وێنەکانی مزایدەی ئێستا لە Apicar\n"
-            "• وێنەکانی ڕووداوی پێشوو\n\n"
             "💳 <b>بەڕێوەبردنی بەشداری:</b>\n"
             "• شوێنکەوتنی باڵانسی مانگانە و ڕۆژانە\n"
             "• داواکردنی چالاککردنی هەژمار یان زیادکردنی سنوور\n"
@@ -2219,76 +2026,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "━━━━━━━━━━━━━━━━━━━━\n"
             "💡 <i>دوگمەکانی خوارەوە بەکاربەرە بۆ دەستگەیشتن بە هەموو تایبەتمەندییەکان!</i>"
         ),
-    },
-    "photos.badvin.label": {
-        "ar": "صور السيارة المخفية",
-        "en": "Hidden car photos",
-        "ku": "وێنەی شۆفێرە شاراوەکان",
-    },
-    "photos.auction.label": {
-        "ar": "صور المزاد الحالي",
-        "en": "Current auction photos",
-        "ku": "وێنەکانی مزادی ئێستا",
-    },
-    "photos.accident.label": {
-        "ar": "صور حادث سابق",
-        "en": "Accident photos",
-        "ku": "وێنەکانی ڕووداو",
-    },
-    "photos.status.loading": {
-        "ar": "⏳ <b>{label}</b>\nيتم الآن جمع الصور لـ VIN <code>{vin}</code>...",
-        "en": "⏳ <b>{label}</b>\nFetching photos for VIN <code>{vin}</code>...",
-        "ku": "⏳ <b>{label}</b>\nوێنەکان بۆ VIN <code>{vin}</code> دەهێنرێن...",
-    },
-    "photos.empty": {
-        "ar": "⚠️ لا توجد صور متاحة حالياً.",
-        "en": "⚠️ No photos are available right now.",
-        "ku": "⚠️ هیچ وێنەیەک بوونی نییە لە ئێستادا.",
-    },
-    "photos.error": {
-        "ar": "⚠️ حدث خطأ أثناء جلب الصور.",
-        "en": "⚠️ An error occurred while fetching photos.",
-        "ku": "⚠️ هەڵە ڕوویدا لە کاتی هێنانی وێنەکاندا.",
-    },
-    "photos.accident.empty": {
-        "ar": "⚠️ لا توجد صور حادث متاحة لهذا رقم الشاصي.",
-        "en": "⚠️ No accident images available for this VIN.",
-        "ku": "⚠️ وێنەی ڕووداو بوونی نییە بۆ ئەم VIN ـە.",
-    },
-    "photos.accident.error": {
-        "ar": "⚠️ حدث خطأ أثناء جلب صور الحادث.",
-        "en": "⚠️ Error while fetching accident images.",
-        "ku": "⚠️ هەڵە ڕوویدا لە هێنانی وێنەکانی ڕووداودا.",
-    },
-    "photos.not_enabled": {
-        "ar": "⛔ {label} غير مفعلة لحسابك.",
-        "en": "⛔ {label} is not enabled for your account.",
-        "ku": "⛔ {label} بۆ هەژمارەکەت چالاک نەکراوە.",
-    },
-    "photos.summary": {
-        "ar": "✅ تم إرسال {label} لـ VIN <code>{vin}</code>{days_txt}\n{credit_line}",
-        "en": "✅ Sent {label} for VIN <code>{vin}</code>{days_txt}\n{credit_line}",
-        "ku": "✅ {label} نێردرا بۆ VIN <code>{vin}</code>{days_txt}\n{credit_line}",
-    },
-    "photos.sent.notice": {
-        "ar": "✅ تم إرسال الصور وظهرت أسفل الرسائل.",
-        "en": "✅ Photos sent and displayed below.",
-        "ku": "✅ وێنەکان نێردران و لە خوارەوە دیارە.",
-    },
-    "photos.credit.unlimited": {
-        "ar": "💳 الرصيد: <b>غير محدود</b>",
-        "en": "💳 Credit: <b>Unlimited</b>",
-        "ku": "💳 کریدت: <b>بێ سنوور</b>",
-    },
-    "photos.credit.remaining": {
-        "ar": "💳 الرصيد المتبقي: <b>{remaining}</b>/<b>{limit}</b>",
-        "en": "💳 Remaining credit: <b>{remaining}</b>/<b>{limit}</b>",
-        "ku": "💳 کریدتی ماوە: <b>{remaining}</b>/<b>{limit}</b>",
-    },
-    "photos.summary.days_left": {
-        "ar": " — الاشتراك ينتهي بعد <b>{days}</b> يوم",
-        "en": " — subscription ends in <b>{days}</b> days",
-        "ku": " — بەروارەکە کۆتایی دەهات لە <b>{days}</b> ڕۆژدا",
     },
     "activation.prompt": {
         "ar": "🧾 طلب تفعيل\n\nأرسل رقم هاتفك بصيغة +رمز_الدولة ثم الرقم (مثال: +962795378832).\nسنقوم بمراجعة الطلب وإعلامك في أقرب وقت.",
@@ -2373,18 +2110,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "✅ The keyboard button next to attachments is now active.",
         "ku": "✅ دوگمەی تەختەکلیل لە نزیک هەڵگرتنەکان چالاک کرا.",
         "ckb": "✅ دوگمەی تەختەکلیل لە لاگەڵ پاشکەوتەکان چالاک کرا.",
-    },
-    "photos.options.accident": {
-        "ar": "💥 صور حادث سابق",
-        "en": "💥 Previous accident photos",
-        "ku": "💥 وێنەکانی ڕووداوی پێشوو",
-        "ckb": "💥 وێنەکانی ڕووداوی پێشووتر",
-    },
-    "photos.options.hidden": {
-        "ar": "📷 صور السيارة المخفية",
-        "en": "📷 Hidden vehicle photos",
-        "ku": "📷 وێنەکانی ئۆتۆمبێلی شاردراو",
-        "ckb": "📷 وێنەکانی ئۆتۆمبێلی شاردراو",
     },
     "media.ack.support": {
         "ar": "📸 تم استلام المرفق بنجاح. فريق الدعم سيراجعها ويتواصل معك قريبًا.",
@@ -2766,11 +2491,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "• Carfax: {value}",
         "ku": "• Carfax: {value}",
     },
-    "account.field.service.photos": {
-        "ar": "• Photos: {value}",
-        "en": "• Photos: {value}",
-        "ku": "• وێنەکان: {value}",
-    },
     "account.field.daily": {
         "ar": "• اليوم: {value}",
         "en": "• Today: {value}",
@@ -2936,24 +2656,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "❌ Cancel",
         "ku": "❌ هەڵوەشاندنەوە",
     },
-    "wa.photos.prompt": {
-        "ar": "📸 اختر نوع الصور:\n1️⃣ صور حادث سابق\n2️⃣ صور السيارة المخفية",
-        "en": "📸 Choose photo type:\n1️⃣ Accident images\n2️⃣ Hidden car photos",
-        "ku": "📸 جۆری وێنە هەڵبژێرە:\n1️⃣ وێنەکانی ڕووداو\n2️⃣ وێنەکانی ئۆتۆموبیڵی شاردراو",
-        "ckb": "📸 جۆری وێنە هەڵبژێرە:\n1️⃣ وێنەکانی ڕووداوی پێشووتر\n2️⃣ وێنەکانی ئۆتۆمبێلی شاردراو",
-    },
-    "wa.photos.option.accident": {
-        "ar": "1. صور حادث سابق 💥",
-        "en": "1. Accident photos 💥",
-        "ku": "1. وێنەی ڕووداو 💥",
-        "ckb": "1. وێنەکانی ڕووداوی پێشووتر 💥",
-    },
-    "wa.photos.option.hidden": {
-        "ar": "2. صور السيارة المخفية 📷",
-        "en": "2. Hidden car photos 📷",
-        "ku": "2. وێنەی ئۆتۆموبیڵی شاردراو 📷",
-        "ckb": "2. وێنەکانی ئۆتۆمبێلی شاردراو 📷",
-    },
     "wa.progress.processing": {
         "ar": "🔍 *جاري معالجة الطلب...*",
         "en": "🔍 *Processing your request...*",
@@ -2996,18 +2698,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ku": "⏳ *چاوەڕێ بکە، ڕاپۆرتەکە دەهێنرێت...*",
         "ckb": "⏳ *چاوەڕێ بکە، ڕاپۆرتەکە دەهێنرێت...*",
     },
-    "wa.photos.fetching": {
-        "ar": "📸 جاري جلب الصور لـ VIN: {vin}",
-        "en": "📸 Fetching photos for VIN: {vin}",
-        "ku": "📸 وێنەکان بۆ VIN: {vin} دەهێنرێن", 
-        "ckb": "📸 وێنەکان بۆ VIN: {vin} دەهێنرێن",
-    },
-    "wa.photos.sent_count": {
-        "ar": "✅ تم إرسال {count} صورة.",
-        "en": "✅ Sent {count} image(s).",
-        "ku": "✅ {count} وێنە نێردرا.",
-        "ckb": "✅ {count} وێنە نێردرا.",
-    },
     "wa.language.updated": {
         "ar": "✅ تم تغيير لغة التقارير إلى العربية.",
         "en": "✅ Report language set to English.",
@@ -3019,36 +2709,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "⚠️ Invalid choice. Send 1, 2, 3, or 4.",
         "ku": "⚠️ هەڵبژاردە نادروستە. 1 یان 2 یان 3 یان 4 بنێرە.",
         "ckb": "⚠️ هەڵبژاردە نادروستە. 1 یان 2 یان 3 یان 4 بنێرە.",
-    },
-    "wa.photos.none.accident": {
-        "ar": "⚠️ لا توجد صور حادث متاحة لهذا رقم الشاصي.",
-        "en": "⚠️ No accident images available for this VIN.",
-        "ku": "⚠️ وێنەی ڕووداو بۆ ئەم ژمارەی شاصیە بوونی نییە.",
-        "ckb": "⚠️ هیچ وێنەی ڕووداو بۆ ئەم ژمارەی شاسیە نییە.",
-    },
-    "wa.photos.none.generic": {
-        "ar": "⚠️ لا توجد صور متاحة لهذا الرقم.",
-        "en": "⚠️ No images available for this VIN.",
-        "ku": "⚠️ هیچ وێنەیەک بوونی نییە بۆ ئەم شاصیە.",
-        "ckb": "⚠️ هیچ وێنەیەک بۆ ئەم شاسیە نییە.",
-    },
-    "wa.photos.fetch_error.accident": {
-        "ar": "⚠️ حدث خطأ أثناء جلب صور الحادث.",
-        "en": "⚠️ Error while fetching accident images.",
-        "ku": "⚠️ هەڵە ڕوویدا لە هێنانى وێنەکانی ڕووداو.",
-        "ckb": "⚠️ هەڵە ڕوویدا لە هێنانی وێنەکانی ڕووداو.",
-    },
-    "wa.photos.fetch_error.generic": {
-        "ar": "⚠️ حدث خطأ أثناء جلب الصور.",
-        "en": "⚠️ Error while fetching images.",
-        "ku": "⚠️ هەڵە ڕوویدا لە هێنانى وێنەکان.",
-        "ckb": "⚠️ هەڵە ڕوویدا لە هێنانی وێنەکان.",
-    },
-    "wa.photos.send_error": {
-        "ar": "⚠️ تعذر إرسال الصور حالياً.",
-        "en": "⚠️ Could not send images right now.",
-        "ku": "⚠️ نەتوانرا ئێستا وێنەکان بنێردرێن.",
-        "ckb": "⚠️ نەتوانرا ئێستا وێنەکان بنێردرێن.",
     },
     "wa.footer.brand": {
         "ar": "خدمات بوت كارفاكس",
@@ -3977,9 +3637,6 @@ def _guess_mime_from_name(filename: Optional[str]) -> Optional[str]:
 
 
 async def _download_remote_media(url: str, mime_hint: Optional[str]) -> Tuple[Optional[bytes], Optional[str]]:
-    data = await download_image_bytes(url)
-    if data:
-        return data, mime_hint or _guess_mime_from_name(url)
     try:
         import httpx  # local import to avoid mandatory dependency if unused
 
@@ -4114,8 +3771,6 @@ def _compose_profile_overview(db_user: Dict[str, Any], language: Optional[str] =
 
     services = db_user.get("services", {}) or {}
     carfax_status = "✅" if services.get("carfax", True) else "⛔"
-    # Per requirement: Photos should always appear enabled for users
-    photos_status = "✅"
 
     today_used = _safe_int(limits.get("today_used"))
     daily_limit = _safe_int(limits.get("daily"))
@@ -4146,7 +3801,6 @@ def _compose_profile_overview(db_user: Dict[str, Any], language: Optional[str] =
         "━━━━━━━━━━━━━━━━━━━━",
         t("account.section.services", lang),
         t("account.field.service.carfax", lang, value=carfax_status),
-        t("account.field.service.photos", lang, value=photos_status),
         "━━━━━━━━━━━━━━━━━━━━",
         t("account.section.limits", lang),
         t("account.field.daily", lang, value=daily_str),

@@ -92,9 +92,6 @@ def _default_user(tg_id: str, tg_username: Optional[str]) -> Dict[str, Any]:
         "plan": "basic",
         "services": {
             "carfax": True,
-            "photos_badvin": True,
-            "photos_auction": True,
-            "photos_accident": True,
         },
         "limits": {"daily": 200, "monthly": 500, "today_used": 0, "month_used": 0, "last_day": None, "last_month": None},
         "stats": {"total_reports": 0, "last_report_ts": None},
@@ -116,12 +113,12 @@ def ensure_user(db: Dict[str, Any], tg_id: str, tg_username: Optional[str]) -> D
             users[tg_id].setdefault(key, value)
         users[tg_id].pop("sessions", None)
         services = users[tg_id].setdefault("services", {})
-        if "photos" in services and "photos_badvin" not in services:
-            services["photos_badvin"] = bool(services.pop("photos"))
+        # Feature cleanup: drop any legacy photo service flags.
+        services.pop("photos", None)
+        for _k in list(services.keys()):
+            if _k.startswith("photos_"):
+                services.pop(_k, None)
         services.setdefault("carfax", True)
-        services.setdefault("photos_badvin", True)
-        services.setdefault("photos_auction", True)
-        services.setdefault("photos_accident", True)
     return users[tg_id]
 
 
@@ -169,8 +166,7 @@ def now_str() -> str:
 
 
 def _sanitize_settings(settings: Dict[str, Any]) -> None:
-    for key in ("api_token", "badvin_email", "badvin_password"):
-        settings.pop(key, None)
+    settings.pop("api_token", None)
 
 
 def _backup_existing_db(path: str) -> None:

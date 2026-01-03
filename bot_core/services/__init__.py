@@ -1,1 +1,1 @@
-"""Service helpers (images, pdf, translation, etc.)."""
+"""Service helpers (pdf, translation, reports, notifications, etc.)."""

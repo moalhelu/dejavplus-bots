@@ -64,16 +64,6 @@ from bot_core.storage import (
     commit_credit as _commit_credit,
 )
 from bot_core.request_id import compute_request_id
-from bot_core.services.images import (
-    get_badvin_images as _get_badvin_images,
-    get_badvin_images_media as _get_badvin_images_media,
-    get_apicar_current_images as _get_apicar_current_images,
-    get_apicar_history_images as _get_apicar_history_images,
-    get_apicar_accident_images as _get_apicar_accident_images,
-    get_hidden_vehicle_images as _get_hidden_vehicle_images,
-    download_image_bytes as _download_image_bytes,
-    _select_images,
-)
 from bot_core.services.translation import (
     inject_rtl as _inject_rtl,
     translate_html as _translate_html,
@@ -212,25 +202,10 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 API_URL   = os.getenv("API_URL", "").strip()
 API_TOKEN = os.getenv("API_TOKEN", "").strip()
 
-# === Badvin credentials ===
-BADVIN_EMAIL = os.getenv("BADVIN_EMAIL", "").strip()
-BADVIN_PASSWORD = os.getenv("BADVIN_PASSWORD", "").strip()
-
-# === Apicar photos API ===
-DEFAULT_APICAR_BASE_URL = "https://api.apicar.store/api"
-DEFAULT_APICAR_API_KEY = "1f14a9d6-14e2-49b6-bc12-fd881b5a3e08"
-APICAR_BASE_URL = os.getenv("APICAR_API_BASE", DEFAULT_APICAR_BASE_URL).strip() or DEFAULT_APICAR_BASE_URL
-APICAR_API_KEY = os.getenv("APICAR_API_KEY", DEFAULT_APICAR_API_KEY).strip() or DEFAULT_APICAR_API_KEY
-try:
-    APICAR_TIMEOUT = float(os.getenv("APICAR_API_TIMEOUT", "25"))
-except ValueError:
-    APICAR_TIMEOUT = 25.0
-APICAR_IMAGE_TIMEOUT = float(os.getenv("APICAR_IMAGE_TIMEOUT", str(APICAR_TIMEOUT)))
-
 # =================== Telegram ===================
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.constants import ParseMode
 
@@ -1454,30 +1429,12 @@ def _svc_kb(u: Dict[str, Any], lang: Optional[str] = None) -> InlineKeyboardMark
         return "✅" if b else "⛔"
 
     carfax_label = _bridge.t("usercard.service.carfax", lang)
-    accident_label = _bridge.t("usercard.service.photos_accident", lang)
-    hidden_label = _bridge.t("usercard.service.photos_badvin", lang)
-    auction_label = _bridge.t("usercard.service.photos_auction", lang)
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"📄 {carfax_label} {onoff(s.get('carfax'))}", callback_data=f"svc:carfax:{tg}")],
-        [InlineKeyboardButton(f"💥 {accident_label} {onoff(s.get('photos_accident'))}", callback_data=f"svc:photos_accident:{tg}")],
-        [InlineKeyboardButton(f"📷 {hidden_label} {onoff(s.get('photos_badvin'))}", callback_data=f"svc:photos_badvin:{tg}")],
-        [InlineKeyboardButton(f"🚗 {auction_label} {onoff(s.get('photos_auction'))}", callback_data=f"svc:photos_auction:{tg}")],
         [InlineKeyboardButton(_bridge.t("action.back", lang), callback_data="main_menu:show")],
         [InlineKeyboardButton(_bridge.t("usercard.buttons.main_menu", lang), callback_data="main_menu:show")]
     ])
-
-def _photos_options_keyboard(u: Dict[str, Any], vin: str) -> Optional[InlineKeyboardMarkup]:
-    services = u.get("services", {})
-    lang = _get_user_report_lang(u)
-    rows: List[List[InlineKeyboardButton]] = []
-    if services.get("photos_accident"):
-        rows.append([InlineKeyboardButton(_bridge.t("photos.options.accident", lang), callback_data=f"photos:accident:{vin}")])
-    if services.get("photos_badvin"):
-        rows.append([InlineKeyboardButton(_bridge.t("photos.options.hidden", lang), callback_data=f"photos:badvin:{vin}")])
-    if not rows:
-        return None
-    return InlineKeyboardMarkup(rows)
 
 def _limits_kb(u: Dict[str, Any], lang: Optional[str] = None) -> InlineKeyboardMarkup:
     tg = u["tg_id"]
@@ -1521,9 +1478,6 @@ def _render_usercard_text(u: Dict[str, Any], lang: Optional[str] = None) -> str:
         "usercard.services.line",
         lang,
         carfax="✅" if s.get("carfax") else "⛔",
-        badvin="✅" if s.get("photos_badvin") else "⛔",
-        auction="✅" if s.get("photos_auction") else "⛔",
-        accident="✅" if s.get("photos_accident") else "⛔",
     )
     limits_line = _bridge.t(
         "usercard.limits.line",
@@ -3666,8 +3620,14 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif root == "svc":
         _, svc, target_tg = parts
-        if svc == "photos":
-            svc = "photos_badvin"
+        if svc != "carfax":
+            u = _ensure_user(db, target_tg, None)
+            await update.callback_query.edit_message_text(
+                _bridge.t("services.manage.title", lang),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_svc_kb(u, lang),
+            )
+            return
         u = _ensure_user(db, target_tg, None)
         cur = u["services"].get(svc, False)
         u["services"][svc] = not cur
@@ -3675,10 +3635,6 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_db(db)
         svc_names = {
             "carfax": "usercard.service.carfax",
-            "photos": "usercard.service.carfax",
-            "photos_badvin": "usercard.service.photos_badvin",
-            "photos_auction": "usercard.service.photos_auction",
-            "photos_accident": "usercard.service.photos_accident",
         }
         target_lang = _get_user_report_lang(u)
         svc_key = svc_names.get(svc, svc)
@@ -3694,7 +3650,11 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _notify_supers(context, _bridge.t("services.notify.super", lang, admin=admin_tg, action=action_txt, service=svc_label_admin, user=_fmt_tg_with_phone(target_tg)))
         except Exception:
             pass
-        await update.callback_query.edit_message_text(_bridge.t("services.manage.title", lang), parse_mode=ParseMode.HTML, reply_markup=_svc_kb(u, lang))
+        await update.callback_query.edit_message_text(
+            _bridge.t("services.manage.title", lang),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_svc_kb(u, lang),
+        )
 
     elif root == "lang":
         # تبديل اللغة (مستخدم أو أدمن)
@@ -3846,12 +3806,10 @@ async def settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     supers = _db_super_admins(db)
 
-    if action in {"set_api_token", "set_badvin_email", "set_badvin_password", "secrets_policy"}:
+    if action in {"set_api_token", "secrets_policy"}:
         context.user_data.pop("await", None)
         env_map = {
             "set_api_token": "API_TOKEN",
-            "set_badvin_email": "BADVIN_EMAIL",
-            "set_badvin_password": "BADVIN_PASSWORD",
         }
         if action == "secrets_policy":
             text = _bridge.t("settings.secrets_policy.text", lang)
@@ -4112,8 +4070,6 @@ async def open_settings_panel(update: Update, context: ContextTypes.DEFAULT_TYPE
             "settings.menu.summary",
             lang,
             api_token=_mask(cfg.api_token),
-            badvin_email=_mask(cfg.badvin_email),
-            badvin_password=_mask(cfg.badvin_password),
             env_count=env_admins_count,
             db_count=db_admins_count,
             total=total_supers,
@@ -4506,12 +4462,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u = _ensure_user(db, target, None)
 
         # ===== Settings inputs =====
-        if op in ("set_api_token", "set_badvin_email", "set_badvin_password"):
+        if op in ("set_api_token",):
             context.user_data["await"] = None
             env_map = {
                 "set_api_token": "API_TOKEN",
-                "set_badvin_email": "BADVIN_EMAIL",
-                "set_badvin_password": "BADVIN_PASSWORD",
             }
             env_var = env_map.get(op, "")
             await update.message.reply_text(
@@ -5448,13 +5402,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context,
                     _bridge.t("report.dashboard.success", None, vin=vin, user=user_label, remaining=remaining_txt),
                 )
-                photos_kb = _photos_options_keyboard(finalize_snapshot["user"], vin)
-                if photos_kb:
-                    try:
-                        await msg.edit_reply_markup(reply_markup=photos_kb)
-                    except Exception:
-                        pass
-
                 return
             else:
                 refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False, rid=rid_charge)
@@ -5585,260 +5532,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     return
-
-# =================== Photos callback ===================
-
-    # --- smart fallback to avoid VIN warning on button clicks ---
-    try:
-        txt = (txt or "").strip()
-    except Exception:
-        txt = txt if isinstance(txt, str) else ""
-
-    vin_try = _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
-    looks_like_vin = bool(re.search(r"[A-Za-z0-9]{10,}", (txt or "")))
-
-    if txt in ALL_BUTTON_LABELS or not txt:
-        return 
-    if looks_like_vin and not vin_try:
-        try:
-            await update.message.reply_text(_menu_hint_text(lang))
-        except Exception:
-            pass
-        return
-
-    return 
-async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    try:
-        _, action, vin = q.data.split(":", 2)
-    except ValueError:
-        return await q.answer(_bridge.t("common.invalid_button", user_lang), show_alert=True)
-    tg_id = str(q.from_user.id)
-    db = _load_db()
-    u = _ensure_user(db, tg_id, None)
-    services = u.get("services", {})
-
-    def _accident_no_images(lang: str) -> str:
-        return _bridge.t("report.photos.empty.accident", lang)
-
-    def _accident_error(lang: str) -> str:
-        return _bridge.t("report.photos.accident.error", lang)
-
-    user_lang = _get_user_report_lang(u)
-    rid = f"tg-img-{tg_id}-{int(time.time())}"
-
-    photo_actions: Dict[str, Dict[str, Any]] = {
-        "badvin": {
-            "service": "photos_badvin",
-            "label": _bridge.t("photos.label.hidden", user_lang),
-                "loader": _get_hidden_vehicle_images,
-            "empty": _bridge.t("report.photos.empty.hidden", user_lang),
-            "heading": _bridge.t("photos.heading.hidden", user_lang),
-        },
-        "auction": {
-            "service": "photos_auction",
-            "label": _bridge.t("photos.label.auction", user_lang),
-            "loader": _get_apicar_current_images,
-            "empty": _bridge.t("report.photos.empty.auction", user_lang),
-            "heading": _bridge.t("photos.heading.auction", user_lang),
-        },
-        "accident": {
-            "service": "photos_accident",
-            "label": _bridge.t("photos.label.accident", user_lang),
-            "loader": _get_apicar_accident_images,
-            "empty": _accident_no_images(user_lang),
-            "heading": _bridge.t("photos.heading.accident", user_lang),
-        },
-    }
-
-    info = photo_actions.get(action)
-    if not info:
-        return await q.answer(_bridge.t("common.unknown_option", user_lang), show_alert=True)
-
-    service_key = info["service"]
-    if not services.get(service_key, False):
-        return await q.answer(_bridge.t("photos.not_enabled", user_lang, label=info["label"]), show_alert=True)
-
-    await q.answer(_bridge.t("report.photos.collecting", user_lang, label=info["label"], vin=vin), show_alert=False)
-
-    chat_id = q.message.chat_id
-    status_msg = None
-
-    async def _status_update(text: str, *, markup: Optional[InlineKeyboardMarkup] = None) -> bool:
-        if not status_msg:
-            return False
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg.message_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-            )
-            return True
-        except Exception:
-            return False
-
-    try:
-        status_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=_bridge.t("report.photos.collecting", user_lang, label=info["label"], vin=vin),
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        status_msg = None
-
-    # --- BadVin: prefer authenticated bytes (protected images), fallback to URL flow ---
-    if action == "badvin":
-        try:
-            media_items = await _get_badvin_images_media(
-                vin,
-                limit=int(os.getenv("BADVIN_MEDIA_LIMIT", "30") or 30),
-            )
-        except Exception:
-            media_items = []
-
-        if media_items:
-            BATCH = 10
-            sent_any = False
-            for i in range(0, len(media_items), BATCH):
-                chunk = media_items[i:i + BATCH]
-                media: List[InputMediaPhoto] = []
-                for filename, data in chunk:
-                    if not data:
-                        continue
-                    bio = BytesIO(data)
-                    bio.name = filename or "photo.jpg"
-                    media.append(InputMediaPhoto(bio))
-                if not media:
-                    continue
-                try:
-                    if len(media) == 1:
-                        await context.bot.send_photo(chat_id=chat_id, photo=media[0].media)
-                    else:
-                        await context.bot.send_media_group(chat_id=chat_id, media=media)
-                    sent_any = True
-                except Exception:
-                    continue
-
-            if not sent_any:
-                fail_msg = _bridge.t("report.photos.error", user_lang)
-                if not await _status_update(fail_msg):
-                    await context.bot.send_message(chat_id=chat_id, text=fail_msg, parse_mode=ParseMode.HTML)
-                return
-
-            left_days = _days_left(u.get("expiry_date"))
-            days_txt = _bridge.t("report.summary.expires_in", user_lang, days=left_days) if left_days is not None else ""
-            monthly_remaining = _remaining_monthly_reports(u)
-            monthly_limit = _safe_int(u.get("limits", {}).get("monthly"))
-            credit_line = _bridge.t("report.summary.unlimited", user_lang) if monthly_remaining is None else _bridge.t(
-                "report.summary.credit", user_lang, remaining=monthly_remaining, limit=monthly_limit
-            )
-            summary = _bridge.t("report.summary.sent", user_lang, label=info["label"], vin=vin, expires=days_txt, credit=credit_line)
-            if not await _status_update(summary):
-                await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode=ParseMode.HTML)
-            await q.answer(_bridge.t("report.photos.toast", user_lang), show_alert=False)
-            return
-
-    try:
-        if action == "accident":
-            logger.info("telegram: fetching accident images via apicar vin=%s", vin)
-        urls = await info["loader"](vin, rid=rid)
-    except Exception:
-        if action == "accident":
-            err_msg = _accident_error(user_lang)
-        else:
-            err_msg = info["empty"]
-        if not await _status_update(err_msg):
-            await context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode=ParseMode.HTML)
-        return
-
-    urls = _select_images(urls)
-    if not urls:
-        no_images_msg = info["empty"]
-        if not await _status_update(no_images_msg):
-            await context.bot.send_message(chat_id=chat_id, text=no_images_msg, parse_mode=ParseMode.HTML)
-        return
-
-    def _is_jpeg(data: bytes) -> bool:
-        return bool(data) and data.startswith(b"\xFF\xD8\xFF")
-
-    def _is_png(data: bytes) -> bool:
-        return bool(data) and data.startswith(b"\x89PNG\r\n\x1a\n")
-
-    def _guess_ext(data: bytes) -> str:
-        if _is_png(data):
-            return ".png"
-        if _is_jpeg(data):
-            return ".jpg"
-        return ".bin"
-
-    TG_PHOTO_MAX_BYTES = 8 * 1024 * 1024
-
-    sent_count = 0
-    failed_count = 0
-    # Send sequentially to support per-item photo/document fallback.
-    for url in urls:
-        # Fast path: public URL as photo.
-        try:
-            await context.bot.send_photo(chat_id=chat_id, photo=url)
-            sent_count += 1
-            continue
-        except Exception:
-            pass
-
-        # Download and decide photo vs document.
-        try:
-            data = await _download_image_bytes(url, rid=rid)
-        except Exception:
-            data = None
-        if not data:
-            failed_count += 1
-            continue
-
-        ext = _guess_ext(data)
-        filename = (url.split("?", 1)[0].split("/")[-1] or f"photo{ext}")
-        if "." not in filename:
-            filename += ext
-
-        bio = BytesIO(data)
-        bio.name = filename
-
-        try:
-            if len(data) <= TG_PHOTO_MAX_BYTES and (_is_jpeg(data) or _is_png(data)):
-                await context.bot.send_photo(chat_id=chat_id, photo=bio)
-            else:
-                await context.bot.send_document(chat_id=chat_id, document=bio, filename=filename)
-            sent_count += 1
-        except Exception:
-            failed_count += 1
-            continue
-
-    if sent_count <= 0:
-        reason = _bridge.t("report.photos.error", user_lang)
-        if not await _status_update(reason):
-            await context.bot.send_message(chat_id=chat_id, text=reason, parse_mode=ParseMode.HTML)
-        return
-
-    left_days = _days_left(u.get("expiry_date"))
-    days_txt = _bridge.t("report.summary.expires_in", user_lang, days=left_days) if left_days is not None else ""
-    monthly_remaining = _remaining_monthly_reports(u)
-    monthly_limit = _safe_int(u.get("limits", {}).get("monthly"))
-    credit_line = _bridge.t("report.summary.unlimited", user_lang) if monthly_remaining is None else _bridge.t("report.summary.credit", user_lang, remaining=monthly_remaining, limit=monthly_limit)
-    # Terminal message: always indicate delivered count (0 allowed above with reason).
-    summary = _bridge.t(
-        "report.summary.sent",
-        user_lang,
-        label=info["label"],
-        vin=vin,
-        expires=days_txt,
-        credit=credit_line,
-    ) + f"\n\n{sent_count}/{len(urls)}"
-    if not await _status_update(summary):
-        await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode=ParseMode.HTML)
-
-    await q.answer(_bridge.t("report.photos.toast", user_lang), show_alert=False)
 
 # =================== Contact user (no username) ===================
 async def contact_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6153,7 +5846,6 @@ def main():
     app.add_handler(CallbackQueryHandler(usercard_cb, pattern=r"^(ucard|svc|limits|limitreq|lang|stats|notify|users):"))
     app.add_handler(CallbackQueryHandler(users_pager_cb, pattern=r"^users:page:"))
     app.add_handler(CallbackQueryHandler(pending_cb, pattern=r"^pending:"))
-    app.add_handler(CallbackQueryHandler(photos_cb, pattern=r"^photos:"))
     app.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^settings:"))
     app.add_handler(CallbackQueryHandler(contact_user_cb, pattern=r"^user:contact:"))
     app.add_handler(CallbackQueryHandler(user_phone_cb, pattern=r"^user:phone:"))
@@ -6275,7 +5967,7 @@ async def new_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         today_used=today_used,
         daily_limit=daily_limit,
         monthly_label=(
-            _bridge.t("photos.credit.unlimited", lang)
+            _bridge.t("usercard.unlimited", lang)
             if monthly_remaining is None
             else f"{monthly_remaining}/{monthly_limit}"
         ),

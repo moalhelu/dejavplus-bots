@@ -505,7 +505,16 @@ async def _wa_run_vin_report_job(
         pass
     # Keep user messaging neutral (no noisy markers).
     try:
-        await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", lang), client=client)
+        err_key = "report.error.generic"
+        try:
+            errs = [str(e).lower() for e in (getattr(last_result, "errors", None) or [])] if last_result is not None else []
+        except Exception:
+            errs = []
+        if any("invalid_token" in e for e in errs) or any(e.startswith("http_401") or e.startswith("http_403") for e in errs):
+            err_key = "report.error.fetch"
+        elif any("timeout" in e for e in errs):
+            err_key = "report.error.timeout"
+        await send_whatsapp_text(msisdn, _bridge.t(err_key, lang), client=client)
     except Exception:
         pass
 

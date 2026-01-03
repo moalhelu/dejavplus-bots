@@ -98,6 +98,68 @@ REPORT_LANG_CODES = tuple(REPORT_LANG_INFO.keys())
 LANG_BUTTON_TEXTS = tuple(info["label"] for info in REPORT_LANG_INFO.values())
 RTL_REPORT_LANGS = {"ar", "ku", "ckb"}
 
+
+def _is_upstream_unauthorized_result(rr: Optional["_ReportResult"]) -> bool:
+    if not rr:
+        return False
+    try:
+        errors = [str(e).lower() for e in (getattr(rr, "errors", None) or [])]
+    except Exception:
+        errors = []
+    if any("invalid_token" in e for e in errors):
+        return True
+    if any(e.startswith("http_401") or e.startswith("http_403") for e in errors):
+        return True
+    try:
+        raw = getattr(rr, "raw_response", None)
+        if isinstance(raw, dict):
+            status = raw.get("status")
+            if int(status) in (401, 403):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_retryable_report_failure(rr: Optional["_ReportResult"]) -> bool:
+    if not rr:
+        return True
+    if getattr(rr, "success", False):
+        return False
+    if _is_upstream_unauthorized_result(rr):
+        return False
+    try:
+        errors = [str(e).lower() for e in (getattr(rr, "errors", None) or [])]
+    except Exception:
+        errors = []
+    if any("invalid_vin" in e for e in errors):
+        return False
+    transient_markers = (
+        "timeout",
+        "http_500",
+        "http_502",
+        "http_503",
+        "http_504",
+        "non_pdf_upstream",
+        "exception",
+    )
+    return any(m in e for e in errors for m in transient_markers) or not errors
+
+
+def _report_failure_user_message(rr: Optional["_ReportResult"], lang: str) -> str:
+    if not rr:
+        return _bridge.t("report.error.generic", lang)
+    if _is_upstream_unauthorized_result(rr):
+        return _bridge.t("report.error.fetch", lang)
+    try:
+        errors = [str(e).lower() for e in (getattr(rr, "errors", None) or [])]
+    except Exception:
+        errors = []
+    if any("timeout" in e for e in errors):
+        return _bridge.t("report.error.timeout", lang)
+    user_msg = str(getattr(rr, "user_message", None) or "").strip()
+    return user_msg or _bridge.t("report.error.fetch", lang)
+
 def _menu_label(lang: str, key: str) -> str:
     lang_code = (lang or "ar").lower()
     return _bridge.t(f"menu.{key}.label", lang_code)
@@ -5170,26 +5232,46 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         bridge_pdf_path = pdf_doc.get("path")
 
             if not report_result:
-                try:
-                    report_result = await asyncio.wait_for(
-                        _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(tg_id)),
-                        timeout=_tg_remaining_s(),
-                    )
-                except asyncio.TimeoutError:
-                    report_result = _ReportResult(
-                        success=False,
-                        user_message=_bridge.t("report.error.timeout", report_lang),
-                        errors=["timeout"],
-                        vin=vin,
-                    )
-                except Exception as exc:
-                    logger.error("tg_report_generation_failed", extra={"vin": vin, "tg_id": tg_id}, exc_info=True)
-                    report_result = _ReportResult(
-                        success=False,
-                        user_message=_bridge.t("report.error.generic", report_lang),
-                        errors=[repr(exc)],
-                        vin=vin,
-                    )
+                gen_attempts = int(os.getenv("TG_REPORT_RETRIES", "3") or 3)
+                gen_attempts = max(1, min(gen_attempts, 6))
+                gen_backoffs = [0.0, 1.0, 3.0, 7.0, 12.0, 20.0]
+                last_exc: Optional[BaseException] = None
+                for i in range(gen_attempts):
+                    if i > 0:
+                        try:
+                            await asyncio.sleep(gen_backoffs[min(i, len(gen_backoffs) - 1)])
+                        except Exception:
+                            pass
+                    try:
+                        report_result = await asyncio.wait_for(
+                            _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(tg_id)),
+                            timeout=_tg_remaining_s(),
+                        )
+                    except asyncio.TimeoutError:
+                        report_result = _ReportResult(
+                            success=False,
+                            user_message=_bridge.t("report.error.timeout", report_lang),
+                            errors=["timeout"],
+                            vin=vin,
+                        )
+                    except Exception as exc:
+                        last_exc = exc
+                        logger.error(
+                            "tg_report_generation_failed",
+                            extra={"vin": vin, "tg_id": tg_id, "attempt": i + 1},
+                            exc_info=True,
+                        )
+                        report_result = _ReportResult(
+                            success=False,
+                            user_message=_bridge.t("report.error.fetch", report_lang),
+                            errors=[f"exception:{type(exc).__name__}"],
+                            vin=vin,
+                        )
+
+                    if report_result and getattr(report_result, "success", False) and getattr(report_result, "pdf_bytes", None):
+                        break
+                    if not _is_retryable_report_failure(report_result):
+                        break
         except asyncio.TimeoutError:
             # SLA timeout anywhere in the fast pipeline.
             report_result = _ReportResult(
@@ -5229,7 +5311,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             if not report_result.success:
-                err_text = report_result.user_message or _bridge.t("report.error.fetch", report_lang)
+                err_text = _report_failure_user_message(report_result, report_lang)
                 refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False, rid=rid_charge)
                 refreshed_header = _build_vin_progress_header(
                     vin,
@@ -5284,42 +5366,64 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                         raise RuntimeError("upstream_pdf_parity_mismatch")
 
-                    bio = BytesIO(pdf_bytes)
-                    bio.name = report_result.pdf_filename or f"{vin}.pdf"
-                    try:
-                        from bot_core.telemetry import atimed
-                    except Exception:
-                        atimed = None
-                    if atimed:
-                        async with atimed(
-                            "tg.send_document",
-                            bytes=len(pdf_bytes),
-                            via="bytes",
-                            vin=vin,
-                            upstream_sha256=(upstream_sha256 or ""),
-                            delivered_sha256=(delivered_sha256 or ""),
-                        ):
-                            await asyncio.wait_for(
-                                context.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=bio,
-                                    filename=bio.name,
-                                    caption=f"📄 تقرير VIN <code>{vin}</code>",
-                                    parse_mode=ParseMode.HTML,
-                                ),
-                                timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
-                            )
-                    else:
-                        await asyncio.wait_for(
-                            context.bot.send_document(
-                                chat_id=update.effective_chat.id,
-                                document=bio,
-                                filename=bio.name,
-                                caption=f"📄 تقرير VIN <code>{vin}</code>",
-                                parse_mode=ParseMode.HTML,
-                            ),
-                            timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
-                        )
+                    max_send_attempts = int(os.getenv("TG_DELIVERY_RETRIES", "3") or 3)
+                    max_send_attempts = max(1, min(max_send_attempts, 6))
+                    send_backoffs = [0.0, 1.0, 3.0, 7.0, 12.0, 20.0]
+                    last_send_exc: Optional[BaseException] = None
+                    sent_ok = False
+                    for attempt in range(max_send_attempts):
+                        if attempt > 0:
+                            try:
+                                await asyncio.sleep(send_backoffs[min(attempt, len(send_backoffs) - 1)])
+                            except Exception:
+                                pass
+                        try:
+                            bio = BytesIO(pdf_bytes)
+                            bio.name = report_result.pdf_filename or f"{vin}.pdf"
+                            try:
+                                from bot_core.telemetry import atimed
+                            except Exception:
+                                atimed = None
+                            if atimed:
+                                async with atimed(
+                                    "tg.send_document",
+                                    bytes=len(pdf_bytes),
+                                    via="bytes",
+                                    vin=vin,
+                                    upstream_sha256=(upstream_sha256 or ""),
+                                    delivered_sha256=(delivered_sha256 or ""),
+                                ):
+                                    await asyncio.wait_for(
+                                        context.bot.send_document(
+                                            chat_id=update.effective_chat.id,
+                                            document=bio,
+                                            filename=bio.name,
+                                            caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                            parse_mode=ParseMode.HTML,
+                                        ),
+                                        timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
+                                    )
+                            else:
+                                await asyncio.wait_for(
+                                    context.bot.send_document(
+                                        chat_id=update.effective_chat.id,
+                                        document=bio,
+                                        filename=bio.name,
+                                        caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                        parse_mode=ParseMode.HTML,
+                                    ),
+                                    timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
+                                )
+                            sent_ok = True
+                            break
+                        except asyncio.TimeoutError as exc:
+                            last_send_exc = exc
+                        except Exception as exc:
+                            last_send_exc = exc
+                            logger.warning("tg_send_document_failed vin=%s attempt=%s", vin, attempt + 1, exc_info=True)
+
+                    if not sent_ok:
+                        raise (last_send_exc or RuntimeError("tg_send_document_failed"))
                     try:
                         logger.info(
                             "tg_pdf_delivered vin=%s bytes=%s upstream_sha256=%s delivered_sha256=%s",
@@ -5340,7 +5444,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as exc:
                     report_result = _ReportResult(
                         success=False,
-                        user_message=_bridge.t("report.error.generic", report_lang),
+                        user_message=_bridge.t("report.error.fetch", report_lang),
                         errors=[f"send_failed:{exc}"],
                         vin=vin,
                     )

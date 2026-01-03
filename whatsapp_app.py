@@ -59,7 +59,6 @@ from bot_core.telemetry import atimed, new_rid, set_rid
 from bot_core.services.translation import close_http_session as _close_translation_session
 from bot_core.services.reports import close_http_session as _close_reports_session
 from bot_core.request_id import compute_request_id
-from bot_core.utils.pdf_format import validate_pdf_format
 
 from bot_core.logging_setup import configure_logging
 
@@ -1864,21 +1863,15 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
 
     public_url = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip() or None
 
-    def _maybe_validate_vin_pdf(raw_bytes: bytes) -> bool:
-        vin = _extract_first_vin(str(filename)) or _extract_first_vin(str(caption))
-        if not vin:
-            return True
-        chk = validate_pdf_format(raw_bytes, expected_vin=vin)
-        if not chk.ok:
-            LOGGER.warning("Blocked PDF send due to format mismatch vin=%s reason=%s", vin, chk.reason)
-            return False
-        return True
+    def _looks_like_pdf(raw_bytes: bytes) -> bool:
+        return bool(raw_bytes) and raw_bytes.startswith(b"%PDF")
 
     # If we have bytes, prefer them (no disk).
     if not base64_payload and not url_value:
         if isinstance(doc_bytes, (bytes, bytearray)) and doc_bytes:
             raw_bytes = bytes(doc_bytes)
-            if not _maybe_validate_vin_pdf(raw_bytes):
+            if not _looks_like_pdf(raw_bytes):
+                LOGGER.warning("Skipping pdf document: invalid PDF header filename=%s", filename)
                 return False
             if len(raw_bytes) >= wa_max_b64_bytes:
                 if not public_url:
@@ -1915,7 +1908,8 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
             if not raw_bytes:
                 LOGGER.warning("Skipping pdf document: failed to read path=%s", path_value)
                 return False
-            if not _maybe_validate_vin_pdf(raw_bytes):
+            if not _looks_like_pdf(raw_bytes):
+                LOGGER.warning("Skipping pdf document: invalid PDF header filename=%s path=%s", filename, path_value)
                 return False
             if len(raw_bytes) >= wa_max_b64_bytes:
                 if not public_url:

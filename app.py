@@ -63,7 +63,6 @@ from bot_core.storage import (
     commit_credit as _commit_credit,
 )
 from bot_core.request_id import compute_request_id
-from bot_core.utils.pdf_format import validate_pdf_format
 from bot_core.services.images import (
     get_badvin_images as _get_badvin_images,
     get_badvin_images_media as _get_badvin_images_media,
@@ -5246,16 +5245,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     pdf_local_path = None
 
-                chk = validate_pdf_format(bytes(report_result.pdf_bytes), expected_vin=vin)
-                if not chk.ok:
+                if not bytes(report_result.pdf_bytes).startswith(b"%PDF"):
                     report_result = _ReportResult(
                         success=False,
                         user_message=_bridge.t("report.error.generic", report_lang),
-                        errors=[f"pdf_format:{chk.reason}"],
+                        errors=["invalid_pdf_header"],
                         vin=vin,
                     )
                 else:
-
                     try:
                         # We are now past generation and entering the upload/send phase.
                         context.chat_data["progress_cap"] = 95
@@ -5399,8 +5396,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 cm.__enter__()
                             full = await _generate_vin_report(vin, language=requested_lang, fast_mode=False)
                             if full and getattr(full, "success", False) and getattr(full, "pdf_bytes", None):
-                                chk2 = validate_pdf_format(bytes(full.pdf_bytes), expected_vin=vin)
-                                if not chk2.ok:
+                                if not bytes(full.pdf_bytes).startswith(b"%PDF"):
                                     return
                                 bio2 = BytesIO(bytes(full.pdf_bytes))
                                 bio2.name = getattr(full, "pdf_filename", None) or f"{vin}.pdf"

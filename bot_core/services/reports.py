@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+from io import BytesIO
 from dataclasses import dataclass, field
 from html import escape, unescape
 from pathlib import Path
@@ -333,6 +334,13 @@ class ReportResult:
 ERROR_UPSTREAM_FETCH_FAILED = "UPSTREAM_FETCH_FAILED"
 ERROR_PDF_RENDER_FAILED = "PDF_RENDER_FAILED"
 
+UPSTREAM_PDF_VHR_OK = "VHR_OK"
+UPSTREAM_PDF_VALUE_REPORT = "VALUE_REPORT"
+UPSTREAM_PDF_FORBIDDEN_OR_ERROR = "FORBIDDEN_OR_ERROR_PDF"
+UPSTREAM_PDF_UNKNOWN = "UNKNOWN_PDF"
+
+VHR_FETCH_FAILED_USER_MESSAGE = "Could not fetch the Vehicle History Report for this VIN. Credit refunded."
+
 
 class UpstreamFetchFailed(RuntimeError):
     pass
@@ -340,6 +348,83 @@ class UpstreamFetchFailed(RuntimeError):
 
 class PdfRenderFailed(RuntimeError):
     pass
+
+
+def _canonical_api_base() -> str:
+    """Canonical DejaVuPlus base URL per docs.
+
+    We ignore non-canonical API_URL values to avoid hitting undocumented routes.
+    """
+
+    cfg = get_env()
+    env_base = (cfg.api_url or "").strip().rstrip("/")
+    canonical = "https://api.dejavuplus.com/api"
+    if not env_base:
+        return canonical
+    low = env_base.lower()
+    if "api.dejavuplus.com" in low:
+        return env_base
+    try:
+        LOGGER.warning("Ignoring non-canonical API_URL=%s; using %s", env_base, canonical)
+    except Exception:
+        pass
+    return canonical
+
+
+def _carfax_url(vin: str, *, ts_ms: Optional[int] = None) -> str:
+    base = _canonical_api_base().rstrip("/")
+    url = f"{base}/carfax/{vin}"
+    if ts_ms is not None:
+        url = f"{url}?ts={int(ts_ms)}"
+    return url
+
+
+def classify_pdf(pdf_bytes: bytes) -> str:
+    """Classify upstream PDFs into VHR / value report / forbidden/error / unknown."""
+
+    if not pdf_bytes:
+        return UPSTREAM_PDF_UNKNOWN
+
+    # Prefer text extraction if possible.
+    text = ""
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(BytesIO(pdf_bytes))
+        parts: List[str] = []
+        for page in getattr(reader, "pages", [])[:2]:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                pass
+        text = "\n".join(parts)
+    except Exception:
+        text = ""
+
+    low = (text or "").lower()
+    if not low:
+        # Fallback: best-effort raw scan (may miss compressed content).
+        try:
+            low = pdf_bytes[:500_000].decode("latin-1", errors="ignore").lower()
+        except Exception:
+            low = ""
+
+    if "vehicle history report" in low or "carfax vehicle history report" in low:
+        return UPSTREAM_PDF_VHR_OK
+    if "history-based value" in low or "value report" in low:
+        return UPSTREAM_PDF_VALUE_REPORT
+    if "forbidden" in low or "not authorized" in low or "access denied" in low or "unauthorized" in low:
+        return UPSTREAM_PDF_FORBIDDEN_OR_ERROR
+    return UPSTREAM_PDF_UNKNOWN
+
+
+def _classify_upstream_non_pdf(text_or_json: str) -> str:
+    low = (text_or_json or "").lower()
+    if "history-based value" in low or "value report" in low:
+        return UPSTREAM_PDF_VALUE_REPORT
+    if "forbidden" in low or "not authorized" in low or "access denied" in low or "unauthorized" in low:
+        return UPSTREAM_PDF_FORBIDDEN_OR_ERROR
+    return UPSTREAM_PDF_UNKNOWN
 
 
 async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool = True) -> ReportResult:
@@ -396,8 +481,6 @@ async def generate_vin_report(vin: str, *, language: str = "en", fast_mode: bool
 
 async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, fast_mode: bool) -> ReportResult:
     """Inner implementation for generate_vin_report (no caching)."""
-
-    from bot_core.utils.pdf_format import validate_pdf_format
 
     start_t = time.perf_counter()
     total_budget = _TOTAL_BUDGET_SEC if fast_mode else _REPORT_TOTAL_TIMEOUT_SEC
@@ -480,7 +563,7 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
                 )
             return ReportResult(
                 success=False,
-                user_message=_t("report.error.fetch_detailed", requested_lang, "⚠️ فشل جلب تقرير VIN: {error}", error=err),
+                user_message=VHR_FETCH_FAILED_USER_MESSAGE,
                 errors=[str(err)],
                 vin=normalized_vin,
                 raw_response=api_response,
@@ -490,38 +573,6 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
         # If we have official upstream PDF bytes, use them immediately for ALL modes.
         pdf_bytes = api_response.get("pdf_bytes")
         if pdf_bytes:
-            # Validate official format gate BEFORE returning.
-            chk = validate_pdf_format(bytes(pdf_bytes), expected_vin=normalized_vin, require_official_tokens=True)
-            if not chk.ok:
-                # One fresh retry (best-effort) to avoid cached/bad upstream variants.
-                retry_budget = max(0.25, _remaining_s())
-                try:
-                    pdf2 = await fetch_report_pdf_bytes(
-                        normalized_vin,
-                        options=None,
-                        lang=(requested_lang or "en"),
-                        total_timeout_s=retry_budget,
-                        deadline=deadline,
-                        force_fresh=True,
-                    )
-                    if pdf2:
-                        chk2 = validate_pdf_format(bytes(pdf2), expected_vin=normalized_vin, require_official_tokens=True)
-                        if chk2.ok:
-                            pdf_bytes = pdf2
-                            chk = chk2
-                except Exception:
-                    pass
-
-            if not chk.ok:
-                return ReportResult(
-                    success=False,
-                    user_message=_t("report.error.generic", requested_lang, "⚠️ تعذّر إكمال الطلب."),
-                    errors=[f"format_mismatch:{chk.reason}"],
-                    vin=normalized_vin,
-                    raw_response=api_response,
-                    error_class=ERROR_UPSTREAM_FETCH_FAILED,
-                )
-
             # If requested language != EN, deliver official report (EN) and mark translation as skipped.
             if (requested_lang or "en") != "en":
                 skipped_translation = True
@@ -558,88 +609,11 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
         if fast_mode:
             return ReportResult(
                 success=False,
-                user_message=_t("report.error.fetch", requested_lang, "⚠️ Failed to fetch report from upstream."),
+                user_message=VHR_FETCH_FAILED_USER_MESSAGE,
                 errors=["no_pdf"],
                 vin=normalized_vin,
                 raw_response=api_response,
                 error_class=ERROR_UPSTREAM_FETCH_FAILED,
-            )
-
-            # Validate official format gate BEFORE returning.
-            chk = validate_pdf_format(bytes(pdf_bytes), expected_vin=normalized_vin, require_official_tokens=True)
-            if not chk.ok:
-                # One fresh retry (best-effort) to avoid cached/bad upstream variants.
-                retry_budget = max(0.25, _remaining_s())
-                try:
-                    api_response2 = await _call_carfax_api(
-                        normalized_vin,
-                        prefer_non_pdf=False,
-                        total_timeout_s=retry_budget,
-                        deadline=deadline,
-                        force_fresh=True,
-                    )
-                    pdf2 = api_response2.get("pdf_bytes")
-                    if pdf2:
-                        chk2 = validate_pdf_format(bytes(pdf2), expected_vin=normalized_vin, require_official_tokens=True)
-                        if chk2.ok:
-                            api_response = api_response2
-                            pdf_bytes = pdf2
-                            chk = chk2
-                except Exception:
-                    pass
-
-            format_ok = bool(chk.ok)
-            if not format_ok:
-                return ReportResult(
-                    success=False,
-                    user_message=_t("report.error.generic", requested_lang, "⚠️ تعذّر إكمال الطلب ضمن SLA الوقت."),
-                    errors=[f"format_mismatch:{chk.reason}"],
-                    vin=normalized_vin,
-                    raw_response=api_response,
-                )
-
-            # Requested language != EN: deliver base official report now; localized can follow asynchronously.
-            if (requested_lang or "en") != "en":
-                skipped_translation = True
-                delivered_lang = "en"
-
-            try:
-                api_response["_dv_fast"] = {
-                    "fast_mode": True,
-                    "skipped_translation": bool(skipped_translation),
-                    "requested_lang": (requested_lang or "en"),
-                    "delivered_lang": delivered_lang,
-                    "format_ok": True,
-                    "fetch_sec": round(float(fetch_sec), 3),
-                    "pdf_sec": 0.0,
-                    "total_sec": round(float(time.perf_counter() - start_t), 3),
-                }
-            except Exception:
-                pass
-
-            try:
-                LOGGER.info(
-                    "sla.base rid=%s vin=%s req_lang=%s del_lang=%s cache_hit_base=%s format_ok=%s fetch_sec=%.3f total_sec=%.3f outcome=success",
-                    get_rid() or "-",
-                    normalized_vin,
-                    requested_lang,
-                    delivered_lang,
-                    bool(cache_hit_base),
-                    True,
-                    float(fetch_sec),
-                    float(time.perf_counter() - start_t),
-                )
-            except Exception:
-                pass
-
-            filename = api_response.get("filename", f"{normalized_vin}.pdf")
-            return ReportResult(
-                success=True,
-                user_message=_t("report.success.pdf_direct", requested_lang, "✅ Report ready."),
-                pdf_bytes=bytes(pdf_bytes),
-                pdf_filename=filename,
-                vin=normalized_vin,
-                raw_response=api_response,
             )
 
         # In Fast Mode, prefer using the full remaining SLA time for PDF rendering.
@@ -668,7 +642,7 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
                 pass
             return ReportResult(
                 success=False,
-                user_message=_t("report.error.fetch", lang_code, "⚠️ Failed to fetch report from upstream."),
+                user_message=VHR_FETCH_FAILED_USER_MESSAGE,
                 errors=["upstream_fetch_failed"],
                 vin=normalized_vin,
                 raw_response=api_response,
@@ -719,6 +693,33 @@ async def _generate_vin_report_inner(normalized_vin: str, requested_lang: str, f
                 vin=normalized_vin,
                 raw_response=api_response,
                 error_class=ERROR_PDF_RENDER_FAILED,
+            )
+
+        # Safety gate: never deliver a non-VHR PDF (value report / forbidden / unknown).
+        try:
+            pdf_class = classify_pdf(bytes(pdf_bytes))
+            try:
+                LOGGER.info("rendered_pdf_class rid=%s class=%s", get_rid() or "-", pdf_class)
+            except Exception:
+                pass
+            if pdf_class != UPSTREAM_PDF_VHR_OK:
+                return ReportResult(
+                    success=False,
+                    user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                    errors=[f"pdf_class:{pdf_class}"],
+                    vin=normalized_vin,
+                    raw_response=api_response,
+                    error_class=ERROR_UPSTREAM_FETCH_FAILED,
+                )
+        except Exception:
+            # If we cannot classify reliably, fail closed.
+            return ReportResult(
+                success=False,
+                user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                errors=["pdf_class:unknown"],
+                vin=normalized_vin,
+                raw_response=api_response,
+                error_class=ERROR_UPSTREAM_FETCH_FAILED,
             )
 
         # Language SLA policy:
@@ -814,25 +815,18 @@ async def _call_carfax_api(
     force_fresh: bool = False,
 ) -> Dict[str, Any]:
     cfg = get_env()
-    api_url = cfg.api_url.strip()
     headers: Dict[str, str] = {}
-    token = cfg.api_token.strip()
+    token = (cfg.api_token or "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    if force_fresh:
-        headers["Cache-Control"] = "no-cache"
-        headers["Pragma"] = "no-cache"
+    # Always no-cache to avoid stale variants; retries add a cache-buster too.
+    headers["Cache-Control"] = "no-cache"
+    headers["Pragma"] = "no-cache"
     if prefer_non_pdf:
-        headers["Accept"] = "application/json, text/html;q=0.9, */*;q=0.5"
+        headers["Accept"] = "application/json, text/html;q=0.9, application/pdf;q=0.8, */*;q=0.5"
     else:
         headers["Accept"] = "application/pdf, application/json;q=0.9, text/html;q=0.8, */*;q=0.5"
-    if not api_url:
-        return {"ok": False, "error": "API_URL غير مضبوط في .env"}
 
-    base = api_url.rstrip("/")
-    payload = {"vin": vin}
-    if force_fresh:
-        payload["_ts"] = int(time.time())
     session = await _get_http_session()
 
     # Cap request time budget (best-effort) so end-to-end report stays fast.
@@ -849,30 +843,65 @@ async def _call_carfax_api(
             return {"ok": False, "error": "deadline_exceeded"}
     request_timeout = aiohttp.ClientTimeout(total=budget)
 
-    async def _handle(resp: aiohttp.ClientResponse) -> Dict[str, Any]:
-        status = resp.status
-        ctype = (resp.headers.get("Content-Type", "") or "").lower()
-        final_url = str(getattr(resp, "url", "") or "")
-        if status not in (200, 201):
+    url = _carfax_url(vin, ts_ms=(int(time.time() * 1000) if force_fresh else None))
+
+    # Acquire Carfax slot with a bounded wait; otherwise fail fast as "busy".
+    acquired = False
+    try:
+        queue_budget = _CARFAX_QUEUE_TIMEOUT_SEC
+        if deadline is not None:
+            queue_budget = min(queue_budget, max(0.05, float(deadline) - time.perf_counter()))
+        await asyncio.wait_for(_CARFAX_SEM.acquire(), timeout=max(0.05, queue_budget))
+        acquired = True
+
+        async with atimed("carfax.http", method="GET", route="/carfax/{vin}"):
+            async with session.get(url, headers=headers, timeout=request_timeout, allow_redirects=True) as resp:
+                status = int(resp.status)
+                ctype = (resp.headers.get("Content-Type", "") or "").lower()
+                final_url = str(getattr(resp, "url", "") or "")
+                body = await resp.read()
+                rid = get_rid() or "-"
+                try:
+                    LOGGER.info(
+                        "upstream_call rid=%s url=%s status=%s content_type=%s bytes_len=%s",
+                        rid,
+                        final_url or url,
+                        status,
+                        ctype or "-",
+                        len(body) if body is not None else 0,
+                    )
+                except Exception:
+                    pass
+
+                if status != 200:
+                    try:
+                        txt = body.decode("utf-8", errors="ignore")
+                    except Exception:
+                        txt = ""
+                    return {"ok": False, "status": status, "ctype": ctype, "err_text": txt, "final_url": final_url}
+
+                if ("application/pdf" in ctype) or body.startswith(b"%PDF"):
+                    return {"ok": True, "pdf_bytes": body, "filename": f"{vin}.pdf", "status": status, "final_url": final_url, "ctype": ctype}
+
+                if "application/json" in ctype or (body[:1] == b"{"):
+                    try:
+                        data = json.loads(body.decode("utf-8", errors="ignore") or "{}")
+                        return {"ok": True, "json": data, "status": status, "final_url": final_url, "ctype": ctype}
+                    except Exception:
+                        return {"ok": True, "text": body.decode("utf-8", errors="ignore"), "status": status, "final_url": final_url, "ctype": ctype}
+
+                return {"ok": True, "text": body.decode("utf-8", errors="ignore"), "status": status, "final_url": final_url, "ctype": ctype}
+
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "queue_timeout"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        if acquired:
             try:
-                txt = await resp.text()
+                _CARFAX_SEM.release()
             except Exception:
-                txt = ""
-            return {"ok": False, "status": status, "ctype": ctype, "err_text": txt, "final_url": final_url}
-        if "application/pdf" in ctype:
-            if prefer_non_pdf:
-                return {"ok": False, "status": status, "ctype": ctype, "error": "pdf_returned", "final_url": final_url}
-            data = await resp.read()
-            return {"ok": True, "pdf_bytes": data, "filename": f"{vin}.pdf", "status": status, "final_url": final_url}
-        if "application/json" in ctype:
-            try:
-                data = await resp.json()
-                return {"ok": True, "json": data, "status": status, "final_url": final_url}
-            except Exception:
-                txt = await resp.text()
-                return {"ok": True, "text": txt, "status": status, "final_url": final_url}
-        txt = await resp.text()
-        return {"ok": True, "text": txt, "status": status, "final_url": final_url}
+                pass
 
 
 async def fetch_report_pdf_bytes(
@@ -899,31 +928,76 @@ async def fetch_report_pdf_bytes(
     except Exception:
         pass
 
-    api_response = await _call_carfax_api(
-        vin,
-        prefer_non_pdf=False,
-        total_timeout_s=total_timeout_s,
-        deadline=deadline,
-        force_fresh=force_fresh,
-    )
+    # Retry policy: 2 retries (0.4s, 0.8s) on value/forbidden/unknown.
+    delays = [0.0, 0.4, 0.8]
+    last_reason = "unknown"
+    for attempt, delay_s in enumerate(delays):
+        if attempt and delay_s:
+            try:
+                LOGGER.info("upstream_retry rid=%s attempt=%s reason=%s", rid, attempt, last_reason)
+            except Exception:
+                pass
+            try:
+                await asyncio.sleep(delay_s)
+            except Exception:
+                pass
 
-    status = api_response.get("status")
-    final_url = api_response.get("final_url")
-    pdf_bytes = api_response.get("pdf_bytes")
-    try:
-        LOGGER.info(
-            "upstream_pdf_fetch rid=%s vin=%s fetch_status=%s fetch_final_url=%s pdf_bytes_len=%s",
-            rid,
+        api_response = await _call_carfax_api(
             vin,
-            status if status is not None else "na",
-            final_url or "-",
-            len(pdf_bytes) if isinstance(pdf_bytes, (bytes, bytearray)) else 0,
+            prefer_non_pdf=False,
+            total_timeout_s=total_timeout_s,
+            deadline=deadline,
+            force_fresh=True if attempt > 0 else force_fresh,
         )
+
+        status = api_response.get("status")
+        final_url = api_response.get("final_url")
+        pdf_bytes = api_response.get("pdf_bytes")
+        try:
+            LOGGER.info(
+                "upstream_pdf_fetch rid=%s vin=%s fetch_status=%s fetch_final_url=%s pdf_bytes_len=%s",
+                rid,
+                vin,
+                status if status is not None else "na",
+                final_url or "-",
+                len(pdf_bytes) if isinstance(pdf_bytes, (bytes, bytearray)) else 0,
+            )
+        except Exception:
+            pass
+
+        if not api_response.get("ok"):
+            last_reason = str(api_response.get("error") or api_response.get("err_text") or "fetch_failed")
+            continue
+
+        if isinstance(pdf_bytes, (bytes, bytearray)) and bytes(pdf_bytes).startswith(b"%PDF"):
+            pdf_class = classify_pdf(bytes(pdf_bytes))
+            try:
+                LOGGER.info("upstream_pdf_class rid=%s class=%s", rid, pdf_class)
+            except Exception:
+                pass
+
+            if pdf_class == UPSTREAM_PDF_VHR_OK:
+                try:
+                    LOGGER.info("final_outcome rid=%s success=%s error_class=%s", rid, True, "-")
+                except Exception:
+                    pass
+                return bytes(pdf_bytes)
+
+            if pdf_class in {UPSTREAM_PDF_VALUE_REPORT, UPSTREAM_PDF_FORBIDDEN_OR_ERROR, UPSTREAM_PDF_UNKNOWN}:
+                last_reason = pdf_class
+                continue
+
+        # Non-PDF response body; classify for retry.
+        if api_response.get("json") is not None:
+            last_reason = _classify_upstream_non_pdf(json.dumps(api_response.get("json"), ensure_ascii=False))
+        else:
+            last_reason = _classify_upstream_non_pdf(str(api_response.get("text") or ""))
+        continue
+
+    try:
+        LOGGER.info("final_outcome rid=%s success=%s error_class=%s", rid, False, ERROR_UPSTREAM_FETCH_FAILED)
     except Exception:
         pass
-
-    if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes.startswith(b"%PDF"):
-        return bytes(pdf_bytes)
     return None
 
 
@@ -1020,93 +1094,6 @@ async def _fetch_html_http_validated(
         raise
     except Exception as exc:
         raise UpstreamFetchFailed(str(exc))
-
-    async def _try_get() -> Optional[Dict[str, Any]]:
-        try:
-            async with atimed("carfax.http", method="GET", route="/{vin}"):
-                url = f"{base}/{vin}"
-                if force_fresh:
-                    url = f"{url}?ts={int(time.time())}"
-                async with session.get(url, headers=headers, timeout=request_timeout) as resp:
-                    parsed = await _handle(resp)
-                    if parsed.get("ok"):
-                        return parsed
-                    return None
-        except Exception:
-            return None
-
-    async def _try_post_vin() -> Optional[Dict[str, Any]]:
-        try:
-            async with atimed("carfax.http", method="POST", route="/vin"):
-                async with session.post(f"{base}/vin", json=payload, headers=headers, timeout=request_timeout) as resp:
-                    parsed = await _handle(resp)
-                    if parsed.get("ok"):
-                        return parsed
-                    return None
-        except Exception:
-            return None
-
-    async def _try_post_base() -> Dict[str, Any]:
-        try:
-            async with atimed("carfax.http", method="POST", route="/"):
-                async with session.post(base, json=payload, headers=headers, timeout=request_timeout) as resp:
-                    parsed = await _handle(resp)
-                    if parsed.get("ok"):
-                        return parsed
-                    return {"ok": False, "error": f"HTTP {parsed.get('status')}", "detail": parsed.get("err_text", "")}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-
-    # Acquire Carfax slot with a bounded wait; otherwise fail fast as "busy".
-    acquired = False
-    try:
-        queue_budget = _CARFAX_QUEUE_TIMEOUT_SEC
-        if deadline is not None:
-            queue_budget = min(queue_budget, max(0.05, float(deadline) - time.perf_counter()))
-        await asyncio.wait_for(_CARFAX_SEM.acquire(), timeout=max(0.05, queue_budget))
-        acquired = True
-
-        if _carfax_parallel_primary_enabled():
-            tasks = [asyncio.create_task(_try_get()), asyncio.create_task(_try_post_vin())]
-            try:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for d in done:
-                    result = d.result()
-                    if result and result.get("ok"):
-                        for p in pending:
-                            p.cancel()
-                        return result
-                # If first completed was not ok, await the other one too.
-                for p in pending:
-                    try:
-                        other = await p
-                        if other and other.get("ok"):
-                            return other
-                    except Exception:
-                        pass
-            finally:
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-            return await _try_post_base()
-
-        parsed = await _try_get()
-        if parsed:
-            return parsed
-        parsed = await _try_post_vin()
-        if parsed:
-            return parsed
-        return await _try_post_base()
-
-    except asyncio.TimeoutError:
-        return {"ok": False, "error": "queue_timeout"}
-    finally:
-        if acquired:
-            try:
-                _CARFAX_SEM.release()
-            except Exception:
-                pass
 
 
 def _extract_html_or_url_from_json(data: Any) -> Dict[str, Optional[str]]:

@@ -14,6 +14,7 @@ if sys.platform == "win32" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())  # type: ignore[attr-defined, deprecated-call]
 
 import base64
+import hashlib
 import logging
 import os
 import re
@@ -1693,41 +1694,15 @@ async def handle_incoming_whatsapp_message(
                 # Terminal success message (never leave user with only 'fetching...').
                 try:
                     parts: List[str] = []
-                    if fast_skipped_translation and (user_ctx.language or "en").lower() != "en":
-                        parts.append(f"Full {(user_ctx.language or 'en').upper()} version will be sent shortly")
-                    # No placeholder/"fast-light" PDFs are allowed; we either render the real report or fail.
+                    if (user_ctx.language or "en").lower() != "en":
+                        if (user_ctx.language or "").lower() == "ar":
+                            parts.append("ملاحظة: ملف PDF هو النسخة الرسمية من المصدر باللغة الإنجليزية، ونحن لا نُعدّل ملفات PDF.")
+                        else:
+                            parts.append("Note: The PDF is the official upstream English report; PDFs are never modified or translated.")
                     parts.append("✅ Delivered (PDF)")
                     await send_whatsapp_text(msisdn, "\n".join(parts), client=client)
                 except Exception:
                     pass
-
-                # Asynchronously generate + send FULL localized PDF if Fast Mode delivered English.
-                if fast_skipped_translation and (user_ctx.language or "en").lower() != "en":
-                    async def _send_full_localized_wa() -> None:
-                        try:
-                            from bot_core.services.reports import generate_vin_report as _gen
-                        except Exception:
-                            return
-                        try:
-                            full = await _gen(vin_from_response or "", language=(user_ctx.language or "en"), fast_mode=False)
-                            if full and getattr(full, "success", False) and getattr(full, "pdf_bytes", None):
-                                await _relay_pdf_document(
-                                    client,
-                                    msisdn,
-                                    {
-                                        "type": "pdf",
-                                        "bytes": bytes(full.pdf_bytes),
-                                        "filename": getattr(full, "pdf_filename", None) or f"{vin_from_response}.pdf",
-                                        "caption": f"📄 Full {(user_ctx.language or 'en').upper()} VIN report {vin_from_response}",
-                                    },
-                                )
-                        except Exception:
-                            LOGGER.info("whatsapp: full localized send failed", exc_info=True)
-
-                    try:
-                        asyncio.create_task(_send_full_localized_wa())
-                    except Exception:
-                        pass
             else:
                 try:
                     if not delivery_refunded:
@@ -1863,16 +1838,37 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
 
     public_url = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip() or None
 
-    def _looks_like_pdf(raw_bytes: bytes) -> bool:
-        return bool(raw_bytes) and raw_bytes.startswith(b"%PDF")
+    upstream_sha256 = document.get("upstream_sha256")
 
     # If we have bytes, prefer them (no disk).
     if not base64_payload and not url_value:
         if isinstance(doc_bytes, (bytes, bytearray)) and doc_bytes:
             raw_bytes = bytes(doc_bytes)
-            if not _looks_like_pdf(raw_bytes):
-                LOGGER.warning("Skipping pdf document: invalid PDF header filename=%s", filename)
+            delivered_sha256 = None
+            try:
+                delivered_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            except Exception:
+                delivered_sha256 = None
+            if upstream_sha256 and delivered_sha256 and upstream_sha256 != delivered_sha256:
+                LOGGER.error(
+                    "wa_upstream_pdf_parity_mismatch msisdn=%s filename=%s upstream_sha256=%s delivered_sha256=%s",
+                    msisdn,
+                    filename,
+                    upstream_sha256,
+                    delivered_sha256,
+                )
                 return False
+            try:
+                LOGGER.info(
+                    "wa_pdf_bytes_ready msisdn=%s filename=%s bytes=%s upstream_sha256=%s delivered_sha256=%s",
+                    msisdn,
+                    filename,
+                    len(raw_bytes),
+                    upstream_sha256 or "-",
+                    delivered_sha256 or "-",
+                )
+            except Exception:
+                pass
             if len(raw_bytes) >= wa_max_b64_bytes:
                 if not public_url:
                     public_url = await _ensure_public_url()
@@ -1908,9 +1904,31 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
             if not raw_bytes:
                 LOGGER.warning("Skipping pdf document: failed to read path=%s", path_value)
                 return False
-            if not _looks_like_pdf(raw_bytes):
-                LOGGER.warning("Skipping pdf document: invalid PDF header filename=%s path=%s", filename, path_value)
+            delivered_sha256 = None
+            try:
+                delivered_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            except Exception:
+                delivered_sha256 = None
+            if upstream_sha256 and delivered_sha256 and upstream_sha256 != delivered_sha256:
+                LOGGER.error(
+                    "wa_upstream_pdf_parity_mismatch msisdn=%s filename=%s upstream_sha256=%s delivered_sha256=%s",
+                    msisdn,
+                    filename,
+                    upstream_sha256,
+                    delivered_sha256,
+                )
                 return False
+            try:
+                LOGGER.info(
+                    "wa_pdf_file_ready msisdn=%s filename=%s bytes=%s upstream_sha256=%s delivered_sha256=%s",
+                    msisdn,
+                    filename,
+                    len(raw_bytes),
+                    upstream_sha256 or "-",
+                    delivered_sha256 or "-",
+                )
+            except Exception:
+                pass
             if len(raw_bytes) >= wa_max_b64_bytes:
                 if not public_url:
                     public_url = await _ensure_public_url()
@@ -2071,14 +2089,6 @@ async def _on_startup() -> None:
     
     _get_ultramsg_client()
     LOGGER.info("WhatsApp webhook server ready on %s:%s", WHATSAPP_HOST, WHATSAPP_PORT)
-
-    # Prewarm Chromium so the first report doesn't pay Playwright cold-start.
-    try:
-        from bot_core.services.pdf import prewarm_pdf_engine
-
-        _track_bg_task(asyncio.create_task(prewarm_pdf_engine()), name="pdf_prewarm")
-    except Exception:
-        pass
 
     # Periodic cleanup for one-shot blobs (prevents unbounded RAM growth).
     try:

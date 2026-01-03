@@ -20,7 +20,6 @@ class PdfFormatCheck:
 
 # Hard prohibitions (never allowed)
 _FORBIDDEN_PHRASES = [
-    "history-based value report",
     "this is a fast/light pdf",
     "strict time budget",
     "vin report",  # placeholder header used by legacy template

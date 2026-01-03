@@ -3885,6 +3885,7 @@ async def _handle_vin_request(
                 "bytes": report_result.pdf_bytes,
                 "caption": user_message,
                 "filename": filename,
+                "upstream_sha256": getattr(report_result, "upstream_sha256", None),
             }
         )
 

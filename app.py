@@ -7,6 +7,7 @@ import sys
 import copy
 import json
 import logging
+import hashlib
 
 try:
     from dotenv import load_dotenv
@@ -5240,72 +5241,81 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fast_skipped_translation = False
 
             if report_result.pdf_bytes:
-                if bridge_pdf_path and os.path.exists(bridge_pdf_path):
-                    pdf_local_path = bridge_pdf_path
-                else:
-                    pdf_local_path = None
+                try:
+                    # We are now past generation and entering the upload/send phase.
+                    context.chat_data["progress_cap"] = 95
+                    pdf_bytes = bytes(report_result.pdf_bytes)
+                    delivered_sha256 = hashlib.sha256(pdf_bytes).hexdigest() if pdf_bytes else None
+                    upstream_sha256 = getattr(report_result, "upstream_sha256", None)
+                    if upstream_sha256 and delivered_sha256 and upstream_sha256 != delivered_sha256:
+                        logger.error(
+                            "tg_upstream_pdf_parity_mismatch vin=%s upstream_sha256=%s delivered_sha256=%s",
+                            vin,
+                            upstream_sha256,
+                            delivered_sha256,
+                        )
+                        raise RuntimeError("upstream_pdf_parity_mismatch")
 
-                if not bytes(report_result.pdf_bytes).startswith(b"%PDF"):
+                    bio = BytesIO(pdf_bytes)
+                    bio.name = report_result.pdf_filename or f"{vin}.pdf"
+                    try:
+                        from bot_core.telemetry import atimed
+                    except Exception:
+                        atimed = None
+                    if atimed:
+                        async with atimed(
+                            "tg.send_document",
+                            bytes=len(pdf_bytes),
+                            via="bytes",
+                            vin=vin,
+                            upstream_sha256=(upstream_sha256 or ""),
+                            delivered_sha256=(delivered_sha256 or ""),
+                        ):
+                            await asyncio.wait_for(
+                                context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=bio,
+                                    filename=bio.name,
+                                    caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                    parse_mode=ParseMode.HTML,
+                                ),
+                                timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
+                            )
+                    else:
+                        await asyncio.wait_for(
+                            context.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=bio,
+                                filename=bio.name,
+                                caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                parse_mode=ParseMode.HTML,
+                            ),
+                            timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
+                        )
+                    try:
+                        logger.info(
+                            "tg_pdf_delivered vin=%s bytes=%s upstream_sha256=%s delivered_sha256=%s",
+                            vin,
+                            len(pdf_bytes),
+                            upstream_sha256 or "-",
+                            delivered_sha256 or "-",
+                        )
+                    except Exception:
+                        pass
+                except asyncio.TimeoutError:
+                    report_result = _ReportResult(
+                        success=False,
+                        user_message=_bridge.t("report.error.timeout", report_lang),
+                        errors=["send_timeout"],
+                        vin=vin,
+                    )
+                except Exception as exc:
                     report_result = _ReportResult(
                         success=False,
                         user_message=_bridge.t("report.error.generic", report_lang),
-                        errors=["invalid_pdf_header"],
+                        errors=[f"send_failed:{exc}"],
                         vin=vin,
                     )
-                else:
-                    try:
-                        # We are now past generation and entering the upload/send phase.
-                        context.chat_data["progress_cap"] = 95
-                        if pdf_local_path:
-                            _register_cleanup(pdf_local_path)
-                            await asyncio.wait_for(
-                                _send_pdf_file(context, update.effective_chat.id, pdf_local_path, f"📄 تقرير VIN <code>{vin}</code>"),
-                                timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=10.0)),
-                            )
-                        else:
-                            bio = BytesIO(bytes(report_result.pdf_bytes))
-                            bio.name = report_result.pdf_filename or f"{vin}.pdf"
-                            try:
-                                from bot_core.telemetry import atimed
-                            except Exception:
-                                atimed = None
-                            if atimed:
-                                async with atimed("tg.send_document", bytes=len(report_result.pdf_bytes), via="bytes"):
-                                    await asyncio.wait_for(
-                                        context.bot.send_document(
-                                            chat_id=update.effective_chat.id,
-                                            document=bio,
-                                            filename=bio.name,
-                                            caption=f"📄 تقرير VIN <code>{vin}</code>",
-                                            parse_mode=ParseMode.HTML,
-                                        ),
-                                        timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
-                                    )
-                            else:
-                                await asyncio.wait_for(
-                                    context.bot.send_document(
-                                        chat_id=update.effective_chat.id,
-                                        document=bio,
-                                        filename=bio.name,
-                                        caption=f"📄 تقرير VIN <code>{vin}</code>",
-                                        parse_mode=ParseMode.HTML,
-                                    ),
-                                    timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
-                                )
-                    except asyncio.TimeoutError:
-                        report_result = _ReportResult(
-                            success=False,
-                            user_message=_bridge.t("report.error.timeout", report_lang),
-                            errors=["send_timeout"],
-                            vin=vin,
-                        )
-                    except Exception as exc:
-                        report_result = _ReportResult(
-                            success=False,
-                            user_message=_bridge.t("report.error.generic", report_lang),
-                            errors=[f"send_failed:{exc}"],
-                            vin=vin,
-                        )
                 delivery_note = _bridge.t("report.success.pdf_note", report_lang)
                 delivered = bool(report_result and report_result.success)
 
@@ -5334,17 +5344,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 note = delivery_note or _bridge.t("report.success.note", report_lang)
 
-                # Fast Mode post-delivery notes (kept before the terminal line).
+                # Post-delivery note: we never translate/modify PDFs. If user requested non-EN,
+                # we can only send a localized TEXT note.
                 extra_notes: List[str] = []
-                try:
-                    rr = getattr(report_result, "raw_response", None)
-                    if isinstance(rr, dict):
-                        dv = rr.get("_dv_fast") or {}
-                        if isinstance(dv, dict) and dv.get("skipped_translation") and (requested_lang or "en") != "en":
-                            extra_notes.append(f"Full {requested_lang.upper()} version will be sent shortly")
-                        # No placeholder/"fast-light" PDFs are allowed; we either render the real report or fail.
-                except Exception:
-                    pass
+                if (requested_lang or "en") != "en":
+                    if (requested_lang or "").lower() == "ar":
+                        extra_notes.append("ملاحظة: ملف PDF هو النسخة الرسمية من المصدر باللغة الإنجليزية، ونحن لا نُعدّل ملفات PDF.")
+                    else:
+                        extra_notes.append("Note: The PDF is the official upstream English report; PDFs are never modified or translated.")
 
                 extra_block = ""
                 if extra_notes:
@@ -5378,46 +5385,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if photos_kb:
                     try:
                         await msg.edit_reply_markup(reply_markup=photos_kb)
-                    except Exception:
-                        pass
-
-                # Asynchronously generate + send FULL localized PDF if Fast Mode delivered English.
-                if fast_skipped_translation and requested_lang != "en" and delivered_lang == "en":
-                    async def _send_full_localized() -> None:
-                        try:
-                            from bot_core.telemetry import new_rid as _new_rid2, set_rid as _set_rid2
-                        except Exception:
-                            _new_rid2 = None  # type: ignore
-                            _set_rid2 = None  # type: ignore
-                        rid2 = (_new_rid2("tg-full-") if _new_rid2 else None)
-                        cm = _set_rid2(rid2) if (_set_rid2 and rid2) else None
-                        try:
-                            if cm:
-                                cm.__enter__()
-                            full = await _generate_vin_report(vin, language=requested_lang, fast_mode=False)
-                            if full and getattr(full, "success", False) and getattr(full, "pdf_bytes", None):
-                                if not bytes(full.pdf_bytes).startswith(b"%PDF"):
-                                    return
-                                bio2 = BytesIO(bytes(full.pdf_bytes))
-                                bio2.name = getattr(full, "pdf_filename", None) or f"{vin}.pdf"
-                                await context.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=bio2,
-                                    filename=bio2.name,
-                                    caption=f"📄 Full {requested_lang.upper()} VIN report <code>{vin}</code>",
-                                    parse_mode=ParseMode.HTML,
-                                )
-                        except Exception:
-                            logger.info("tg full localized send failed", exc_info=True)
-                        finally:
-                            try:
-                                if cm:
-                                    cm.__exit__(None, None, None)
-                            except Exception:
-                                pass
-
-                    try:
-                        asyncio.create_task(_send_full_localized())
                     except Exception:
                         pass
 
@@ -6014,14 +5981,6 @@ def _track_bg_task(task: asyncio.Task[Any], *, name: str) -> None:
 
 
 async def _post_init_warmup(app: Application) -> None:
-    # Prewarm Chromium so the first report doesn't pay Playwright cold-start.
-    try:
-        from bot_core.services.pdf import prewarm_pdf_engine
-
-        _track_bg_task(asyncio.create_task(prewarm_pdf_engine()), name="pdf_prewarm")
-    except Exception:
-        pass
-
     try:
         bot_session = getattr(app.bot, "session", None)
         if bot_session and not bot_session.closed:

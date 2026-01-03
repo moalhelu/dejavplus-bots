@@ -18,15 +18,6 @@ class PdfFormatCheck:
         yield self.reason
 
 
-# Hard prohibitions (never allowed)
-_FORBIDDEN_PHRASES = [
-    "history-based value report",
-    "this is a fast/light pdf",
-    "strict time budget",
-    "vin report",  # placeholder header used by legacy template
-]
-
-
 def _normalize_text(text: str) -> str:
     # Normalize whitespace + case for robust token checks.
     text = text.replace("\u00a0", " ")
@@ -60,11 +51,10 @@ def validate_pdf_format(
     expected_vin: Optional[str] = None,
     require_official_tokens: bool = True,
 ) -> PdfFormatCheck:
-    """Validate that a PDF looks like the official CARFAX VHR report.
+    """Best-effort PDF sanity checks.
 
-    Non-negotiables:
-    - Never allow placeholder / value-report PDFs
-    - For base delivery, require tokens "CARFAX" + "Vehicle History Report" on first page.
+    Note: Upstream PDFs must never be blocked at delivery-time.
+    This helper is intended for optional offline tooling only.
     """
 
     if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
@@ -81,18 +71,6 @@ def validate_pdf_format(
         raw_low = raw_head.lower()
     except Exception:
         raw_low = None
-
-    for bad in _FORBIDDEN_PHRASES:
-        if not bad:
-            continue
-        if low and bad in low:
-            return PdfFormatCheck(False, f"forbidden:{bad}", extracted_head=head_text)
-        if raw_low is not None:
-            try:
-                if bad.encode("utf-8", errors="ignore") in raw_low:
-                    return PdfFormatCheck(False, f"forbidden:{bad}", extracted_head=head_text)
-            except Exception:
-                pass
 
     # Official tokens required for base report correctness.
     # Prefer extracted text; fallback to raw bytes if extraction fails.

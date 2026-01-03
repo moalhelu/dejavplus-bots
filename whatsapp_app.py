@@ -79,6 +79,44 @@ _WA_DEDUP_MAX = int(os.getenv("WA_DEDUP_MAX", "5000") or 5000)
 _WA_DEDUP_MAX = max(100, min(_WA_DEDUP_MAX, 50000))
 
 
+def _is_public_http_base(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    u = str(url).strip().lower()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False
+    # Reject localhost and obvious private network bases.
+    for bad in (
+        "http://localhost",
+        "https://localhost",
+        "http://127.",
+        "https://127.",
+        "http://0.0.0.0",
+        "https://0.0.0.0",
+        "http://10.",
+        "https://10.",
+        "http://192.168.",
+        "https://192.168.",
+        "http://172.16.",
+        "https://172.16.",
+        "http://172.17.",
+        "https://172.17.",
+        "http://172.18.",
+        "https://172.18.",
+        "http://172.19.",
+        "https://172.19.",
+        "http://172.2",
+        "https://172.2",
+        "http://172.30.",
+        "https://172.30.",
+        "http://172.31.",
+        "https://172.31.",
+    ):
+        if u.startswith(bad):
+            return False
+    return True
+
+
 def _wa_event_message_id(event: Dict[str, Any]) -> Optional[str]:
     for key in ("id", "messageId", "message_id", "msgId", "msg_id", "idMessage", "_id"):
         val = event.get(key)
@@ -90,6 +128,35 @@ def _wa_event_message_id(event: Dict[str, Any]) -> Optional[str]:
             val = data.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
+
+    # Some webhook formats wrap the message inside a list/dict.
+    for container_key in ("message", "messages", "entry"):
+        container = event.get(container_key)
+        if isinstance(container, dict):
+            for key in ("id", "messageId", "message_id", "msgId", "msg_id", "idMessage", "_id"):
+                val = container.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        if isinstance(container, list) and container:
+            first = container[0]
+            if isinstance(first, dict):
+                for key in ("id", "messageId", "message_id", "msgId", "msg_id", "idMessage", "_id"):
+                    val = first.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+
+    # Last-resort fingerprint: helps suppress provider retries when message IDs are missing.
+    try:
+        raw_sender = str(event.get("from") or event.get("chatId") or event.get("author") or "").strip()
+        body = str(event.get("body") or event.get("text") or "").strip()
+        ts = str(event.get("timestamp") or event.get("time") or event.get("t") or event.get("date") or "").strip()
+        kind = str(event.get("type") or "").strip()
+        media = str(event.get("media") or event.get("mediaUrl") or event.get("url") or "").strip()
+        if raw_sender and (body or media):
+            fp = f"{raw_sender}|{kind}|{ts}|{body}|{media}".encode("utf-8", errors="ignore")
+            return "fp:" + hashlib.sha1(fp).hexdigest()
+    except Exception:
+        pass
     return None
 
 
@@ -1803,13 +1870,24 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
     path_value = document.get("path")
     url_value = document.get("url")
 
-    # Prefer serving via public URL for larger PDFs to avoid UltraMsg payload limits.
-    wa_max_b64_raw = os.getenv("WA_PDF_BASE64_MAX_BYTES", "650000")  # ~0.65MB raw bytes (becomes larger in base64)
+    # UltraMsg "document" supports both URL and base64.
+    # Prefer base64 for reliability unless it's truly too large.
+    # Docs: Max Base64 length is 10,000,000.
+    UM_MAX_BASE64_LEN = int(os.getenv("UM_MAX_DOC_BASE64_LEN", "10000000") or 10000000)
+    UM_MAX_BASE64_LEN = max(1_000_000, min(UM_MAX_BASE64_LEN, 20_000_000))
+
+    def _b64_len(raw_len: int) -> int:
+        if raw_len <= 0:
+            return 0
+        return 4 * ((raw_len + 2) // 3)
+
+    # Optional operator cap (raw bytes) before we consider URL mode.
+    wa_max_b64_raw = os.getenv("WA_PDF_BASE64_MAX_BYTES", "7000000")
     try:
         wa_max_b64_bytes = int(wa_max_b64_raw)
     except Exception:
-        wa_max_b64_bytes = 650000
-    wa_max_b64_bytes = max(100000, min(wa_max_b64_bytes, 5_000_000))
+        wa_max_b64_bytes = 7_000_000
+    wa_max_b64_bytes = max(250_000, min(wa_max_b64_bytes, 25_000_000))
 
     file_size: Optional[int] = None
     if isinstance(doc_bytes, (bytes, bytearray)):
@@ -1834,6 +1912,9 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
         return None
 
     public_url = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip() or None
+    if public_url and not _is_public_http_base(public_url):
+        LOGGER.warning("Ignoring non-public WHATSAPP_PUBLIC_URL base: %s", public_url)
+        public_url = None
 
     upstream_sha256 = document.get("upstream_sha256")
 
@@ -1866,20 +1947,29 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                 )
             except Exception:
                 pass
-            if len(raw_bytes) >= wa_max_b64_bytes:
+            raw_len = len(raw_bytes)
+            b64len = _b64_len(raw_len)
+            # Use base64 whenever possible (and within documented UltraMsg limits).
+            if raw_len <= wa_max_b64_bytes and b64len <= UM_MAX_BASE64_LEN:
+                base64_payload = base64.b64encode(raw_bytes).decode("ascii")
+            else:
                 if not public_url:
                     public_url = await _ensure_public_url()
+                if not _is_public_http_base(public_url):
+                    public_url = None
                 if not public_url:
                     LOGGER.warning(
-                        "WhatsApp PDF too large for base64 and no public URL (size=%s bytes, max=%s).",
-                        len(raw_bytes),
+                        "WhatsApp PDF too large for base64 and no public URL (raw=%s, b64=%s, cap_raw=%s, cap_b64=%s).",
+                        raw_len,
+                        b64len,
                         wa_max_b64_bytes,
+                        UM_MAX_BASE64_LEN,
                     )
                     try:
                         await send_whatsapp_text(
                             msisdn,
-                            "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير ولا يوجد رابط عام. "
-                            "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين) ثم أعد المحاولة.",
+                            "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير جداً ولا يوجد رابط عام صالح. "
+                            "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين عام) ثم أعد المحاولة.",
                             client=client,
                         )
                     except Exception:
@@ -1888,8 +1978,6 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                 token = await _put_one_shot_blob(raw_bytes, filename=filename, media_type="application/pdf")
                 url_value = f"{public_url}/download/{token}"
                 LOGGER.info("Serving PDF via one-shot URL: %s", url_value)
-            else:
-                base64_payload = base64.b64encode(raw_bytes).decode("ascii")
 
         elif path_value:
             # Backward compatibility: legacy callers may still pass a temp path.
@@ -1926,20 +2014,28 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                 )
             except Exception:
                 pass
-            if len(raw_bytes) >= wa_max_b64_bytes:
+            raw_len = len(raw_bytes)
+            b64len = _b64_len(raw_len)
+            if raw_len <= wa_max_b64_bytes and b64len <= UM_MAX_BASE64_LEN:
+                base64_payload = base64.b64encode(raw_bytes).decode("ascii")
+            else:
                 if not public_url:
                     public_url = await _ensure_public_url()
+                if not _is_public_http_base(public_url):
+                    public_url = None
                 if not public_url:
                     LOGGER.warning(
-                        "WhatsApp PDF too large for base64 and no public URL (size=%s bytes, max=%s).",
-                        len(raw_bytes),
+                        "WhatsApp PDF too large for base64 and no public URL (raw=%s, b64=%s, cap_raw=%s, cap_b64=%s).",
+                        raw_len,
+                        b64len,
                         wa_max_b64_bytes,
+                        UM_MAX_BASE64_LEN,
                     )
                     try:
                         await send_whatsapp_text(
                             msisdn,
-                            "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير ولا يوجد رابط عام. "
-                            "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين) ثم أعد المحاولة.",
+                            "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير جداً ولا يوجد رابط عام صالح. "
+                            "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين عام) ثم أعد المحاولة.",
                             client=client,
                         )
                     except Exception:
@@ -1948,8 +2044,6 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                 token = await _put_one_shot_blob(raw_bytes, filename=filename, media_type="application/pdf")
                 url_value = f"{public_url}/download/{token}"
                 LOGGER.info("Serving PDF via one-shot URL: %s", url_value)
-            else:
-                base64_payload = base64.b64encode(raw_bytes).decode("ascii")
 
     if url_value:
         payload["document_url"] = url_value
@@ -2201,9 +2295,11 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks) 
     # from the inbound request and use it for PDF links (served from /download).
     if not (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip():
         inferred = _infer_public_url_from_request(request)
-        if inferred:
+        if inferred and _is_public_http_base(inferred):
             os.environ["WHATSAPP_PUBLIC_URL"] = inferred
             LOGGER.info("Inferred WHATSAPP_PUBLIC_URL from webhook request: %s", inferred)
+        elif inferred:
+            LOGGER.info("Skipping inferred WHATSAPP_PUBLIC_URL (not public): %s", inferred)
 
     try:
         payload = await request.json()

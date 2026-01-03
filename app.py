@@ -5158,7 +5158,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not report_result:
                 try:
                     report_result = await asyncio.wait_for(
-                        _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(user_id)),
+                        _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(tg_id)),
                         timeout=_tg_remaining_s(),
                     )
                 except asyncio.TimeoutError:
@@ -5169,7 +5169,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         vin=vin,
                     )
                 except Exception as exc:
-                    report_result = _ReportResult(success=False, user_message=str(exc), errors=[str(exc)], vin=vin)
+                    logger.error("tg_report_generation_failed", extra={"vin": vin, "tg_id": tg_id}, exc_info=True)
+                    report_result = _ReportResult(
+                        success=False,
+                        user_message=_bridge.t("report.error.generic", report_lang),
+                        errors=[repr(exc)],
+                        vin=vin,
+                    )
         except asyncio.TimeoutError:
             # SLA timeout anywhere in the fast pipeline.
             report_result = _ReportResult(

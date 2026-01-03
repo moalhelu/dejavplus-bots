@@ -70,6 +70,7 @@ from bot_core.services.images import (
     get_apicar_current_images as _get_apicar_current_images,
     get_apicar_history_images as _get_apicar_history_images,
     get_apicar_accident_images as _get_apicar_accident_images,
+    get_hidden_vehicle_images as _get_hidden_vehicle_images,
     download_image_bytes as _download_image_bytes,
     _select_images,
 )
@@ -5351,24 +5352,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 note = delivery_note or _bridge.t("report.success.note", report_lang)
 
-                # Post-delivery note: we never translate/modify PDFs. If user requested non-EN,
-                # we can only send a localized TEXT note.
-                extra_notes: List[str] = []
-                if (requested_lang or "en") != "en":
-                    if (requested_lang or "").lower() == "ar":
-                        extra_notes.append("ملاحظة: ملف PDF هو النسخة الرسمية من المصدر باللغة الإنجليزية، ونحن لا نُعدّل ملفات PDF.")
-                    else:
-                        extra_notes.append("Note: The PDF is the official upstream English report; PDFs are never modified or translated.")
-
                 extra_block = ""
-                if extra_notes:
-                    extra_block = "\n" + "\n".join(extra_notes)
                 try:
                     # Always end on an explicit "completed" state.
                     # We edit the same progress message to avoid leaving it at 90%.
                     await asyncio.wait_for(
                         msg.edit_text(
-                            success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block + "\n\n✅ Delivered (PDF)",
+                            success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block,
                             parse_mode=ParseMode.HTML,
                         ),
                         timeout=_tg_remaining_s(floor=1.0),
@@ -5377,7 +5367,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # If editing fails (e.g., message no longer editable), send a final
                     # completion message anyway so the user always sees 100%.
                     try:
-                        await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Delivered (PDF)")
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text=success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block,
+                            parse_mode=ParseMode.HTML,
+                        )
                     except Exception:
                         pass
                 context.chat_data["progress_header"] = success_header
@@ -5562,7 +5556,7 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "badvin": {
             "service": "photos_badvin",
             "label": _bridge.t("photos.label.hidden", user_lang),
-            "loader": _get_badvin_images,
+                "loader": _get_hidden_vehicle_images,
             "empty": _bridge.t("report.photos.empty.hidden", user_lang),
             "heading": _bridge.t("photos.heading.hidden", user_lang),
         },
@@ -5644,7 +5638,10 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not media:
                     continue
                 try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                    if len(media) == 1:
+                        await context.bot.send_photo(chat_id=chat_id, photo=media[0].media)
+                    else:
+                        await context.bot.send_media_group(chat_id=chat_id, media=media)
                     sent_any = True
                 except Exception:
                     continue
@@ -5691,10 +5688,25 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     BATCH = 10
     sent_any = False
     for i in range(0, len(urls), BATCH):
-        chunk = urls[i:i+BATCH]
+        chunk = urls[i:i + BATCH]
+        # Fast path: let Telegram fetch public URLs directly.
+        try:
+            if len(chunk) == 1:
+                await context.bot.send_photo(chat_id=chat_id, photo=chunk[0])
+            else:
+                await context.bot.send_media_group(chat_id=chat_id, media=[InputMediaPhoto(u) for u in chunk])
+            sent_any = True
+            continue
+        except Exception:
+            pass
+
+        # Fallback: download bytes ourselves and send.
         media: List[InputMediaPhoto] = []
         for url in chunk:
-            data = await _download_image_bytes(url)
+            try:
+                data = await _download_image_bytes(url)
+            except Exception:
+                data = None
             if not data:
                 continue
             filename = url.split("?")[0].split("/")[-1] or "photo.jpg"
@@ -5706,7 +5718,10 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not media:
             continue
         try:
-            await context.bot.send_media_group(chat_id=chat_id, media=media)
+            if len(media) == 1:
+                await context.bot.send_photo(chat_id=chat_id, photo=media[0].media)
+            else:
+                await context.bot.send_media_group(chat_id=chat_id, media=media)
             sent_any = True
         except Exception:
             continue

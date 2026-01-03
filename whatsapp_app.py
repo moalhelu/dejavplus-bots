@@ -41,6 +41,7 @@ from bot_core.services.images import (
     get_apicar_current_images,
     get_apicar_history_images,
     get_apicar_accident_images,
+    get_hidden_vehicle_images,
     download_image_bytes,
     _select_images,
 )
@@ -1006,7 +1007,7 @@ async def _handle_report_option_choice(
 
     fetchers = {
         "wa_opt_accident": get_apicar_accident_images,
-        "wa_opt_badvin": get_badvin_images,
+        "wa_opt_badvin": get_hidden_vehicle_images,
     }
     fetcher = fetchers.get(choice)
     if not fetcher:
@@ -1698,18 +1699,7 @@ async def handle_incoming_whatsapp_message(
                 except Exception:
                     LOGGER.exception("whatsapp: failed to commit credit after delivery user=%s", user_ctx.user_id)
 
-                # Terminal success message (never leave user with only 'fetching...').
-                try:
-                    parts: List[str] = []
-                    if (user_ctx.language or "en").lower() != "en":
-                        if (user_ctx.language or "").lower() == "ar":
-                            parts.append("ملاحظة: ملف PDF هو النسخة الرسمية من المصدر باللغة الإنجليزية، ونحن لا نُعدّل ملفات PDF.")
-                        else:
-                            parts.append("Note: The PDF is the official upstream English report; PDFs are never modified or translated.")
-                    parts.append("✅ Delivered (PDF)")
-                    await send_whatsapp_text(msisdn, "\n".join(parts), client=client)
-                except Exception:
-                    pass
+                # No extra terminal message needed; the delivered document is the confirmation.
             else:
                 try:
                     if not delivery_refunded:

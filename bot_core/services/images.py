@@ -606,6 +606,54 @@ async def get_apicar_accident_images(vin: str, *, limit: int = 12) -> List[str]:
     return selected
 
 
+async def get_hidden_vehicle_images(vin: str, *, limit: int = 20) -> List[str]:
+    """Hidden vehicle photos.
+
+    Primary source is BadVin (when credentials are configured).
+    If BadVin is unavailable or returns no images, fall back to ApiCar images
+    so users still get a useful photo bundle.
+    """
+
+    vin_norm = (vin or "").strip()
+    cache_key = ("hidden_vehicle", vin_norm, int(limit or 20))
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    urls: List[str] = []
+    try:
+        urls = await get_badvin_images(vin_norm)
+    except Exception:
+        urls = []
+    selected = _select_images(urls or [], limit=int(limit or 20))
+    if selected:
+        _cache_set(cache_key, selected)
+        return selected
+
+    # Fallback: ApiCar current (often has auction/gallery images)
+    try:
+        urls = await get_apicar_current_images(vin_norm)
+    except Exception:
+        urls = []
+    selected = _select_images(urls or [], limit=int(limit or 20))
+    if selected:
+        _cache_set(cache_key, selected)
+        return selected
+
+    # Fallback: ApiCar history
+    try:
+        urls = await get_apicar_history_images(vin_norm)
+    except Exception:
+        urls = []
+    selected = _select_images(urls or [], limit=int(limit or 20))
+    if selected:
+        _cache_set(cache_key, selected)
+        return selected
+
+    _cache_set(cache_key, [])
+    return []
+
+
 def _collect_apicar_urls(data: Any) -> List[str]:
     if not data:
         return []

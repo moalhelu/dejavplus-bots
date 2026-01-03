@@ -6,6 +6,7 @@ import os
 import logging
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -13,6 +14,10 @@ import httpx
 from bot_core.config import get_env
 
 LOGGER = logging.getLogger(__name__)
+
+_IMAGE_DOWNLOAD_MAX_BYTES = int(os.getenv("IMAGE_DOWNLOAD_MAX_BYTES", str(12 * 1024 * 1024)) or (12 * 1024 * 1024))
+_IMAGE_DOWNLOAD_RETRIES = int(os.getenv("IMAGE_DOWNLOAD_RETRIES", "2") or 2)
+_IMAGE_DOWNLOAD_DEBUG = str(os.getenv("IMAGE_DOWNLOAD_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
 
 try:  # optional dependency
     from badvin import BadvinScraper
@@ -47,6 +52,31 @@ async def _get_http_client() -> httpx.AsyncClient:
             return _HTTP_CLIENT
         _HTTP_CLIENT = httpx.AsyncClient()
         return _HTTP_CLIENT
+
+
+def _looks_like_image_bytes(content: bytes, url: str = "", content_type: str = "") -> bool:
+    ct = (content_type or "").lower().strip()
+    if ct.startswith("image/"):
+        return True
+
+    u = (url or "").lower().split("?", 1)[0]
+    if u.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        return True
+
+    if not content:
+        return False
+
+    # Magic bytes for common image formats.
+    if content.startswith(b"\xFF\xD8\xFF"):
+        return True  # JPEG
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True  # PNG
+    if content.startswith(b"GIF87a") or content.startswith(b"GIF89a"):
+        return True  # GIF
+    if content.startswith(b"RIFF") and b"WEBP" in content[:32]:
+        return True  # WebP
+
+    return False
 
 
 async def get_badvin_images(vin: str) -> List[str]:
@@ -837,12 +867,79 @@ def _collect_oldest_hd_urls(data: Any) -> List[str]:
 
 async def download_image_bytes(url: str) -> Optional[bytes]:
     cfg = get_env()
-    try:
-        client = await _get_http_client()
-        resp = await client.get(url, timeout=cfg.apicar_image_timeout)
-        resp.raise_for_status()
-        if "image" not in (resp.headers.get("content-type", "").lower()):
-            return None
-        return resp.content
-    except Exception:
+
+    if not isinstance(url, str):
         return None
+    url = url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return None
+
+    def _same_host(a: str, b: str) -> bool:
+        try:
+            return bool(urlparse(a).netloc) and urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
+        except Exception:
+            return False
+
+    headers: Dict[str, str] = {
+        "accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "user-agent": "Mozilla/5.0 (compatible; DejavuPlusBot/1.0)",
+    }
+
+    # Some ApiCar image links require the api-key header. If the host matches,
+    # inject it for the download step (Telegram/WhatsApp URL-fetch cannot).
+    apicar_base = (cfg.apicar_base_url or "").strip()
+    if cfg.apicar_api_key and apicar_base and _same_host(url, apicar_base):
+        headers["api-key"] = cfg.apicar_api_key
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(max(1, _IMAGE_DOWNLOAD_RETRIES)):
+        try:
+            client = await _get_http_client()
+            async with client.stream(
+                "GET",
+                url,
+                headers=headers,
+                timeout=cfg.apicar_image_timeout,
+                follow_redirects=True,
+            ) as resp:
+                status = int(resp.status_code)
+                if status >= 400:
+                    if _IMAGE_DOWNLOAD_DEBUG:
+                        LOGGER.info("image download http error url=%s status=%s", url, status)
+                    return None
+
+                ctype = str(resp.headers.get("content-type", ""))
+                clen = resp.headers.get("content-length")
+                try:
+                    if clen is not None and int(clen) > _IMAGE_DOWNLOAD_MAX_BYTES:
+                        if _IMAGE_DOWNLOAD_DEBUG:
+                            LOGGER.info("image download too large url=%s content_length=%s", url, clen)
+                        return None
+                except Exception:
+                    pass
+
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if len(buf) > _IMAGE_DOWNLOAD_MAX_BYTES:
+                        if _IMAGE_DOWNLOAD_DEBUG:
+                            LOGGER.info("image download exceeded max bytes url=%s bytes=%s", url, len(buf))
+                        return None
+
+                content = bytes(buf)
+                if len(content) < 128:
+                    return None
+                if not _looks_like_image_bytes(content, url=url, content_type=ctype):
+                    if _IMAGE_DOWNLOAD_DEBUG:
+                        LOGGER.info("image download not image url=%s content_type=%s bytes=%s", url, ctype, len(content))
+                    return None
+                return content
+        except Exception as exc:  # pragma: no cover
+            last_exc = exc
+            await asyncio.sleep(0.4 * (attempt + 1))
+
+    if _IMAGE_DOWNLOAD_DEBUG and last_exc:
+        LOGGER.info("image download failed url=%s error=%s", url, last_exc)
+    return None

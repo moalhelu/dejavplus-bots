@@ -5616,6 +5616,7 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return _bridge.t("report.photos.accident.error", lang)
 
     user_lang = _get_user_report_lang(u)
+    rid = f"tg-img-{tg_id}-{int(time.time())}"
 
     photo_actions: Dict[str, Dict[str, Any]] = {
         "badvin": {
@@ -5733,7 +5734,7 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if action == "accident":
             logger.info("telegram: fetching accident images via apicar vin=%s", vin)
-        urls = await info["loader"](vin)
+        urls = await info["loader"](vin, rid=rid)
     except Exception:
         if action == "accident":
             err_msg = _accident_error(user_lang)
@@ -5750,51 +5751,64 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text=no_images_msg, parse_mode=ParseMode.HTML)
         return
 
-    BATCH = 10
-    sent_any = False
-    for i in range(0, len(urls), BATCH):
-        chunk = urls[i:i + BATCH]
-        # Fast path: let Telegram fetch public URLs directly.
+    def _is_jpeg(data: bytes) -> bool:
+        return bool(data) and data.startswith(b"\xFF\xD8\xFF")
+
+    def _is_png(data: bytes) -> bool:
+        return bool(data) and data.startswith(b"\x89PNG\r\n\x1a\n")
+
+    def _guess_ext(data: bytes) -> str:
+        if _is_png(data):
+            return ".png"
+        if _is_jpeg(data):
+            return ".jpg"
+        return ".bin"
+
+    TG_PHOTO_MAX_BYTES = 8 * 1024 * 1024
+
+    sent_count = 0
+    failed_count = 0
+    # Send sequentially to support per-item photo/document fallback.
+    for url in urls:
+        # Fast path: public URL as photo.
         try:
-            if len(chunk) == 1:
-                await context.bot.send_photo(chat_id=chat_id, photo=chunk[0])
-            else:
-                await context.bot.send_media_group(chat_id=chat_id, media=[InputMediaPhoto(u) for u in chunk])
-            sent_any = True
+            await context.bot.send_photo(chat_id=chat_id, photo=url)
+            sent_count += 1
             continue
         except Exception:
             pass
 
-        # Fallback: download bytes ourselves and send.
-        media: List[InputMediaPhoto] = []
-        for url in chunk:
-            try:
-                data = await _download_image_bytes(url)
-            except Exception:
-                data = None
-            if not data:
-                continue
-            filename = url.split("?")[0].split("/")[-1] or "photo.jpg"
-            if "." not in filename:
-                filename += ".jpg"
-            bio = BytesIO(data)
-            bio.name = filename
-            media.append(InputMediaPhoto(bio))
-        if not media:
-            continue
+        # Download and decide photo vs document.
         try:
-            if len(media) == 1:
-                await context.bot.send_photo(chat_id=chat_id, photo=media[0].media)
-            else:
-                await context.bot.send_media_group(chat_id=chat_id, media=media)
-            sent_any = True
+            data = await _download_image_bytes(url, rid=rid)
         except Exception:
+            data = None
+        if not data:
+            failed_count += 1
             continue
 
-    if not sent_any:
-        fail_msg = _bridge.t("report.photos.error", user_lang)
-        if not await _status_update(fail_msg):
-            await context.bot.send_message(chat_id=chat_id, text=fail_msg, parse_mode=ParseMode.HTML)
+        ext = _guess_ext(data)
+        filename = (url.split("?", 1)[0].split("/")[-1] or f"photo{ext}")
+        if "." not in filename:
+            filename += ext
+
+        bio = BytesIO(data)
+        bio.name = filename
+
+        try:
+            if len(data) <= TG_PHOTO_MAX_BYTES and (_is_jpeg(data) or _is_png(data)):
+                await context.bot.send_photo(chat_id=chat_id, photo=bio)
+            else:
+                await context.bot.send_document(chat_id=chat_id, document=bio, filename=filename)
+            sent_count += 1
+        except Exception:
+            failed_count += 1
+            continue
+
+    if sent_count <= 0:
+        reason = _bridge.t("report.photos.error", user_lang)
+        if not await _status_update(reason):
+            await context.bot.send_message(chat_id=chat_id, text=reason, parse_mode=ParseMode.HTML)
         return
 
     left_days = _days_left(u.get("expiry_date"))
@@ -5802,7 +5816,15 @@ async def photos_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     monthly_remaining = _remaining_monthly_reports(u)
     monthly_limit = _safe_int(u.get("limits", {}).get("monthly"))
     credit_line = _bridge.t("report.summary.unlimited", user_lang) if monthly_remaining is None else _bridge.t("report.summary.credit", user_lang, remaining=monthly_remaining, limit=monthly_limit)
-    summary = _bridge.t("report.summary.sent", user_lang, label=info["label"], vin=vin, expires=days_txt, credit=credit_line)
+    # Terminal message: always indicate delivered count (0 allowed above with reason).
+    summary = _bridge.t(
+        "report.summary.sent",
+        user_lang,
+        label=info["label"],
+        vin=vin,
+        expires=days_txt,
+        credit=credit_line,
+    ) + f"\n\n{sent_count}/{len(urls)}"
     if not await _status_update(summary):
         await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode=ParseMode.HTML)
 

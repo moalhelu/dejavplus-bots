@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import random
 import time
 from datetime import datetime
 from urllib.parse import urlparse
@@ -16,8 +17,56 @@ from bot_core.config import get_env
 LOGGER = logging.getLogger(__name__)
 
 _IMAGE_DOWNLOAD_MAX_BYTES = int(os.getenv("IMAGE_DOWNLOAD_MAX_BYTES", str(12 * 1024 * 1024)) or (12 * 1024 * 1024))
-_IMAGE_DOWNLOAD_RETRIES = int(os.getenv("IMAGE_DOWNLOAD_RETRIES", "2") or 2)
+_IMAGE_DOWNLOAD_MAX_BYTES = max(256_000, min(_IMAGE_DOWNLOAD_MAX_BYTES, 60 * 1024 * 1024))
 _IMAGE_DOWNLOAD_DEBUG = str(os.getenv("IMAGE_DOWNLOAD_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+
+# Policy requirement: 2 attempts with short jitter (<=200ms) on 429/5xx/timeouts only.
+_IMG_RETRY_ATTEMPTS = 2
+_IMG_RETRY_JITTER_MAX_SEC = 0.2
+
+
+def _rid_or_default(rid: Optional[str]) -> str:
+    base = (rid or "").strip()
+    if base:
+        return base
+    return f"img-{int(time.time())}"  # best-effort; caller should pass rid
+
+
+def _log_image_event(
+    rid: Optional[str],
+    event: str,
+    *,
+    url: Optional[str] = None,
+    final_url: Optional[str] = None,
+    status: Optional[int] = None,
+    content_type: Optional[str] = None,
+    bytes_len: Optional[int] = None,
+    err: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        payload: Dict[str, Any] = {
+            "rid": _rid_or_default(rid),
+            "event": event,
+        }
+        if url:
+            payload["url"] = url
+        if final_url:
+            payload["final_url"] = final_url
+        if status is not None:
+            payload["status"] = int(status)
+        if content_type:
+            payload["content_type"] = content_type
+        if bytes_len is not None:
+            payload["bytes_len"] = int(bytes_len)
+        if err:
+            payload["error"] = err
+        if extra:
+            payload.update({k: v for k, v in extra.items() if v is not None})
+        # Keep structured logs compact and safe.
+        LOGGER.info("image_%s %s", event, payload)
+    except Exception:
+        return
 
 try:  # optional dependency
     from badvin import BadvinScraper
@@ -509,14 +558,107 @@ async def _apicar_fetch_json(path: str, params: Dict[str, str]) -> Any:
     if not cfg.apicar_api_key:
         return None
     client = await _get_http_client()
-    resp = await client.get(
-        _apicar_base_url(path),
-        params=params,
-        headers=_apicar_base_headers(),
-        timeout=cfg.apicar_timeout,
-    )
-    resp.raise_for_status()
-    return resp.json()
+
+    url = _apicar_base_url(path)
+    rid = params.get("rid") if isinstance(params, dict) else None
+    safe_params = {k: v for k, v in (params or {}).items() if k != "rid"}
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(_IMG_RETRY_ATTEMPTS):
+        _log_image_event(rid, "fetch_attempt", url=url, extra={"kind": "json", "path": path, "attempt": attempt + 1})
+        try:
+            resp = await client.get(
+                url,
+                params=safe_params,
+                headers=_apicar_base_headers(),
+                timeout=cfg.apicar_timeout,
+                follow_redirects=True,
+            )
+            status = int(resp.status_code)
+            ctype = str(resp.headers.get("content-type", ""))
+            final_url = str(getattr(resp, "url", url))
+
+            if status == 429 or status >= 500:
+                _log_image_event(
+                    rid,
+                    "fetch_failed",
+                    url=url,
+                    final_url=final_url,
+                    status=status,
+                    content_type=ctype,
+                    bytes_len=len(resp.content or b""),
+                    err=f"http:{status}",
+                    extra={"kind": "json", "path": path},
+                )
+                if attempt < (_IMG_RETRY_ATTEMPTS - 1):
+                    await asyncio.sleep(random.random() * _IMG_RETRY_JITTER_MAX_SEC)
+                    continue
+                return None
+
+            resp.raise_for_status()
+            data = resp.json()
+            keys = list(data.keys())[:20] if isinstance(data, dict) else []
+            _log_image_event(
+                rid,
+                "fetch_ok",
+                url=url,
+                final_url=final_url,
+                status=status,
+                content_type=ctype,
+                bytes_len=len(resp.content or b""),
+                extra={"kind": "json", "path": path, "json_keys": keys},
+            )
+            return data
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+            _log_image_event(rid, "fetch_failed", url=url, err="timeout", extra={"kind": "json", "path": path})
+            if attempt < (_IMG_RETRY_ATTEMPTS - 1):
+                await asyncio.sleep(random.random() * _IMG_RETRY_JITTER_MAX_SEC)
+                continue
+            return None
+        except httpx.HTTPStatusError as exc:
+            last_exc = exc
+            try:
+                status = int(exc.response.status_code)
+                ctype = str(exc.response.headers.get("content-type", ""))
+                final_url = str(getattr(exc.response, "url", url))
+                body_len = len(exc.response.content or b"")
+            except Exception:
+                status = None
+                ctype = ""
+                final_url = url
+                body_len = None
+            _log_image_event(
+                rid,
+                "fetch_failed",
+                url=url,
+                final_url=final_url,
+                status=status,
+                content_type=ctype,
+                bytes_len=body_len,
+                err="http_status",
+                extra={"kind": "json", "path": path},
+            )
+            if status in (429,) or (status is not None and status >= 500):
+                if attempt < (_IMG_RETRY_ATTEMPTS - 1):
+                    await asyncio.sleep(random.random() * _IMG_RETRY_JITTER_MAX_SEC)
+                    continue
+            return None
+        except httpx.TransportError as exc:
+            last_exc = exc
+            _log_image_event(rid, "fetch_failed", url=url, err="transport", extra={"kind": "json", "path": path})
+            if attempt < (_IMG_RETRY_ATTEMPTS - 1):
+                await asyncio.sleep(random.random() * _IMG_RETRY_JITTER_MAX_SEC)
+                continue
+            return None
+        except Exception as exc:
+            last_exc = exc
+            _log_image_event(rid, "fetch_failed", url=url, err=str(exc), extra={"kind": "json", "path": path})
+            return None
+
+    if _IMAGE_DOWNLOAD_DEBUG and last_exc:
+        LOGGER.info("apicar json fetch failed path=%s error=%s", path, last_exc)
+    return None
 
 
 def _apicar_extract_images(obj: Any) -> List[str]:
@@ -552,13 +694,13 @@ def _apicar_extract_images(obj: Any) -> List[str]:
     return primary + fallback
 
 
-async def get_apicar_current_images(vin: str) -> List[str]:
+async def get_apicar_current_images(vin: str, *, rid: Optional[str] = None) -> List[str]:
     key = ("apicar_current", vin)
     cached = _cache_get(key)
     if cached is not None:
         return cached
     try:
-        data = await _apicar_fetch_json("cars/vin/all", {"vin": vin})
+        data = await _apicar_fetch_json("cars/vin/all", {"vin": vin, "rid": _rid_or_default(rid)})
     except Exception:
         data = None
     urls = _collect_apicar_urls(data)
@@ -567,13 +709,13 @@ async def get_apicar_current_images(vin: str) -> List[str]:
     return urls
 
 
-async def get_apicar_history_images(vin: str) -> List[str]:
+async def get_apicar_history_images(vin: str, *, rid: Optional[str] = None) -> List[str]:
     key = ("apicar_history", vin)
     cached = _cache_get(key)
     if cached is not None:
         return cached
     try:
-        data = await _apicar_fetch_json("sale-histories/vin", {"vin": vin})
+        data = await _apicar_fetch_json("sale-histories/vin", {"vin": vin, "rid": _rid_or_default(rid)})
     except Exception:
         data = None
     urls = _collect_apicar_urls(data)
@@ -582,7 +724,7 @@ async def get_apicar_history_images(vin: str) -> List[str]:
     return urls
 
 
-async def get_apicar_accident_images(vin: str, *, limit: int = 12) -> List[str]:
+async def get_apicar_accident_images(vin: str, *, limit: int = 12, rid: Optional[str] = None) -> List[str]:
     """Accident/old damage images.
 
     New strategy (per request):
@@ -600,7 +742,7 @@ async def get_apicar_accident_images(vin: str, *, limit: int = 12) -> List[str]:
     # --- Primary: cars/vin/all oldest-record HD images ---
     primary_urls: List[str] = []
     try:
-        data = await _apicar_fetch_json("cars/vin/all", {"vin": vin_norm})
+        data = await _apicar_fetch_json("cars/vin/all", {"vin": vin_norm, "rid": _rid_or_default(rid)})
         primary_urls = _collect_oldest_hd_urls(data)
     except Exception as exc:  # pragma: no cover - network dependent
         LOGGER.warning("apicar cars/vin/all fetch failed vin=%s error=%s", vin_norm, exc)
@@ -613,7 +755,7 @@ async def get_apicar_accident_images(vin: str, *, limit: int = 12) -> List[str]:
 
     # --- Fallback: History API (oldest-first) ---
     try:
-        hist_urls = await get_apicar_history_images(vin_norm)
+        hist_urls = await get_apicar_history_images(vin_norm, rid=_rid_or_default(rid))
     except Exception as exc:  # pragma: no cover - network dependent
         LOGGER.warning("history fetch failed vin=%s error=%s", vin_norm, exc)
         hist_urls = []
@@ -636,7 +778,7 @@ async def get_apicar_accident_images(vin: str, *, limit: int = 12) -> List[str]:
     return selected
 
 
-async def get_hidden_vehicle_images(vin: str, *, limit: int = 20) -> List[str]:
+async def get_hidden_vehicle_images(vin: str, *, limit: int = 20, rid: Optional[str] = None) -> List[str]:
     """Hidden vehicle photos.
 
     Primary source is BadVin (when credentials are configured).
@@ -662,7 +804,7 @@ async def get_hidden_vehicle_images(vin: str, *, limit: int = 20) -> List[str]:
 
     # Fallback: ApiCar current (often has auction/gallery images)
     try:
-        urls = await get_apicar_current_images(vin_norm)
+        urls = await get_apicar_current_images(vin_norm, rid=_rid_or_default(rid))
     except Exception:
         urls = []
     selected = _select_images(urls or [], limit=int(limit or 20))
@@ -672,7 +814,7 @@ async def get_hidden_vehicle_images(vin: str, *, limit: int = 20) -> List[str]:
 
     # Fallback: ApiCar history
     try:
-        urls = await get_apicar_history_images(vin_norm)
+        urls = await get_apicar_history_images(vin_norm, rid=_rid_or_default(rid))
     except Exception:
         urls = []
     selected = _select_images(urls or [], limit=int(limit or 20))
@@ -865,7 +1007,7 @@ def _collect_oldest_hd_urls(data: Any) -> List[str]:
     return cleaned
 
 
-async def download_image_bytes(url: str) -> Optional[bytes]:
+async def download_image_bytes(url: str, *, rid: Optional[str] = None) -> Optional[bytes]:
     cfg = get_env()
 
     if not isinstance(url, str):
@@ -892,7 +1034,8 @@ async def download_image_bytes(url: str) -> Optional[bytes]:
         headers["api-key"] = cfg.apicar_api_key
 
     last_exc: Optional[Exception] = None
-    for attempt in range(max(1, _IMAGE_DOWNLOAD_RETRIES)):
+    for attempt in range(_IMG_RETRY_ATTEMPTS):
+        _log_image_event(rid, "fetch_attempt", url=url, extra={"kind": "image", "attempt": attempt + 1})
         try:
             client = await _get_http_client()
             async with client.stream(
@@ -903,12 +1046,23 @@ async def download_image_bytes(url: str) -> Optional[bytes]:
                 follow_redirects=True,
             ) as resp:
                 status = int(resp.status_code)
-                if status >= 400:
-                    if _IMAGE_DOWNLOAD_DEBUG:
-                        LOGGER.info("image download http error url=%s status=%s", url, status)
-                    return None
-
+                final_url = str(getattr(resp, "url", url))
                 ctype = str(resp.headers.get("content-type", ""))
+                if status >= 400:
+                    _log_image_event(
+                        rid,
+                        "fetch_failed",
+                        url=url,
+                        final_url=final_url,
+                        status=status,
+                        content_type=ctype,
+                        err=f"http:{status}",
+                        extra={"kind": "image"},
+                    )
+                    if (status == 429 or status >= 500) and attempt < (_IMG_RETRY_ATTEMPTS - 1):
+                        await asyncio.sleep(random.random() * _IMG_RETRY_JITTER_MAX_SEC)
+                        continue
+                    return None
                 clen = resp.headers.get("content-length")
                 try:
                     if clen is not None and int(clen) > _IMAGE_DOWNLOAD_MAX_BYTES:
@@ -930,15 +1084,60 @@ async def download_image_bytes(url: str) -> Optional[bytes]:
 
                 content = bytes(buf)
                 if len(content) < 128:
+                    _log_image_event(
+                        rid,
+                        "fetch_failed",
+                        url=url,
+                        final_url=final_url,
+                        status=status,
+                        content_type=ctype,
+                        bytes_len=len(content),
+                        err="too_small",
+                        extra={"kind": "image"},
+                    )
                     return None
                 if not _looks_like_image_bytes(content, url=url, content_type=ctype):
-                    if _IMAGE_DOWNLOAD_DEBUG:
-                        LOGGER.info("image download not image url=%s content_type=%s bytes=%s", url, ctype, len(content))
+                    _log_image_event(
+                        rid,
+                        "fetch_failed",
+                        url=url,
+                        final_url=final_url,
+                        status=status,
+                        content_type=ctype,
+                        bytes_len=len(content),
+                        err="not_image",
+                        extra={"kind": "image"},
+                    )
                     return None
+                _log_image_event(
+                    rid,
+                    "fetch_ok",
+                    url=url,
+                    final_url=final_url,
+                    status=status,
+                    content_type=ctype,
+                    bytes_len=len(content),
+                    extra={"kind": "image"},
+                )
                 return content
+        except httpx.TimeoutException as exc:  # pragma: no cover
+            last_exc = exc
+            _log_image_event(rid, "fetch_failed", url=url, err="timeout", extra={"kind": "image"})
+            if attempt < (_IMG_RETRY_ATTEMPTS - 1):
+                await asyncio.sleep(random.random() * _IMG_RETRY_JITTER_MAX_SEC)
+                continue
+            return None
+        except httpx.TransportError as exc:  # pragma: no cover
+            last_exc = exc
+            _log_image_event(rid, "fetch_failed", url=url, err="transport", extra={"kind": "image"})
+            if attempt < (_IMG_RETRY_ATTEMPTS - 1):
+                await asyncio.sleep(random.random() * _IMG_RETRY_JITTER_MAX_SEC)
+                continue
+            return None
         except Exception as exc:  # pragma: no cover
             last_exc = exc
-            await asyncio.sleep(0.4 * (attempt + 1))
+            _log_image_event(rid, "fetch_failed", url=url, err=str(exc), extra={"kind": "image"})
+            return None
 
     if _IMAGE_DOWNLOAD_DEBUG and last_exc:
         LOGGER.info("image download failed url=%s error=%s", url, last_exc)

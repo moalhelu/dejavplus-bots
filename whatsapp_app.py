@@ -1177,8 +1177,92 @@ async def _send_photo_batch(
 
     sent = 0
     failed_urls: List[str] = []
+
+    async def _ensure_public_url() -> Optional[str]:
+        public = (os.getenv("WHATSAPP_PUBLIC_URL") or "").strip()
+        if public and _is_public_http_base(public):
+            return public
+        try:
+            public = await _get_ngrok_url()
+        except Exception:
+            public = None
+        if public and _is_public_http_base(public):
+            os.environ["WHATSAPP_PUBLIC_URL"] = public
+            return public
+        return None
+
+    async def _send_image_bytes_robust(data: bytes, *, filename: str, rid: str, src_url: str) -> bool:
+        # 1) Try base64 image (fast).
+        try:
+            b64 = base64.b64encode(data).decode("ascii")
+            await client.send_image(msisdn, image_base64=b64, filename=filename)
+            return True
+        except Exception as exc:  # pragma: no cover
+            LOGGER.debug(
+                "whatsapp: send_image base64 failed rid=%s vin=%s choice=%s file=%s bytes=%s error=%s",
+                rid,
+                vin,
+                choice,
+                filename,
+                len(data),
+                exc,
+            )
+
+        # 2) Host bytes via one-shot and send as public URL image.
+        public = await _ensure_public_url()
+        if public:
+            try:
+                token = await _put_one_shot_blob(data, filename=filename, media_type="image/jpeg")
+                url_value = f"{public}/download/{token}"
+                await client.send_image(msisdn, image_url=url_value, filename=filename)
+                return True
+            except Exception as exc:  # pragma: no cover
+                LOGGER.debug(
+                    "whatsapp: send_image one-shot url failed rid=%s vin=%s choice=%s url=%s src_url=%s error=%s",
+                    rid,
+                    vin,
+                    choice,
+                    url_value if 'url_value' in locals() else '-',
+                    src_url,
+                    exc,
+                )
+
+            # 3) Still failing: send as document via one-shot URL.
+            try:
+                token = await _put_one_shot_blob(data, filename=filename, media_type="application/octet-stream")
+                url_value = f"{public}/download/{token}"
+                await client.send_document(msisdn, document_url=url_value, filename=filename)
+                return True
+            except Exception as exc:  # pragma: no cover
+                LOGGER.warning(
+                    "whatsapp: send_document one-shot failed rid=%s vin=%s choice=%s src_url=%s error=%s",
+                    rid,
+                    vin,
+                    choice,
+                    src_url,
+                    exc,
+                )
+        else:
+            # No public URL available; last resort: document via base64.
+            try:
+                b64 = base64.b64encode(data).decode("ascii")
+                await client.send_document(msisdn, document_base64=b64, filename=filename)
+                return True
+            except Exception as exc:  # pragma: no cover
+                LOGGER.warning(
+                    "whatsapp: send_document base64 failed rid=%s vin=%s choice=%s file=%s error=%s",
+                    rid,
+                    vin,
+                    choice,
+                    filename,
+                    exc,
+                )
+
+        return False
     for url in cleaned:
         payload: Dict[str, Any] = {}
+
+        rid = f"wa-img-{user_ctx.user_id}-{vin}-{int(time.time())}"
 
         try:
             await client.send_image(msisdn, image_url=url, **payload)
@@ -1193,7 +1277,7 @@ async def _send_photo_batch(
                 exc,
             )
 
-        data = await download_image_bytes(url)
+        data = await download_image_bytes(url, rid=rid)
         if not data:
             failed_urls.append(url)
             LOGGER.warning(
@@ -1204,19 +1288,14 @@ async def _send_photo_batch(
             )
             continue
 
-        try:
-            b64 = base64.b64encode(data).decode("ascii")
-            await client.send_image(msisdn, image_base64=b64, **payload)
+        filename = url.split("?", 1)[0].split("/")[-1] or "photo.jpg"
+        if "." not in filename:
+            filename += ".jpg"
+        ok = await _send_image_bytes_robust(data, filename=filename, rid=rid, src_url=url)
+        if ok:
             sent += 1
-        except Exception as exc:  # pragma: no cover - network dependent
+        else:
             failed_urls.append(url)
-            LOGGER.warning(
-                "whatsapp: failed to send image_base64 vin=%s choice=%s url=%s error=%s",
-                vin,
-                choice,
-                url,
-                exc,
-            )
 
     LOGGER.info(
         "whatsapp: photo send summary vin=%s choice=%s sent=%s failed=%s total=%s",
@@ -1265,6 +1344,7 @@ async def _handle_report_option_choice(
         return {"status": "ignored", "reason": "unknown_choice"}
 
     LOGGER.info("whatsapp: report photos choice=%s vin=%s user=%s", choice, vin, user_ctx.user_id)
+    rid = f"wa-img-{user_ctx.user_id}-{vin}-{int(time.time())}"
     await send_whatsapp_text(msisdn, _bridge.t("wa.photos.fetching", user_ctx.language, vin=vin), client=client)
 
     # BadVin images are frequently protected; prefer authenticated bytes.
@@ -1282,9 +1362,10 @@ async def _handle_report_option_choice(
                 if not data:
                     continue
                 try:
-                    b64 = base64.b64encode(data).decode("ascii")
-                    await client.send_image(msisdn, image_base64=b64)
-                    sent += 1
+                    filename = f"{vin}_hidden.jpg"
+                    ok = await _send_image_bytes_robust(bytes(data), filename=filename, rid=rid, src_url="badvin_media")
+                    if ok:
+                        sent += 1
                 except Exception as exc:  # pragma: no cover
                     LOGGER.warning("whatsapp: failed to send badvin media_base64 vin=%s error=%s", vin, exc)
 
@@ -1296,7 +1377,7 @@ async def _handle_report_option_choice(
     try:
         if choice == "wa_opt_accident":
             LOGGER.info("whatsapp: fetching accident images via apicar vin=%s", vin)
-        urls = await fetcher(vin)
+        urls = await fetcher(vin, rid=rid)
     except Exception as exc:  # pragma: no cover - network dependent
         LOGGER.warning("Failed to fetch images for choice=%s vin=%s: %s", choice, vin, exc)
         await send_whatsapp_text(msisdn, _photo_fetch_error_message(user_ctx.language, choice), client=client)

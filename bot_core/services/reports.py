@@ -39,6 +39,7 @@ from bot_core.utils.vin import normalize_vin
 
 from bot_core.services.pdf import html_to_pdf_bytes_chromium
 from bot_core.services.translation import inject_rtl, translate_html
+from bot_core.services.pdf import PdfBusyError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -451,6 +452,14 @@ async def generate_vin_report(
                 if isinstance(json_payload, dict):
                     html_candidate = _extract_html_from_upstream_json(cast(Dict[str, Any], json_payload))
 
+                # Also accept direct HTML bodies (some upstream variants return text/html).
+                if not html_candidate:
+                    body_text = upstream.get("text")
+                    if isinstance(body_text, str):
+                        low = body_text.lstrip().lower()
+                        if low.startswith("<html") or "<!doctype html" in low:
+                            html_candidate = body_text
+
                 if not html_candidate:
                     # Missing htmlContent is a hard failure per contract.
                     try:
@@ -519,13 +528,30 @@ async def generate_vin_report(
                 render_budget_ms = _deadline_remaining_ms(deadline, floor_ms=1500, cap_ms=120_000)
                 pdf_rendered: Optional[bytes] = None
                 try:
-                    pdf_rendered = await html_to_pdf_bytes_chromium(
-                        html_str=html_candidate,
-                        base_url="https://www.carfax.com/",
-                        timeout_ms=render_budget_ms,
-                        acquire_timeout_ms=min(2000, render_budget_ms),
-                        wait_until="domcontentloaded",
-                    )
+                    # Avoid overly aggressive 2s queue timeouts; under load the single-page
+                    # PDF engine can be busy, but we should wait within the remaining budget.
+                    acquire_ms = min(20_000, max(2_000, int(render_budget_ms * 0.5)))
+
+                    for attempt in range(1, 4):
+                        try:
+                            pdf_rendered = await html_to_pdf_bytes_chromium(
+                                html_str=html_candidate,
+                                base_url="https://www.carfax.com/",
+                                timeout_ms=render_budget_ms,
+                                acquire_timeout_ms=acquire_ms,
+                                wait_until="domcontentloaded",
+                            )
+                            if pdf_rendered:
+                                break
+                        except PdfBusyError:
+                            # Backoff lightly and retry as long as we still have budget.
+                            if attempt >= 3:
+                                pdf_rendered = None
+                                break
+                            await asyncio.sleep(0.35 * attempt)
+                        except Exception:
+                            pdf_rendered = None
+                            break
                 except Exception:
                     pdf_rendered = None
 

@@ -38,9 +38,26 @@ from bot_core.telemetry import atimed, get_rid
 from bot_core.utils.vin import normalize_vin
 
 from bot_core.services.pdf import html_to_pdf_bytes_chromium
+from bot_core.services.translation import inject_rtl, translate_html
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+SUPPORTED_REPORT_LANGS = {"ar", "en", "ku", "ckb"}
+
+
+def _normalize_report_lang(lang: Optional[str]) -> str:
+    candidate = (lang or "").strip().lower()
+    if not candidate:
+        return "en"
+    if candidate in SUPPORTED_REPORT_LANGS:
+        return candidate
+    # Accept common system-style tags like ar-IQ, ckb-IQ, ku-TR.
+    primary = re.split(r"[-_]", candidate, maxsplit=1)[0]
+    if primary in SUPPORTED_REPORT_LANGS:
+        return primary
+    return "en"
 
 
 def _empty_errors() -> List[str]:
@@ -303,7 +320,7 @@ async def generate_vin_report(
     2) Fallback (HTML-only upstream): validate upstream response + HTML content, then render via Playwright.
     """
 
-    requested_lang = (language or "en").strip().lower()
+    requested_lang = _normalize_report_lang(language)
     normalized_vin = normalize_vin(vin)
     if not normalized_vin:
         return ReportResult(
@@ -458,16 +475,38 @@ async def generate_vin_report(
                         error_class=ERROR_UPSTREAM_FETCH_FAILED,
                     )
 
+                # Translate report HTML when requested (kept bounded by the overall reports deadline).
+                delivered_lang = requested_lang
+                translate_ms = None
+                translated = False
+                if requested_lang != "en":
+                    t_tr0 = time.perf_counter()
+                    try:
+                        html_out = await translate_html(html_candidate, requested_lang)
+                        if isinstance(html_out, str) and html_out.strip():
+                            translated = (html_out != html_candidate)
+                            html_candidate = html_out
+                    except Exception:
+                        # Hard fallback: preserve original content but ensure correct RTL styling.
+                        try:
+                            html_candidate = inject_rtl(html_candidate, lang=requested_lang)
+                        except Exception:
+                            pass
+                    translate_ms = round((time.perf_counter() - t_tr0) * 1000.0, 2)
+
                 html_len = len(html_candidate.encode("utf-8", errors="ignore"))
                 try:
                     LOGGER.info(
-                        "upstream_ok rid=%s vin=%s upstream_mode=html status=%s ctype=%s final_url=%s html_bytes_len=%s",
+                        "upstream_ok rid=%s vin=%s upstream_mode=html status=%s ctype=%s final_url=%s html_bytes_len=%s lang=%s translated=%s translate_ms=%s",
                         rid,
                         normalized_vin,
                         status if status is not None else "na",
                         ctype or "-",
                         final_url or "-",
                         html_len,
+                        delivered_lang,
+                        translated,
+                        translate_ms if translate_ms is not None else "-",
                     )
                 except Exception:
                     pass
@@ -516,7 +555,19 @@ async def generate_vin_report(
                     pdf_bytes=bytes(pdf_rendered),
                     pdf_filename=f"{normalized_vin}.pdf",
                     vin=normalized_vin,
-                    raw_response={**(upstream or {}), "total_time_sec": total_time, "upstream_mode": "html"},
+                    raw_response={
+                        **(upstream or {}),
+                        "total_time_sec": total_time,
+                        "upstream_mode": "html",
+                        "_dv_fast": {
+                            "fast_mode": bool(fast_mode),
+                            "requested_lang": requested_lang,
+                            "delivered_lang": delivered_lang,
+                            "translated": bool(translated),
+                            "translate_ms": translate_ms,
+                            "total_sec": total_time,
+                        },
+                    },
                 )
             finally:
                 if acquired_report_slot:

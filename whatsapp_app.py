@@ -487,6 +487,13 @@ def _normalize_language_code(value: Optional[str]) -> str:
     candidate = (value or "").strip().lower()
     if candidate in SUPPORTED_LANGS:
         return candidate
+    # Accept system-style tags like ar-IQ / en-US / ckb-IQ.
+    try:
+        primary = re.split(r"[-_]", candidate, maxsplit=1)[0]
+    except Exception:
+        primary = ""
+    if primary in SUPPORTED_LANGS:
+        return primary
     fallback = (get_report_default_lang() or "ar").strip().lower()
     return fallback if fallback in SUPPORTED_LANGS else "ar"
 

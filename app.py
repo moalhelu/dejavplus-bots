@@ -297,6 +297,13 @@ def _normalize_report_lang_code(lang: Optional[str]) -> str:
     candidate = (lang or "").strip().lower()
     if candidate in REPORT_LANG_INFO:
         return candidate
+    # Accept system language tags like ar-IQ, en-US, ckb-IQ.
+    try:
+        primary = re.split(r"[-_]", candidate, maxsplit=1)[0]
+    except Exception:
+        primary = ""
+    if primary in REPORT_LANG_INFO:
+        return primary
     default_candidate = (get_report_default_lang() or "ar").strip().lower()
     return default_candidate if default_candidate in REPORT_LANG_INFO else "ar"
 

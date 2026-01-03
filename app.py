@@ -5088,15 +5088,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report_result: Optional[_ReportResult] = None
         bridge_pdf_path: Optional[str] = None
         bridge_temp_files: List[str] = []
-        # Strict user-visible SLA (Fast PDF delivery).
-        sla_total_s = float(os.getenv("TOTAL_BUDGET_SEC", "10") or 10)
-        sla_total_s = max(5.0, min(sla_total_s, 30.0))
-
-        # Keep Telegram-specific knobs but clamp to SLA by default.
-        tg_total_timeout_s = float(os.getenv("TG_REPORT_TOTAL_TIMEOUT_SEC", str(sla_total_s)) or sla_total_s)
-        tg_total_timeout_s = max(5.0, min(tg_total_timeout_s, sla_total_s))
-        tg_send_timeout_s = float(os.getenv("TG_REPORT_SEND_TIMEOUT_SEC", str(max(5.0, sla_total_s))) or max(5.0, sla_total_s))
-        tg_send_timeout_s = max(5.0, min(tg_send_timeout_s, sla_total_s))
+        # Telegram time budgets: keep them independent from the WhatsApp TOTAL_BUDGET_SEC.
+        # Reliability > overly strict SLA; reports pipeline also has its own internal deadline.
+        tg_total_timeout_s = float(os.getenv("TG_REPORT_TOTAL_TIMEOUT_SEC", "120") or 120)
+        tg_total_timeout_s = max(10.0, min(tg_total_timeout_s, 300.0))
+        tg_send_timeout_s = float(os.getenv("TG_REPORT_SEND_TIMEOUT_SEC", "60") or 60)
+        tg_send_timeout_s = max(10.0, min(tg_send_timeout_s, 300.0))
         tg_t0 = time.perf_counter()
 
         def _tg_remaining_s(floor: float = 1.0) -> float:

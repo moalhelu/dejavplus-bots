@@ -70,8 +70,11 @@ _CARFAX_SEM = asyncio.Semaphore(int(os.getenv("CARFAX_MAX_CONCURRENCY", "12") or
 _CARFAX_TIMEOUT = float(os.getenv("CARFAX_HTTP_TIMEOUT", "8") or 8)
 _CARFAX_TIMEOUT = max(1.0, min(_CARFAX_TIMEOUT, 10.0))
 
-_REPORT_TOTAL_TIMEOUT_SEC = float(os.getenv("REPORT_TOTAL_TIMEOUT_SEC", "10") or 10)
-_REPORT_TOTAL_TIMEOUT_SEC = max(3.0, min(_REPORT_TOTAL_TIMEOUT_SEC, 10.0))
+# Total wall-clock budget for generating a report end-to-end.
+# 10s is too tight in real-world conditions (translation + Chromium render), and can cause
+# user-visible timeouts/refunds even when upstream is healthy.
+_REPORT_TOTAL_TIMEOUT_SEC = float(os.getenv("REPORT_TOTAL_TIMEOUT_SEC", "45") or 45)
+_REPORT_TOTAL_TIMEOUT_SEC = max(5.0, min(_REPORT_TOTAL_TIMEOUT_SEC, 180.0))
 
 # Backpressure: bound concurrent end-to-end report generation so heavy load doesn't
 # push all requests into timeouts after partial progress.

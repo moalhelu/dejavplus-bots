@@ -5077,6 +5077,16 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if limit_message:
                         limit_response.messages.append(limit_message)
                 await _send_bridge_responses(update, limit_response, context=context)
+                # IMPORTANT: we did not start a report pipeline; clear in-flight marker.
+                # Otherwise users can get stuck with "already processing" for 15 minutes
+                # after a daily limit rejection, even if an admin resets the counter.
+                try:
+                    if isinstance(context.user_data, dict):
+                        inflight_block = context.user_data.get("vin_inflight")
+                        if isinstance(inflight_block, dict) and str(inflight_block.get("vin") or "") == str(vin):
+                            context.user_data.pop("vin_inflight", None)
+                except Exception:
+                    pass
                 return
 
             # Deterministic rid for exactly-once accounting.

@@ -1678,32 +1678,42 @@ async def handle_incoming_whatsapp_message(
                     LOGGER.info("whatsapp: report already in-flight user=%s vin=%s", user_ctx.user_id, vin_clean)
                     return {"status": "ok", "responses": 1, "reason": "inflight"}
 
+            # Enforce subscription/service/usage limits BEFORE reserving credit or starting jobs.
+            # Previously the WhatsApp VIN fast-path skipped limit validation, allowing reports
+            # beyond the daily/monthly limits.
+            try:
+                limit_allowed, limit_message, limit_reason = await _bridge.check_user_limits(user_ctx)
+            except Exception as exc:
+                LOGGER.warning("whatsapp: limit check failed user=%s vin=%s error=%s", user_ctx.user_id, vin_clean, exc)
+                limit_allowed, limit_message, limit_reason = True, None, None
+
+            if not limit_allowed:
+                if limit_message:
+                    await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(limit_message), client=client)
+
+                if limit_reason in {"daily", "monthly", "both"}:
+                    try:
+                        limit_resp = await _bridge.request_limit_increase(
+                            user_ctx,
+                            notifications=telegram_context,
+                            reason=limit_reason,
+                        )
+                        for msg in (limit_resp.messages or []):
+                            if msg:
+                                await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(str(msg)), client=client)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "whatsapp: limit increase request failed user=%s reason=%s error=%s",
+                            user_ctx.user_id,
+                            limit_reason,
+                            exc,
+                        )
+
+                return {"status": "ok", "responses": 1, "reason": f"limit:{limit_reason or 'blocked'}"}
+
+            # Snapshot counters for the progress header; reload after reserve for accurate used counts.
             db_snapshot = _load_db()
             user_record = db_snapshot.get("users", {}).get(user_ctx.user_id, {}) or {}
-            limits = user_record.get("limits", {})
-            monthly_limit = _safe_int(limits.get("monthly"))
-            monthly_remaining = remaining_monthly_reports(user_record)
-            daily_limit = _safe_int(limits.get("daily"))
-            daily_used = _safe_int(limits.get("today_used"))
-            expiry_days = days_left(user_record.get("expiry_date"))
-
-            # Guard: inactive or expired accounts get blocked immediately (no progress message)
-            if not user_record.get("is_active"):
-                await send_whatsapp_text(msisdn, _bridge.t("account.inactive", user_ctx.language), client=client)
-                return {"status": "ok", "responses": 1}
-
-            if expiry_days is not None and expiry_days <= 0:
-                expiry_label = user_record.get("expiry_date") or "-"
-                await send_whatsapp_text(
-                    msisdn,
-                    _bridge.t("account.inactive.expired", user_ctx.language, expiry=expiry_label),
-                    client=client,
-                )
-                return {"status": "ok", "responses": 1}
-
-            if not (user_record.get("services", {}) or {}).get("carfax", True):
-                await send_whatsapp_text(msisdn, _bridge.t("service.carfax.disabled", user_ctx.language), client=client)
-                return {"status": "ok", "responses": 1}
 
             # Reserve credit immediately on VIN receipt; downstream handler will commit/refund
             try:
@@ -1712,6 +1722,15 @@ async def handle_incoming_whatsapp_message(
                 LOGGER.info("whatsapp: credit reserved on receipt for vin=%s user=%s", vin_clean, user_ctx.user_id)
             except Exception as exc:
                 LOGGER.exception("whatsapp: failed to reserve credit vin=%s user=%s", vin_clean, user_ctx.user_id)
+
+            db_snapshot2 = _load_db()
+            user_record2 = db_snapshot2.get("users", {}).get(user_ctx.user_id, {}) or {}
+            limits2 = user_record2.get("limits", {})
+            monthly_limit = _safe_int(limits2.get("monthly"))
+            monthly_remaining = remaining_monthly_reports(user_record2)
+            daily_limit = _safe_int(limits2.get("daily"))
+            daily_used = _safe_int(limits2.get("today_used"))
+            expiry_days = days_left(user_record2.get("expiry_date"))
 
             progress_msg = _build_vin_progress_header(
                 vin_clean,

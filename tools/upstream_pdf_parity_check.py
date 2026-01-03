@@ -27,6 +27,13 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+# Ensure repo root is importable when running `py tools\upstream_pdf_parity_check.py ...`.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 import asyncio
 import hashlib
 import sys
@@ -58,7 +65,7 @@ async def _run(vin: str, lang: str) -> int:
     if not upstream_ok or ("application/pdf" not in upstream_ctype) or not isinstance(upstream_bytes, (bytes, bytearray)) or not bytes(upstream_bytes):
         return 3
 
-    result = await generate_vin_report(vin, language=lang, fast_mode=True)
+    result = await generate_vin_report(vin, language=lang, fast_mode=True, user_id="tool")
     if not getattr(result, "success", False) or not getattr(result, "pdf_bytes", None):
         print(f"bot:      success={getattr(result, 'success', None)} bytes=0")
         return 4

@@ -3851,7 +3851,7 @@ async def _handle_vin_request(
         credit_reserved = True
 
     try:
-        report_result = await generate_vin_report(vin, language=language)
+        report_result = await generate_vin_report(vin, language=language, user_id=str(user.user_id))
             
     except Exception as exc:  # pylint: disable=broad-except
         # If failed, refund the credit

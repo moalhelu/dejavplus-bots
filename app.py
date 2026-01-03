@@ -5150,7 +5150,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not report_result:
                 try:
                     report_result = await asyncio.wait_for(
-                        _generate_vin_report(vin, language=report_lang, fast_mode=True),
+                        _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(user_id)),
                         timeout=_tg_remaining_s(),
                     )
                 except asyncio.TimeoutError:

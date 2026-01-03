@@ -60,6 +60,7 @@ from bot_core.utils.vin import is_valid_vin
 from bot_core.telemetry import atimed, new_rid, set_rid
 from bot_core.services.translation import close_http_session as _close_translation_session
 from bot_core.services.reports import close_http_session as _close_reports_session
+from bot_core.services.reports import generate_vin_report as _generate_vin_report
 from bot_core.request_id import compute_request_id
 
 from bot_core.logging_setup import configure_logging
@@ -344,6 +345,187 @@ _ONE_SHOT_TOTAL_BYTES = 0
 
 # Track background tasks (startup loops) so exceptions are never lost.
 _BG_TASKS: set[asyncio.Task[Any]] = set()
+
+# One in-flight VIN report task per WhatsApp user.
+_WA_REPORT_TASKS: Dict[str, asyncio.Task[Any]] = {}
+_WA_REPORT_TASKS_LOCK = asyncio.Lock()
+
+# Simple on-disk report cache to reduce user-visible failures.
+_WA_REPORT_CACHE_DIR = Path(os.getenv("WA_REPORT_CACHE_DIR", "temp_static/report_cache") or "temp_static/report_cache")
+_WA_REPORT_CACHE_TTL_SEC = float(os.getenv("WA_REPORT_CACHE_TTL_SEC", str(7 * 86400)) or (7 * 86400))
+_WA_REPORT_CACHE_TTL_SEC = max(3600.0, min(_WA_REPORT_CACHE_TTL_SEC, 30 * 86400.0))
+
+
+def _wa_cache_path(vin: str, lang: str) -> Path:
+    safe_vin = re.sub(r"[^A-Za-z0-9]", "", (vin or "").upper())[:32] or "VIN"
+    safe_lang = re.sub(r"[^a-z0-9_-]", "", (lang or "en").lower())[:16] or "en"
+    return _WA_REPORT_CACHE_DIR / f"{safe_vin}__{safe_lang}.pdf"
+
+
+def _wa_cache_read(vin: str, lang: str) -> Optional[bytes]:
+    try:
+        p = _wa_cache_path(vin, lang)
+        if not p.exists():
+            return None
+        st = p.stat()
+        if st.st_mtime and (time.time() - float(st.st_mtime)) > _WA_REPORT_CACHE_TTL_SEC:
+            return None
+        data = p.read_bytes()
+        return data if data else None
+    except Exception:
+        return None
+
+
+def _wa_cache_write(vin: str, lang: str, pdf_bytes: bytes) -> None:
+    if not pdf_bytes:
+        return
+    try:
+        _WA_REPORT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        target = _wa_cache_path(vin, lang)
+        tmp = target.with_suffix(".pdf.tmp")
+        tmp.write_bytes(pdf_bytes)
+        tmp.replace(target)
+    except Exception:
+        return
+
+
+async def _wa_try_send_pdf(
+    *,
+    client: UltraMsgClient,
+    msisdn: str,
+    vin: str,
+    lang: str,
+    pdf_bytes: bytes,
+    upstream_sha256: Optional[str] = None,
+    max_attempts: int = 3,
+) -> bool:
+    doc = {
+        "type": "pdf",
+        "bytes": pdf_bytes,
+        "filename": f"{vin}.pdf",
+        "upstream_sha256": upstream_sha256,
+    }
+    attempts = max(1, int(max_attempts))
+    backoffs = [0.0, 1.5, 4.0, 8.0]
+    for i in range(attempts):
+        if i > 0:
+            try:
+                await asyncio.sleep(backoffs[min(i, len(backoffs) - 1)])
+            except Exception:
+                pass
+        try:
+            ok = await _relay_pdf_document(client, msisdn, doc)
+        except Exception:
+            ok = False
+        if ok:
+            return True
+    # Last-resort: try cache copy (can help if upstream bytes were corrupted)
+    try:
+        cached = _wa_cache_read(vin, lang)
+        if cached and cached != pdf_bytes:
+            doc["bytes"] = cached
+            return await _relay_pdf_document(client, msisdn, doc)
+    except Exception:
+        pass
+    return False
+
+
+async def _wa_run_vin_report_job(
+    *,
+    user_id: str,
+    msisdn: str,
+    vin: str,
+    lang: str,
+    client: UltraMsgClient,
+    rid_for_request: str,
+) -> None:
+    """Generate and deliver a VIN report reliably (background job).
+
+    - Retries generation on transient failures
+    - Retries delivery
+    - Writes/uses a cached PDF fallback
+    - Commits credit only after delivery, refunds only when giving up
+    """
+
+    attempts = int(os.getenv("WA_REPORT_RETRIES", "3") or 3)
+    attempts = max(1, min(attempts, 6))
+    gen_backoffs = [0.0, 2.0, 6.0, 12.0, 20.0, 30.0]
+    last_result = None
+    for i in range(attempts):
+        if i > 0:
+            try:
+                await asyncio.sleep(gen_backoffs[min(i, len(gen_backoffs) - 1)])
+            except Exception:
+                pass
+        try:
+            last_result = await _generate_vin_report(vin, language=lang, fast_mode=True, user_id=str(user_id))
+        except Exception:
+            last_result = None
+
+        if last_result is not None and getattr(last_result, "success", False) and getattr(last_result, "pdf_bytes", None):
+            try:
+                pdf_bytes = bytes(getattr(last_result, "pdf_bytes"))
+            except Exception:
+                pdf_bytes = b""
+            if pdf_bytes:
+                try:
+                    _wa_cache_write(vin, lang, pdf_bytes)
+                except Exception:
+                    pass
+                upstream_sha256 = getattr(last_result, "upstream_sha256", None)
+                delivered = await _wa_try_send_pdf(
+                    client=client,
+                    msisdn=msisdn,
+                    vin=vin,
+                    lang=lang,
+                    pdf_bytes=pdf_bytes,
+                    upstream_sha256=upstream_sha256,
+                    max_attempts=int(os.getenv("WA_DELIVERY_RETRIES", "3") or 3),
+                )
+                if delivered:
+                    try:
+                        commit_credit(user_id, rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin})
+                    except Exception:
+                        LOGGER.exception("whatsapp: failed to commit credit after delivery user=%s vin=%s", user_id, vin)
+                    try:
+                        await _send_report_options_menu(msisdn, user_id, vin, client)
+                    except Exception:
+                        pass
+                    return
+
+    # If generation never succeeded, attempt cached fallback.
+    cached_pdf = _wa_cache_read(vin, lang)
+    if cached_pdf:
+        delivered = await _wa_try_send_pdf(
+            client=client,
+            msisdn=msisdn,
+            vin=vin,
+            lang=lang,
+            pdf_bytes=cached_pdf,
+            upstream_sha256=None,
+            max_attempts=int(os.getenv("WA_DELIVERY_RETRIES", "3") or 3),
+        )
+        if delivered:
+            try:
+                commit_credit(user_id, rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin, "via": "cache"})
+            except Exception:
+                LOGGER.exception("whatsapp: failed to commit credit after cached delivery user=%s vin=%s", user_id, vin)
+            try:
+                await _send_report_options_menu(msisdn, user_id, vin, client)
+            except Exception:
+                pass
+            return
+
+    # Give up: refund reserved credit once.
+    try:
+        refund_credit(user_id, rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin, "reason": "final_failure"})
+    except Exception:
+        pass
+    # Keep user messaging neutral (no noisy markers).
+    try:
+        await send_whatsapp_text(msisdn, _bridge.t("report.error.generic", lang), client=client)
+    except Exception:
+        pass
 
 
 def _track_bg_task(task: asyncio.Task[Any], *, name: str) -> None:
@@ -1407,6 +1589,14 @@ async def handle_incoming_whatsapp_message(
         if text_body and is_valid_vin(text_body):
             vin_clean = text_body.strip().upper()
             rid_for_request = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_clean, language=user_ctx.language)
+
+            # In-flight guard: do not reserve or start multiple report jobs per user.
+            async with _WA_REPORT_TASKS_LOCK:
+                existing = _WA_REPORT_TASKS.get(str(user_ctx.user_id))
+                if existing is not None and not existing.done():
+                    LOGGER.info("whatsapp: report already in-flight user=%s vin=%s", user_ctx.user_id, vin_clean)
+                    return {"status": "ok", "responses": 1, "reason": "inflight"}
+
             db_snapshot = _load_db()
             user_record = db_snapshot.get("users", {}).get(user_ctx.user_id, {}) or {}
             limits = user_record.get("limits", {})
@@ -1452,6 +1642,23 @@ async def handle_incoming_whatsapp_message(
                 language=user_ctx.language,
             )
             await send_whatsapp_text(msisdn, progress_msg, client=client)
+
+            # Dedicated background job: generate + deliver PDF, then commit/refund.
+            job = asyncio.create_task(
+                _wa_run_vin_report_job(
+                    user_id=str(user_ctx.user_id),
+                    msisdn=msisdn,
+                    vin=vin_clean,
+                    lang=(user_ctx.language or "ar"),
+                    client=client,
+                    rid_for_request=rid_for_request,
+                )
+            )
+            _track_bg_task(job, name=f"wa_report:{user_ctx.user_id}:{vin_clean}")
+            async with _WA_REPORT_TASKS_LOCK:
+                _WA_REPORT_TASKS[str(user_ctx.user_id)] = job
+
+            return {"status": "ok", "responses": 1, "vin": vin_clean}
 
         try:
             resp = await _bridge.handle_text(
@@ -1695,12 +1902,13 @@ async def handle_incoming_whatsapp_message(
     delivered_pdfs = 0
     delivery_refunded = False
     delivery_committed = False
-    sla_total_s = float(os.getenv("TOTAL_BUDGET_SEC", "10") or 10)
-    sla_total_s = max(5.0, min(sla_total_s, 30.0))
+    # Delivery (especially PDF/base64) can take longer than chat UX budgets.
+    wa_send_budget_s = float(os.getenv("WA_SEND_BUDGET_SEC", "120") or 120)
+    wa_send_budget_s = max(30.0, min(wa_send_budget_s, 300.0))
     sla_t0 = time.perf_counter()
 
     def _sla_remaining_s(floor: float = 0.25) -> float:
-        return max(floor, sla_total_s - (time.perf_counter() - sla_t0))
+        return max(floor, wa_send_budget_s - (time.perf_counter() - sla_t0))
     try:
         if send_tasks:
             results = await asyncio.wait_for(asyncio.gather(*send_tasks, return_exceptions=True), timeout=_sla_remaining_s())
@@ -1791,7 +1999,7 @@ async def handle_incoming_whatsapp_message(
                 # Send an explicit failure message so the user isn't left guessing.
                 try:
                     err = _bridge.t("report.error.generic", user_ctx.language)
-                    await send_whatsapp_text(msisdn, f"{err}\n\n❌ Failed + refunded", client=client)
+                    await send_whatsapp_text(msisdn, f"{err}", client=client)
                 except Exception:
                     pass
 
@@ -1820,7 +2028,7 @@ async def handle_incoming_whatsapp_message(
             pass
         try:
             msg = _bridge.t("report.error.timeout", user_ctx.language)
-            await send_whatsapp_text(msisdn, f"{msg}\n\n❌ Failed + refunded", client=client)
+            await send_whatsapp_text(msisdn, f"{msg}", client=client)
         except Exception:
             pass
         return {"status": "error", "reason": "sla_timeout"}
@@ -2160,7 +2368,13 @@ def _resolve_ultramsg_settings() -> tuple[str, str, str]:
 def _build_client() -> UltraMsgClient:
     instance_id, token, base_url = _resolve_ultramsg_settings()
     creds = UltraMsgCredentials(instance_id=instance_id, token=token, base_url=base_url)
-    return UltraMsgClient(creds)
+    raw_timeout = (os.getenv("ULTRAMSG_TIMEOUT_SEC", "60") or "60").strip()
+    try:
+        timeout = float(raw_timeout)
+    except Exception:
+        timeout = 60.0
+    timeout = max(10.0, min(timeout, 180.0))
+    return UltraMsgClient(creds, timeout=timeout)
 
 
 def _get_ultramsg_client(request: Optional[Request] = None) -> UltraMsgClient:
@@ -2264,7 +2478,7 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                         except Exception:
                             pass
                         msg = _bridge.t("report.error.timeout", user_ctx.language)
-                        await send_whatsapp_text(msisdn, f"{msg}\n\n❌ Failed + refunded", client=client)
+                        await send_whatsapp_text(msisdn, f"{msg}", client=client)
                 except Exception:
                     pass
             except Exception:
@@ -2284,7 +2498,7 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                         except Exception:
                             pass
                         msg = _bridge.t("report.error.generic", user_ctx.language)
-                        await send_whatsapp_text(msisdn, f"{msg}\n\n❌ Failed + refunded", client=client)
+                        await send_whatsapp_text(msisdn, f"{msg}", client=client)
                 except Exception:
                     pass
 

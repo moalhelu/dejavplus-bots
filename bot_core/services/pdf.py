@@ -427,6 +427,23 @@ async def _release_page(page) -> None:
             return
     except Exception:
         return
+
+    # If the page is marked as bad, never reuse it.
+    try:
+        if getattr(page, "_dv_discard", False):
+            try:
+                await page.close()
+            except Exception:
+                pass
+            finally:
+                try:
+                    if getattr(page, "_dv_pdf_counted", False):
+                        _PDF_PAGE_CREATE_SEM.release()
+                except Exception:
+                    pass
+            return
+    except Exception:
+        pass
     async with _PDF_PAGE_LOCK:
         if len(_PDF_PAGE_POOL) < _PDF_PAGE_MAX:
             _PDF_PAGE_POOL.append(page)
@@ -490,6 +507,21 @@ async def html_to_pdf_bytes_chromium(
             active_jobs = _PDF_ACTIVE_JOBS
     except Exception:
         active_jobs = 0
+
+    async def _await_with_timeout(awaitable, timeout_ms: int):
+        """Hard timeout wrapper that cannot hang indefinitely on cancellation."""
+        timeout_s = max(0.5, min(float(timeout_ms) / 1000.0, 300.0))
+        task = asyncio.create_task(awaitable)
+        done, _ = await asyncio.wait({task}, timeout=timeout_s)
+        if task in done:
+            return await task
+        task.cancel()
+        # Don't block forever waiting for cancellation.
+        try:
+            await asyncio.wait_for(task, timeout=0.2)
+        except Exception:
+            pass
+        raise asyncio.TimeoutError("pdf_op_timeout")
 
     async def _once() -> Optional[bytes]:
         try:
@@ -556,10 +588,13 @@ async def html_to_pdf_bytes_chromium(
                         if fast_first:
                             try:
                                 await page.goto(url, wait_until=effective_fast_first_wait_until, timeout=effective_fast_first_timeout_ms)
-                                pdf_bytes = await page.pdf(
+                                pdf_bytes = await _await_with_timeout(
+                                    page.pdf(
                                     format="A4",
                                     print_background=True,
                                     margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+                                    ),
+                                    effective_timeout_ms,
                                 )
                                 if _pdf_bytes_looks_ok(pdf_bytes):
                                     return pdf_bytes
@@ -584,10 +619,13 @@ async def html_to_pdf_bytes_chromium(
                         if fast_first:
                             try:
                                 await page.set_content(clean, wait_until=effective_fast_first_wait_until, timeout=effective_fast_first_timeout_ms)
-                                pdf_bytes = await page.pdf(
+                                pdf_bytes = await _await_with_timeout(
+                                    page.pdf(
                                     format="A4",
                                     print_background=True,
                                     margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+                                    ),
+                                    effective_timeout_ms,
                                 )
                                 if _pdf_bytes_looks_ok(pdf_bytes):
                                     return pdf_bytes
@@ -602,12 +640,29 @@ async def html_to_pdf_bytes_chromium(
                     else:
                         return None
 
-                    pdf_bytes = await page.pdf(
-                        format="A4",
-                        print_background=True,
-                        margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+                    pdf_bytes = await _await_with_timeout(
+                        page.pdf(
+                            format="A4",
+                            print_background=True,
+                            margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+                        ),
+                        effective_timeout_ms,
                     )
                     return pdf_bytes
+                except asyncio.TimeoutError:
+                    # Mark page as unusable; Playwright can get wedged after timeouts.
+                    try:
+                        setattr(page, "_dv_discard", True)
+                    except Exception:
+                        pass
+                    raise
+                except Exception:
+                    # Any unexpected render failure: discard the page to avoid poisoning the pool.
+                    try:
+                        setattr(page, "_dv_discard", True)
+                    except Exception:
+                        pass
+                    raise
                 finally:
                     await _release_page(page)
             finally:

@@ -1589,6 +1589,8 @@ async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, me
         # Smooth progress feel without misleading 90%: cap at 80% until the
         # handler explicitly raises the cap when we start sending the PDF.
         p = 0
+        last_sent_p: Optional[int] = None
+        last_edit_ts = 0.0
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=0.5)
@@ -1604,6 +1606,12 @@ async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, me
             cap = max(10, min(cap, 95))
             step = 5 if cap <= 80 else 3
             p = min(cap, p + step)
+
+            # Avoid Telegram edit spam (can cause flicker/"blinking" and rate limits).
+            # Only edit when progress changes, with an occasional heartbeat.
+            now = time.perf_counter()
+            if last_sent_p == p and (now - last_edit_ts) < 5.0:
+                continue
 
             bar = _make_progress_bar(p)
             try:
@@ -1627,6 +1635,9 @@ async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, me
                     )
                 except Exception:
                     pass
+
+                last_sent_p = p
+                last_edit_ts = now
     finally:
         # Nothing to return; the loop exits naturally once stop_event is set.
         pass
@@ -4983,6 +4994,41 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     if vin:
+        # Prevent duplicate concurrent report generations per user.
+        # A repeated VIN message should not start a second pipeline (causes saturation and "stuck" UX).
+        try:
+            if isinstance(context.user_data, dict):
+                inflight = context.user_data.get("vin_inflight")
+            else:
+                inflight = None
+        except Exception:
+            inflight = None
+
+        if isinstance(inflight, dict) and inflight.get("vin"):
+            try:
+                started_at = float(inflight.get("started_at") or 0.0)
+            except Exception:
+                started_at = 0.0
+            if started_at and (time.time() - started_at) < 900:
+                # Same VIN -> silently ignore duplicates; different VIN -> tell user it's already processing.
+                try:
+                    if str(inflight.get("vin") or "").strip().upper() != str(vin).strip().upper():
+                        lang_hint = (bridge_user_ctx.language if bridge_user_ctx else None)
+                        await update.message.reply_text(_bridge.t("report.processing.already", lang_hint), parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+                return
+
+        if isinstance(context.user_data, dict):
+            try:
+                context.user_data["vin_inflight"] = {
+                    "vin": vin,
+                    "started_at": time.time(),
+                    "progress_message_id": None,
+                }
+            except Exception:
+                pass
+
         lock = _user_lock(tg_id)
         header_snapshot: Optional[Dict[str, Any]] = None
         report_lang = get_report_default_lang() or "en"
@@ -5075,6 +5121,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safe_payload = re.sub(r"<[^>]+>", "", progress_payload)
             msg = await update.message.reply_text(safe_payload)
         context.chat_data["progress_header"] = header
+
+        try:
+            if isinstance(context.user_data, dict) and isinstance(context.user_data.get("vin_inflight"), dict):
+                if context.user_data["vin_inflight"].get("vin") == vin:
+                    context.user_data["vin_inflight"]["progress_message_id"] = getattr(msg, "message_id", None)
+        except Exception:
+            pass
 
         cleanup_paths: List[str] = []
 
@@ -5429,6 +5482,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         os.remove(path)
                 except Exception:
                     pass
+
+            # Clear in-flight marker.
+            try:
+                if isinstance(context.user_data, dict):
+                    inflight2 = context.user_data.get("vin_inflight")
+                    if isinstance(inflight2, dict) and str(inflight2.get("vin") or "") == str(vin):
+                        context.user_data.pop("vin_inflight", None)
+            except Exception:
+                pass
 
     # ===== Menu routing =====
     if txt in MAIN_MENU_TEXTS:

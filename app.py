@@ -908,60 +908,122 @@ def _user_lock(tg_id: str):
     return _user_locks[str(tg_id)]
 
 
-_TG_REPORT_QUEUES: Dict[str, deque] = {}
-_TG_REPORT_WORKERS: Dict[str, asyncio.Task[Any]] = {}
-_TG_REPORT_QUEUE_LOCK = asyncio.Lock()
+# Telegram: parallel report processing with bounded concurrency.
+_TG_REPORT_LIMITS_LOCK = asyncio.Lock()
+_TG_REPORT_GLOBAL_SEM: Optional[asyncio.Semaphore] = None
+_TG_REPORT_USER_SEMS: Dict[str, asyncio.Semaphore] = {}
+
+_TG_INFLIGHT_LOCK = asyncio.Lock()
+_TG_INFLIGHT_VINS: Dict[str, Dict[str, float]] = {}
 
 
-async def _tg_enqueue_report_job(tg_id: str, job: Dict[str, Any], context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Enqueue a Telegram VIN report job for this user; returns 1-based position in queue."""
+def _tg_report_limits() -> Tuple[int, int]:
+    # Defaults chosen to allow parallelism without saturating the machine.
+    # Increase via env if you have more CPU/network headroom.
+    per_user = int(os.getenv("TG_REPORT_CONCURRENCY_PER_USER", "2") or 2)
+    global_limit = int(os.getenv("TG_REPORT_CONCURRENCY_GLOBAL", "4") or 4)
+    per_user = max(1, min(per_user, 6))
+    global_limit = max(1, min(global_limit, 30))
+    return per_user, global_limit
+
+
+async def _tg_get_semaphores(tg_id: str) -> Tuple[asyncio.Semaphore, asyncio.Semaphore]:
     tg_id = str(tg_id)
-    async with _TG_REPORT_QUEUE_LOCK:
-        q = _TG_REPORT_QUEUES.get(tg_id)
-        if not isinstance(q, deque):
-            q = deque()
-            _TG_REPORT_QUEUES[tg_id] = q
-        q.append(job)
-        pos = len(q)
+    per_user, global_limit = _tg_report_limits()
+    async with _TG_REPORT_LIMITS_LOCK:
+        global _TG_REPORT_GLOBAL_SEM
+        if not _TG_REPORT_GLOBAL_SEM or getattr(_TG_REPORT_GLOBAL_SEM, "_value", None) is None:
+            _TG_REPORT_GLOBAL_SEM = asyncio.Semaphore(global_limit)
+        user_sem = _TG_REPORT_USER_SEMS.get(tg_id)
+        if not user_sem:
+            user_sem = asyncio.Semaphore(per_user)
+            _TG_REPORT_USER_SEMS[tg_id] = user_sem
+        return user_sem, _TG_REPORT_GLOBAL_SEM
 
-        worker = _TG_REPORT_WORKERS.get(tg_id)
-        if not worker or worker.done():
-            task = asyncio.create_task(_tg_report_worker(tg_id, context))
-            _TG_REPORT_WORKERS[tg_id] = task
+
+async def _tg_try_mark_inflight(tg_id: str, vin: str, *, ttl_s: float = 900.0) -> bool:
+    tg_id = str(tg_id)
+    vin = (vin or "").strip().upper()
+    if not vin:
+        return False
+    now = time.time()
+    async with _TG_INFLIGHT_LOCK:
+        bucket = _TG_INFLIGHT_VINS.setdefault(tg_id, {})
+        # prune old
+        for k, ts in list(bucket.items()):
+            if (now - float(ts or 0.0)) > ttl_s:
+                bucket.pop(k, None)
+        if vin in bucket:
+            return False
+        bucket[vin] = now
+        return True
+
+
+async def _tg_unmark_inflight(tg_id: str, vin: str) -> None:
+    tg_id = str(tg_id)
+    vin = (vin or "").strip().upper()
+    if not vin:
+        return
+    async with _TG_INFLIGHT_LOCK:
+        bucket = _TG_INFLIGHT_VINS.get(tg_id)
+        if isinstance(bucket, dict):
+            bucket.pop(vin, None)
+            if not bucket:
+                _TG_INFLIGHT_VINS.pop(tg_id, None)
+
+
+async def _tg_submit_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[str, Any]) -> None:
+    tg_id = str(job.get("tg_id") or "")
+    vin = str(job.get("vin") or "")
+    if not await _tg_try_mark_inflight(tg_id, vin):
+        # Already processing the same VIN; do not start another pipeline.
+        try:
+            chat_id = int(job.get("chat_id") or 0)
+            mid = int(job.get("progress_message_id") or 0)
+            if chat_id and mid:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=mid,
+                    text=_bridge.t("report.processing.already", None),
+                )
+        except Exception:
+            pass
+        return
+
+    async def _runner() -> None:
+        user_sem: Optional[asyncio.Semaphore] = None
+        global_sem: Optional[asyncio.Semaphore] = None
+        got_user = False
+        got_global = False
+        try:
+            user_sem, global_sem = await _tg_get_semaphores(tg_id)
+            # IMPORTANT: acquire in a consistent order to avoid deadlocks.
+            await user_sem.acquire()
+            got_user = True
+            await global_sem.acquire()
+            got_global = True
+            await _tg_run_vin_report_job(context, job)
+        finally:
             try:
-                _track_bg_task(task, name=f"tg_report_worker:{tg_id}")
+                if got_global and global_sem:
+                    global_sem.release()
+            except Exception:
+                pass
+            try:
+                if got_user and user_sem:
+                    user_sem.release()
+            except Exception:
+                pass
+            try:
+                await _tg_unmark_inflight(tg_id, vin)
             except Exception:
                 pass
 
-    return pos
-
-
-async def _tg_report_worker(tg_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tg_id = str(tg_id)
-    while True:
-        job: Optional[Dict[str, Any]] = None
-        async with _TG_REPORT_QUEUE_LOCK:
-            q = _TG_REPORT_QUEUES.get(tg_id)
-            if isinstance(q, deque) and q:
-                try:
-                    job = q.popleft()
-                except Exception:
-                    job = None
-            elif isinstance(q, deque) and not q:
-                _TG_REPORT_QUEUES.pop(tg_id, None)
-                _TG_REPORT_WORKERS.pop(tg_id, None)
-                return
-            else:
-                _TG_REPORT_QUEUES.pop(tg_id, None)
-                _TG_REPORT_WORKERS.pop(tg_id, None)
-                return
-
-        if not job:
-            continue
-        try:
-            await _tg_run_vin_report_job(context, job)
-        except Exception:
-            logger.error("tg_report_job_failed", extra={"tg_id": tg_id, "vin": job.get("vin")}, exc_info=True)
+    task = asyncio.create_task(_runner())
+    try:
+        _track_bg_task(task, name=f"tg_report_job:{tg_id}:{vin}")
+    except Exception:
+        pass
 
 
 SUPER_DASHBOARD_EVENTS_LIMIT = 15
@@ -1745,7 +1807,15 @@ def _render_usercard_text(u: Dict[str, Any], lang: Optional[str] = None) -> str:
 
 # =================== Carfax API ===================
 
-async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, stop_event: asyncio.Event):
+async def _progress_updater(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    stop_event: asyncio.Event,
+    *,
+    state: Optional[Dict[str, Any]] = None,
+    header: str = "",
+):
     try:
         # Smooth progress feel without misleading 90%: cap at 80% until the
         # handler explicitly raises the cap when we start sending the PDF.
@@ -1761,7 +1831,10 @@ async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, me
 
             cap = 80
             try:
-                cap = int(context.chat_data.get("progress_cap", 80) or 80)
+                if isinstance(state, dict) and state.get("cap") is not None:
+                    cap = int(state.get("cap") or 80)
+                else:
+                    cap = int(context.chat_data.get("progress_cap", 80) or 80)
             except Exception:
                 cap = 80
             cap = max(10, min(cap, 95))
@@ -1775,11 +1848,19 @@ async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, me
                 continue
 
             bar = _make_progress_bar(p)
+            hdr = header or ""
+            try:
+                if isinstance(state, dict) and state.get("header"):
+                    hdr = str(state.get("header") or hdr)
+                elif context and isinstance(getattr(context, "chat_data", None), dict) and context.chat_data.get("progress_header"):
+                    hdr = str(context.chat_data.get("progress_header") or hdr)
+            except Exception:
+                hdr = header or ""
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text=context.chat_data.get("progress_header", "") + "\n" + bar,
+                    text=hdr + "\n" + bar,
                     parse_mode=ParseMode.HTML,
                 )
             except Exception as exc:
@@ -1788,7 +1869,7 @@ async def _progress_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, me
                 except Exception:
                     pass
                 try:
-                    header_plain = re.sub(r"<[^>]+>", "", context.chat_data.get("progress_header", ""))
+                    header_plain = re.sub(r"<[^>]+>", "", hdr or "")
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=message_id,
@@ -4634,8 +4715,10 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
         except Exception:
             pass
 
-    # Keep the existing progress mechanism (one active job per user).
-    context.chat_data["progress_header"] = header
+    progress_state: Dict[str, Any] = {
+        "header": header,
+        "cap": 80,
+    }
     cleanup_paths: List[str] = []
 
     def _register_cleanup(path: Optional[str]) -> None:
@@ -4643,8 +4726,9 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
             cleanup_paths.append(path)
 
     stop_event = asyncio.Event()
-    context.chat_data["progress_cap"] = 80
-    progress_task = asyncio.create_task(_progress_updater(context, chat_id, progress_message_id, stop_event))
+    progress_task = asyncio.create_task(
+        _progress_updater(context, chat_id, progress_message_id, stop_event, state=progress_state, header=header)
+    )
     report_result: Optional[_ReportResult] = None
     bridge_temp_files: List[str] = []
 
@@ -4815,7 +4899,7 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
 
         if report_result.pdf_bytes:
             try:
-                context.chat_data["progress_cap"] = 95
+                progress_state["cap"] = 95
                 pdf_bytes = bytes(report_result.pdf_bytes)
 
                 max_send_attempts = int(os.getenv("TG_DELIVERY_RETRIES", "3") or 3)
@@ -5874,7 +5958,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "request_key": f"{base_key}:{i}",
                 "progress_message_id": int(getattr(msg, "message_id", 0) or 0),
             }
-            await _tg_enqueue_report_job(str(tg_id), job, context)
+            await _tg_submit_report_job(context, job)
         return
 
     # ===== Menu routing =====

@@ -903,6 +903,13 @@ def _extract_numeric_token(text: str) -> Optional[str]:
     if not text:
         return None
     candidate = (text or "").strip()
+
+    # Safety: never treat digits inside alphanumeric messages as menu choices.
+    # This prevents VINs (which contain letters+digits) from being misclassified
+    # as language/menu selections.
+    if re.search(r"[A-Za-z]", candidate):
+        return None
+
     if candidate.isdigit():
         return candidate
     # Match a standalone 1-2 digit token (ASCII or Unicode digits).
@@ -1250,8 +1257,12 @@ async def handle_incoming_whatsapp_message(
 
     LOGGER.info("📩 Incoming WhatsApp from %s: %s", msisdn, text_body)
 
+    # VIN detection must win over menu/language numeric parsing.
+    # Users often paste VINs while still "inside" a menu state.
+    vin_in_text = _extract_first_vin(text_body)
+
     # Normalize numeric replies like "3️⃣" -> "3" for menu/language flows.
-    numeric_token = _extract_numeric_token(text_body) or None
+    numeric_token = None if vin_in_text else (_extract_numeric_token(text_body) or None)
 
     enriched_event = dict(event)
     enriched_event.setdefault("sender", bridge_sender)
@@ -1302,7 +1313,7 @@ async def handle_incoming_whatsapp_message(
     manual_texts: List[str] = []
     manual_send_menu = False
 
-    if state_lower == "language_choice":
+    if state_lower == "language_choice" and not vin_in_text:
         LOGGER.debug("whatsapp: entering language_choice handler (state=%s, text=%s)", state_lower, text_body)
         choice = (numeric_token or "").strip()
         if choice and choice.isdigit():
@@ -1321,6 +1332,16 @@ async def handle_incoming_whatsapp_message(
             language_choice_handled = True
         else:
             language_choice_handled = True  # Ignore other inputs inside language flow (no menu fallback)
+
+    # If a VIN is present, exit any stale flow state and proceed with VIN handling.
+    if vin_in_text and state_lower:
+        try:
+            LOGGER.info("whatsapp: VIN detected; exiting active state=%s user=%s", state_lower, user_ctx.user_id)
+        except Exception:
+            pass
+        _update_user_state(user_ctx.user_id, None)
+        user_ctx.state = None
+        state_lower = ""
 
     exit_to_main_menu = False
 
@@ -1407,7 +1428,7 @@ async def handle_incoming_whatsapp_message(
 
         # UX: If the user sends anything that's NOT a VIN and there's no active flow,
         # show the main menu instead of attempting report processing.
-        if text_body and not is_valid_vin(text_body):
+        if text_body and not vin_in_text:
             latest_state = (_load_db().get("users", {}).get(user_ctx.user_id, {}) or {}).get("state")
             latest_state_lower = (latest_state or "").strip().lower()
             if not latest_state_lower or latest_state_lower == "main_menu":
@@ -1429,9 +1450,9 @@ async def handle_incoming_whatsapp_message(
                     await _send_bridge_menu(msisdn, user_ctx, client)
                     return {"status": "ok", "responses": 1}
 
-        # If user sent a VIN directly, send ONE processing message (no progress spam)
-        if text_body and is_valid_vin(text_body):
-            vin_clean = text_body.strip().upper()
+        # If user sent a VIN (or included one in the message), send ONE processing message (no progress spam)
+        if vin_in_text:
+            vin_clean = vin_in_text.strip().upper()
             rid_for_request = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_clean, language=user_ctx.language, request_key=msg_id)
 
             # In-flight guard: do not reserve or start multiple report jobs per user.

@@ -210,16 +210,6 @@ def _sanitize_preview(text: str, *, max_chars: int = 200) -> str:
     return raw[:max_chars]
 
 
-def _pdf_bytes_quick_ok(pdf_bytes: Optional[bytes]) -> bool:
-    if not isinstance(pdf_bytes, (bytes, bytearray)):
-        return False
-    b = bytes(pdf_bytes)
-    if not b.startswith(b"%PDF"):
-        return False
-    # Keep this conservative: small/broken renders tend to be tiny.
-    return len(b) >= 12_000
-
-
 def _looks_like_error_or_login_page(html: str) -> bool:
     # Heuristic detection to prevent rendering login/blocked/error pages.
     # Keep intentionally broad; false positives are preferable to delivering garbage.
@@ -756,10 +746,7 @@ async def generate_vin_report(
                     acquire_ms = min(20_000, max(2_000, int(render_budget_ms * 0.5)))
                     if requested_lang != "en" and isinstance(viewer_url, str) and viewer_url:
                         try:
-                            if fast_mode:
-                                fetch_html_budget_ms = 3_500
-                            else:
-                                fetch_html_budget_ms = max(2_500, min(12_000, int(render_budget_ms * 0.45)))
+                            fetch_html_budget_ms = max(2_500, min(12_000, int(render_budget_ms * 0.45)))
                             html_full = await fetch_page_html_chromium(
                                 viewer_url,
                                 wait_until="domcontentloaded",
@@ -836,33 +823,10 @@ async def generate_vin_report(
                                     wait_until="domcontentloaded",
                                     fast_first_timeout_ms=min(1_500, url_budget_ms),
                                     fast_first_wait_until="domcontentloaded",
-                                    settle_ms=(200 if fast_mode else 750),
-                                    block_resource_types={"image", "media", "font"} if fast_mode else None,
+                                    settle_ms=750,
                                 )
-                                if _pdf_bytes_quick_ok(pdf_url):
+                                if pdf_url:
                                     pdf_rendered = pdf_url
-                            except Exception:
-                                pdf_rendered = None
-
-                        # Fast-first local render: keep it very lightweight. If it fails, fall back
-                        # to the heavier, more reliable render below.
-                        if not pdf_rendered and fast_mode:
-                            try:
-                                fast_budget_ms = max(2_000, min(7_000, int(render_budget_ms * 0.5)))
-                                pdf_fast = await html_to_pdf_bytes_chromium(
-                                    html_str=html_candidate,
-                                    base_url="https://www.carfax.com/",
-                                    strip_scripts=True,
-                                    settle_ms=150,
-                                    timeout_ms=fast_budget_ms,
-                                    acquire_timeout_ms=min(acquire_ms, 5_000),
-                                    wait_until="domcontentloaded",
-                                    fast_first_timeout_ms=min(2_000, fast_budget_ms),
-                                    fast_first_wait_until="domcontentloaded",
-                                    block_resource_types={"image", "media", "font"},
-                                )
-                                if _pdf_bytes_quick_ok(pdf_fast):
-                                    pdf_rendered = pdf_fast
                             except Exception:
                                 pdf_rendered = None
 
@@ -874,11 +838,11 @@ async def generate_vin_report(
                                     html_str=html_candidate,
                                     base_url="https://www.carfax.com/",
                                     strip_scripts=False,
-                                    settle_ms=(750 if fast_mode else 1500),
+                                    settle_ms=1500,
                                     timeout_ms=render_budget_ms,
                                     acquire_timeout_ms=acquire_ms,
-                                    wait_until=("domcontentloaded" if fast_mode else "load"),
-                                    fast_first_timeout_ms=(2_500 if fast_mode else 1500),
+                                    wait_until="load",
+                                    fast_first_timeout_ms=1500,
                                     fast_first_wait_until="domcontentloaded",
                                 )
                                 if pdf_rendered:

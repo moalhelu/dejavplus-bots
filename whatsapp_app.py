@@ -1324,14 +1324,24 @@ async def handle_incoming_whatsapp_message(
                 _update_user_lang(user_ctx.user_id, selected_lang)
                 _update_user_state(user_ctx.user_id, None)
                 user_ctx.language = selected_lang
-                manual_texts.append(_bridge.t("wa.language.updated", selected_lang))
-                manual_send_menu = True
-                LOGGER.debug("whatsapp: menu will be rebuilt after language update in lang=%s", selected_lang)
+                # Requirement: after choosing language, send ONLY one confirmation message
+                # in the selected language (no account card, no main menu).
+                try:
+                    await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(_bridge.t("wa.language.updated", selected_lang)), client=client)
+                except Exception:
+                    # If sending fails, still stop processing to avoid cascading menus.
+                    pass
+                return {"status": "ok", "responses": 1, "reason": "language_updated"}
             else:
-                manual_texts.append(_bridge.t("wa.language.invalid_choice", user_ctx.language))
+                try:
+                    await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(_bridge.t("wa.language.invalid_choice", user_ctx.language)), client=client)
+                except Exception:
+                    pass
+                return {"status": "ok", "responses": 1, "reason": "language_invalid"}
             language_choice_handled = True
         else:
-            language_choice_handled = True  # Ignore other inputs inside language flow (no menu fallback)
+            # Ignore other inputs inside language flow (no menu fallback)
+            return {"status": "ok", "responses": 0, "reason": "language_ignore"}
 
     # If a VIN is present, exit any stale flow state and proceed with VIN handling.
     if vin_in_text and state_lower:

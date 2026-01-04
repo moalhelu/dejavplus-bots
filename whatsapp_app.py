@@ -197,14 +197,15 @@ def _extract_first_vin(text: Optional[str]) -> Optional[str]:
     return None
 
 
-def _compute_whatsapp_rid(*, user_id: str, vin: str, language: str) -> str:
-    # Charge idempotency is per base VIN report delivery.
+def _compute_whatsapp_rid(*, user_id: str, vin: str, language: str, request_key: Optional[str] = None) -> str:
+    # Charge idempotency is per inbound WhatsApp request (message id).
     return compute_request_id(
         platform="whatsapp",
         user_id=str(user_id),
         vin=vin,
         language=language or "en",
         options={"product": "carfax_vhr"},
+        request_key=request_key,
     )
 
 
@@ -1328,7 +1329,7 @@ async def handle_incoming_whatsapp_message(
         # If user sent a VIN directly, send ONE processing message (no progress spam)
         if text_body and is_valid_vin(text_body):
             vin_clean = text_body.strip().upper()
-            rid_for_request = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_clean, language=user_ctx.language)
+            rid_for_request = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_clean, language=user_ctx.language, request_key=msg_id)
 
             # In-flight guard: do not reserve or start multiple report jobs per user.
             async with _WA_REPORT_TASKS_LOCK:
@@ -1659,7 +1660,12 @@ async def handle_incoming_whatsapp_message(
         # Guarantee: if a VIN report was successfully generated, we must either deliver it
         # (then commit credit) or explicitly fail + refund credit.
         if report_success and vin_from_response and credit_commit_required:
-            rid_for_delivery = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_from_response, language=user_ctx.language)
+            rid_for_delivery = rid_for_request or _compute_whatsapp_rid(
+                user_id=user_ctx.user_id,
+                vin=vin_from_response,
+                language=user_ctx.language,
+                request_key=msg_id,
+            )
             delivery_ok = False
             if pdf_present:
                 delivery_ok = delivered_pdfs > 0
@@ -1718,7 +1724,12 @@ async def handle_incoming_whatsapp_message(
             if report_success and credit_commit_required and not delivery_refunded:
                 rid_for_timeout = rid_for_request
                 if vin_from_response:
-                    rid_for_timeout = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_from_response, language=user_ctx.language)
+                    rid_for_timeout = rid_for_timeout or _compute_whatsapp_rid(
+                        user_id=user_ctx.user_id,
+                        vin=vin_from_response,
+                        language=user_ctx.language,
+                        request_key=msg_id,
+                    )
                 refund_credit(
                     user_ctx.user_id,
                     rid=rid_for_timeout,
@@ -2166,6 +2177,7 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                 LOGGER.exception("WhatsApp processing timed out")
                 # Best-effort: notify the user so they don't stay stuck on "processing".
                 try:
+                    msg_id = _wa_event_message_id(entry)
                     raw_sender = entry.get("from") or entry.get("chatId") or entry.get("author")
                     bridge_sender = _normalize_sender(raw_sender)
                     msisdn = _normalize_recipient(raw_sender) or bridge_sender
@@ -2174,7 +2186,7 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                         try:
                             vin = _extract_first_vin(str(entry.get("body") or entry.get("text") or ""))
                             if vin:
-                                rrid = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin, language=user_ctx.language)
+                                rrid = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin, language=user_ctx.language, request_key=msg_id)
                                 refund_credit(user_ctx.user_id, rid=rrid, meta={"reason": "timeout", "platform": "whatsapp", "vin": vin})
                         except Exception:
                             pass
@@ -2186,6 +2198,7 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                 LOGGER.exception("Background processing failed for WhatsApp message")
                 # Best-effort: notify the user (single message) instead of silence.
                 try:
+                    msg_id = _wa_event_message_id(entry)
                     raw_sender = entry.get("from") or entry.get("chatId") or entry.get("author")
                     bridge_sender = _normalize_sender(raw_sender)
                     msisdn = _normalize_recipient(raw_sender) or bridge_sender
@@ -2194,7 +2207,7 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                         try:
                             vin = _extract_first_vin(str(entry.get("body") or entry.get("text") or ""))
                             if vin:
-                                rrid = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin, language=user_ctx.language)
+                                rrid = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin, language=user_ctx.language, request_key=msg_id)
                                 refund_credit(user_ctx.user_id, rid=rrid, meta={"reason": "handler_error", "platform": "whatsapp", "vin": vin})
                         except Exception:
                             pass

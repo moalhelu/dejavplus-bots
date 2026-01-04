@@ -5106,12 +5106,23 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Deterministic rid for exactly-once accounting.
+            request_key: Optional[str] = None
+            try:
+                request_key = str(getattr(update.effective_message, "message_id", None) or "") or None
+            except Exception:
+                request_key = None
+            if not request_key:
+                try:
+                    request_key = str(getattr(update, "update_id", None) or "") or None
+                except Exception:
+                    request_key = None
             rid_charge = compute_request_id(
                 platform="telegram",
                 user_id=str(tg_id),
                 vin=vin,
                 language=report_lang,
                 options={"product": "carfax_vhr"},
+                request_key=request_key,
             )
             try:
                 _reserve_credit(tg_id, rid=rid_charge, meta={"platform": "telegram", "vin": vin, "lang": report_lang})

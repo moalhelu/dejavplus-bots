@@ -1213,6 +1213,9 @@ async def handle_incoming_whatsapp_message(
         mapped_id = _map_text_to_button(text_body, user_ctx.state, is_super_admin(user_ctx.user_id))
         if mapped_id:
             button_id = mapped_id
+            # Make digit-based fallback behave like an interactive button click.
+            # The bridge layer expects BUTTON:<id> tokens for these flows.
+            text_body = f"BUTTON:{button_id}"
             LOGGER.info("🔀 Mapped text '%s' to button_id '%s' (state=%s)", text_body, button_id, user_ctx.state)
 
     incoming = _bridge.IncomingMessage(
@@ -1271,14 +1274,16 @@ async def handle_incoming_whatsapp_message(
             tmp = _resolve_menu_selection(button_id, user_ctx)
             menu_selection_text = await tmp if asyncio.iscoroutine(tmp) else tmp
     elif text_body and text_body.isdigit():
-        if state_lower in {None, "", "main_menu"}:
+        # Prefer main-menu selection whenever the digit maps to a known menu item.
+        # This keeps the bot responsive even if a stale/unknown state is stored.
+        if _is_menu_selection_candidate(text_body):
             tmp = _resolve_menu_selection(text_body, user_ctx)
             mapped = await tmp if asyncio.iscoroutine(tmp) else tmp
             if mapped:
-                LOGGER.info("whatsapp: handling main-menu choice %s for user %s", text_body, user_ctx.user_id)
+                LOGGER.info("whatsapp: handling menu choice %s for user %s", text_body, user_ctx.user_id)
                 menu_selection_text = mapped
-        else:
-            LOGGER.debug("whatsapp: digit '%s' ignored because state=%s (flow active)", text_body, state_lower)
+            else:
+                LOGGER.debug("whatsapp: digit '%s' did not map to any menu item (state=%s)", text_body, state_lower)
 
     if exit_to_main_menu:
         LOGGER.info("whatsapp: exiting to main menu (state=%s)", user_ctx.state)
@@ -1325,6 +1330,30 @@ async def handle_incoming_whatsapp_message(
                 return {"status": "ok", "responses": 1}
             else:
                 LOGGER.debug("whatsapp: skipping fallback menu because state=%s is active", state_lower)
+
+        # UX: If the user sends anything that's NOT a VIN and there's no active flow,
+        # show the main menu instead of attempting report processing.
+        if text_body and not is_valid_vin(text_body):
+            latest_state = (_load_db().get("users", {}).get(user_ctx.user_id, {}) or {}).get("state")
+            latest_state_lower = (latest_state or "").strip().lower()
+            if not latest_state_lower or latest_state_lower == "main_menu":
+                tmp = _resolve_menu_selection(text_body, user_ctx)
+                mapped = await tmp if asyncio.iscoroutine(tmp) else tmp
+                if mapped:
+                    selection_msg = _bridge.IncomingMessage(
+                        platform="whatsapp",
+                        user_id=user_ctx.user_id,
+                        text=mapped,
+                        raw=event,
+                    )
+                    resp_candidate = _bridge.handle_menu_selection(user_ctx, selection_msg, **bridge_kwargs)
+                    resp = await resp_candidate if asyncio.iscoroutine(resp_candidate) else resp_candidate
+                    _apply_bridge_actions_to_state(bridge_sender, resp)
+                    response_batches.append(resp)
+                else:
+                    _update_user_state(user_ctx.user_id, None)
+                    await _send_bridge_menu(msisdn, user_ctx, client)
+                    return {"status": "ok", "responses": 1}
 
         # If user sent a VIN directly, send ONE processing message (no progress spam)
         if text_body and is_valid_vin(text_body):

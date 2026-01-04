@@ -914,7 +914,7 @@ _TG_REPORT_GLOBAL_SEM: Optional[asyncio.Semaphore] = None
 _TG_REPORT_USER_SEMS: Dict[str, asyncio.Semaphore] = {}
 
 _TG_INFLIGHT_LOCK = asyncio.Lock()
-_TG_INFLIGHT_VINS: Dict[str, Dict[str, float]] = {}
+_TG_INFLIGHT: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 
 def _tg_report_limits() -> Tuple[int, int]:
@@ -941,22 +941,107 @@ async def _tg_get_semaphores(tg_id: str) -> Tuple[asyncio.Semaphore, asyncio.Sem
         return user_sem, _TG_REPORT_GLOBAL_SEM
 
 
-async def _tg_try_mark_inflight(tg_id: str, vin: str, *, ttl_s: float = 900.0) -> bool:
+async def _tg_register_inflight(
+    tg_id: str,
+    vin: str,
+    *,
+    chat_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    ttl_s: float = 900.0,
+) -> bool:
     tg_id = str(tg_id)
     vin = (vin or "").strip().upper()
     if not vin:
         return False
     now = time.time()
     async with _TG_INFLIGHT_LOCK:
-        bucket = _TG_INFLIGHT_VINS.setdefault(tg_id, {})
+        bucket = _TG_INFLIGHT.setdefault(tg_id, {})
         # prune old
-        for k, ts in list(bucket.items()):
-            if (now - float(ts or 0.0)) > ttl_s:
+        for k, entry in list(bucket.items()):
+            try:
+                ts = float((entry or {}).get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if (now - ts) > ttl_s:
                 bucket.pop(k, None)
-        if vin in bucket:
-            return False
-        bucket[vin] = now
-        return True
+
+        entry = bucket.get(vin)
+        if not isinstance(entry, dict):
+            entry = {"ts": now, "subs": set()}
+            bucket[vin] = entry
+            is_new = True
+        else:
+            is_new = False
+            entry["ts"] = now
+
+        if chat_id and message_id:
+            subs = entry.get("subs")
+            if not isinstance(subs, set):
+                subs = set()
+                entry["subs"] = subs
+            try:
+                subs.add((int(chat_id), int(message_id)))
+            except Exception:
+                pass
+
+        return is_new
+
+
+async def _tg_inflight_targets(tg_id: str, vin: str) -> List[Tuple[int, int]]:
+    tg_id = str(tg_id)
+    vin = (vin or "").strip().upper()
+    if not (tg_id and vin):
+        return []
+    async with _TG_INFLIGHT_LOCK:
+        entry = (_TG_INFLIGHT.get(tg_id) or {}).get(vin)
+        if not isinstance(entry, dict):
+            return []
+        subs = entry.get("subs")
+        if not isinstance(subs, set):
+            return []
+        out: List[Tuple[int, int]] = []
+        for pair in list(subs):
+            try:
+                c, m = pair
+                out.append((int(c), int(m)))
+            except Exception:
+                continue
+        return out
+
+
+async def _tg_edit_inflight_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    tg_id: str,
+    vin: str,
+    *,
+    text: str,
+    parse_mode: Optional[str] = ParseMode.HTML,
+) -> None:
+    targets = await _tg_inflight_targets(tg_id, vin)
+    if not targets:
+        return
+    for chat_id, message_id in targets:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=parse_mode,
+            )
+        except Exception as exc:
+            try:
+                logger.warning("progress_update_failed_html", extra={"err": str(exc)})
+            except Exception:
+                pass
+            try:
+                header_plain = re.sub(r"<[^>]+>", "", text or "")
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=header_plain,
+                )
+            except Exception:
+                pass
 
 
 async def _tg_unmark_inflight(tg_id: str, vin: str) -> None:
@@ -965,29 +1050,22 @@ async def _tg_unmark_inflight(tg_id: str, vin: str) -> None:
     if not vin:
         return
     async with _TG_INFLIGHT_LOCK:
-        bucket = _TG_INFLIGHT_VINS.get(tg_id)
+        bucket = _TG_INFLIGHT.get(tg_id)
         if isinstance(bucket, dict):
             bucket.pop(vin, None)
             if not bucket:
-                _TG_INFLIGHT_VINS.pop(tg_id, None)
+                _TG_INFLIGHT.pop(tg_id, None)
 
 
 async def _tg_submit_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[str, Any]) -> None:
     tg_id = str(job.get("tg_id") or "")
     vin = str(job.get("vin") or "")
-    if not await _tg_try_mark_inflight(tg_id, vin):
-        # Already processing the same VIN; do not start another pipeline.
-        try:
-            chat_id = int(job.get("chat_id") or 0)
-            mid = int(job.get("progress_message_id") or 0)
-            if chat_id and mid:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=mid,
-                    text=_bridge.t("report.processing.already", None),
-                )
-        except Exception:
-            pass
+    chat_id = int(job.get("chat_id") or 0)
+    mid = int(job.get("progress_message_id") or 0)
+    is_new = await _tg_register_inflight(tg_id, vin, chat_id=chat_id, message_id=mid)
+    if not is_new:
+        # Same VIN already being processed; keep this request as a subscriber.
+        # (Do not reject; progress updates will fan-out to all subscribers.)
         return
 
     async def _runner() -> None:
@@ -1863,6 +1941,8 @@ async def _progress_updater(
                     text=hdr + "\n" + bar,
                     parse_mode=ParseMode.HTML,
                 )
+                last_sent_p = p
+                last_edit_ts = now
             except Exception as exc:
                 try:
                     logger.warning("progress_update_failed_html", extra={"err": str(exc)})
@@ -1882,6 +1962,69 @@ async def _progress_updater(
                 last_edit_ts = now
     finally:
         # Nothing to return; the loop exits naturally once stop_event is set.
+        pass
+
+
+async def _tg_progress_updater(
+    context: ContextTypes.DEFAULT_TYPE,
+    tg_id: str,
+    vin: str,
+    stop_event: asyncio.Event,
+    *,
+    state: Optional[Dict[str, Any]] = None,
+    header: str = "",
+):
+    try:
+        p = 0
+        last_sent_p: Optional[int] = None
+        last_edit_ts = 0.0
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=0.5)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            cap = 80
+            try:
+                if isinstance(state, dict) and state.get("cap") is not None:
+                    cap = int(state.get("cap") or 80)
+                else:
+                    cap = int(context.chat_data.get("progress_cap", 80) or 80)
+            except Exception:
+                cap = 80
+            cap = max(10, min(cap, 95))
+            step = 5 if cap <= 80 else 3
+            p = min(cap, p + step)
+
+            now = time.perf_counter()
+            if last_sent_p == p and (now - last_edit_ts) < 5.0:
+                continue
+
+            bar = _make_progress_bar(p)
+            hdr = header or ""
+            try:
+                if isinstance(state, dict) and state.get("header"):
+                    hdr = str(state.get("header") or hdr)
+                elif context and isinstance(getattr(context, "chat_data", None), dict) and context.chat_data.get("progress_header"):
+                    hdr = str(context.chat_data.get("progress_header") or hdr)
+            except Exception:
+                hdr = header or ""
+
+            try:
+                await _tg_edit_inflight_messages(
+                    context,
+                    tg_id,
+                    vin,
+                    text=hdr + "\n" + bar,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+            last_sent_p = p
+            last_edit_ts = now
+    finally:
         pass
 
 # =================== Commands ===================
@@ -4606,6 +4749,12 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
     if not (tg_id and chat_id and vin and progress_message_id):
         return
 
+    # Ensure the primary progress message is registered as a subscriber.
+    try:
+        await _tg_register_inflight(tg_id, vin, chat_id=chat_id, message_id=progress_message_id)
+    except Exception:
+        pass
+
     lock = _user_lock(tg_id)
     header_snapshot: Optional[Dict[str, Any]] = None
     report_lang = get_report_default_lang() or "en"
@@ -4654,10 +4803,12 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
             if not body:
                 body = "Limit reached."
             try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_message_id,
+                await _tg_edit_inflight_messages(
+                    context,
+                    tg_id,
+                    vin,
                     text=re.sub(r"<[^>]+>", "", body),
+                    parse_mode=None,
                 )
             except Exception:
                 pass
@@ -4699,18 +4850,21 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
     header = _build_vin_progress_header(vin, lang=report_lang, **header_snapshot)
     progress_payload = header + "\n" + _make_progress_bar(0)
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=progress_message_id,
+        await _tg_edit_inflight_messages(
+            context,
+            tg_id,
+            vin,
             text=progress_payload,
             parse_mode=ParseMode.HTML,
         )
     except Exception:
         try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=progress_message_id,
+            await _tg_edit_inflight_messages(
+                context,
+                tg_id,
+                vin,
                 text=re.sub(r"<[^>]+>", "", progress_payload),
+                parse_mode=None,
             )
         except Exception:
             pass
@@ -4727,7 +4881,7 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
 
     stop_event = asyncio.Event()
     progress_task = asyncio.create_task(
-        _progress_updater(context, chat_id, progress_message_id, stop_event, state=progress_state, header=header)
+        _tg_progress_updater(context, tg_id, vin, stop_event, state=progress_state, header=header)
     )
     report_result: Optional[_ReportResult] = None
     bridge_temp_files: List[str] = []
@@ -4877,9 +5031,10 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
             failure_note = f"\n\n{escape(err_text)}{refund_note}\n\n❌ Failed + refunded"
             try:
                 await asyncio.wait_for(
-                    context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=progress_message_id,
+                    _tg_edit_inflight_messages(
+                        context,
+                        tg_id,
+                        vin,
                         text=refreshed_header + "\n" + _make_progress_bar(100) + failure_note,
                         parse_mode=ParseMode.HTML,
                     ),
@@ -4967,9 +5122,10 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
             note = delivery_note or _bridge.t("report.success.note", report_lang)
             try:
                 await asyncio.wait_for(
-                    context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=progress_message_id,
+                    _tg_edit_inflight_messages(
+                        context,
+                        tg_id,
+                        vin,
                         text=success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or ""),
                         parse_mode=ParseMode.HTML,
                     ),
@@ -5006,9 +5162,10 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
         try:
             pdf_failure_note = "\n\n" + _bridge.t("report.error.pdf", report_lang) + _bridge.t("report.refund.note", report_lang) + "\n\n❌ Failed + refunded"
             await asyncio.wait_for(
-                context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_message_id,
+                _tg_edit_inflight_messages(
+                    context,
+                    tg_id,
+                    vin,
                     text=refreshed_header + "\n" + _make_progress_bar(100) + pdf_failure_note,
                     parse_mode=ParseMode.HTML,
                 ),

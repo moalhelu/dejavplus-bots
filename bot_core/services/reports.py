@@ -205,9 +205,64 @@ def _sanitize_preview(text: str, *, max_chars: int = 200) -> str:
 
 
 def _looks_like_error_or_login_page(html: str) -> bool:
-    # Kept for backwards compatibility; production recovery rules do not use this
-    # for decision-making anymore.
+    # Heuristic detection to prevent rendering login/blocked/error pages.
+    # Keep intentionally broad; false positives are preferable to delivering garbage.
+    raw = (html or "").lower()
+    if not raw:
+        return True
+    # Common blockers / bot protections
+    markers = (
+        "access denied",
+        "request blocked",
+        "forbidden",
+        "unauthorized",
+        "login",
+        "sign in",
+        "cloudflare",
+        "attention required",
+        "captcha",
+        "not found",
+        "404",
+        "500",
+        "service unavailable",
+        "temporarily unavailable",
+        "rate limit",
+        "too many requests",
+    )
+    if any(m in raw for m in markers):
+        return True
+    # If it doesn't even look like HTML, treat as invalid.
+    head = raw.lstrip()[:2000]
+    if "<html" not in head and "<!doctype html" not in head:
+        return True
     return False
+
+
+async def fetch_report_pdf_bytes(
+    vin: str,
+    options: Optional[Dict[str, Any]] = None,
+    lang: Optional[str] = None,
+    *,
+    total_timeout_s: Optional[float] = None,
+    deadline: Optional[float] = None,
+    force_fresh: bool = False,
+) -> tuple[Optional[bytes], Dict[str, Any]]:
+    """Primary path: fetch OFFICIAL upstream PDF bytes.
+
+    Endpoint (authoritative): GET https://api.dejavuplus.com/api/carfax/{vin}
+    Auth: Authorization: Bearer <JWT>
+
+    Returns (pdf_bytes, meta). pdf_bytes is non-empty only when upstream responds
+    with application/pdf.
+    """
+
+    _ = (options, lang)  # reserved for future API variants; kept for stable signature.
+    resp = await _call_carfax_api(vin, total_timeout_s=total_timeout_s, deadline=deadline, force_fresh=force_fresh)
+    ctype = (resp.get("ctype") or "").lower()
+    pdf_bytes = resp.get("pdf_bytes")
+    if resp.get("ok") and isinstance(pdf_bytes, (bytes, bytearray)) and bytes(pdf_bytes) and "application/pdf" in ctype:
+        return bytes(pdf_bytes), resp
+    return None, resp
 
 
 def _extract_html_from_upstream_json(payload: Any) -> Optional[str]:
@@ -228,40 +283,6 @@ def _extract_html_from_upstream_json(payload: Any) -> Optional[str]:
 
 
 async def fetch_report_pdf_bytes(
-    vin: str,
-    *,
-    total_timeout_s: Optional[float] = None,
-    deadline: Optional[float] = None,
-    force_fresh: bool = False,
-) -> Dict[str, Any]:
-    """Primary path: attempt to fetch OFFICIAL PDF bytes from upstream.
-
-    Endpoint (authoritative): GET https://api.dejavuplus.com/api/carfax/{vin}
-
-    If upstream responds with application/pdf, we return those bytes as-is.
-    Otherwise, we return ok=False with metadata so callers can decide on HTML fallback.
-    """
-
-    resp = await _call_carfax_api(vin, total_timeout_s=total_timeout_s, deadline=deadline, force_fresh=force_fresh)
-    status = resp.get("status")
-    ctype = (resp.get("ctype") or "").lower()
-    pdf_bytes = resp.get("pdf_bytes")
-    if resp.get("ok") and isinstance(pdf_bytes, (bytes, bytearray)) and bytes(pdf_bytes) and "application/pdf" in ctype:
-        return resp
-    # Normalize a consistent failure shape.
-    return {
-        "ok": False,
-        "error": str(resp.get("error") or "non_pdf_upstream"),
-        "status": status,
-        "ctype": resp.get("ctype"),
-        "final_url": resp.get("final_url"),
-        "sha256": resp.get("sha256"),
-        "json": resp.get("json"),
-        "text": resp.get("text"),
-        "_dv_path": str(resp.get("_dv_path") or "non_pdf"),
-    }
-
-
 def _canonical_api_base() -> str:
     """Canonical DejaVuPlus base URL per docs.
 
@@ -345,6 +366,37 @@ async def generate_vin_report(
         if existing is not None and not existing.done():
             return await asyncio.shield(existing)
 
+        def _is_retryable_failure(rr: Optional[ReportResult]) -> bool:
+            if rr is None:
+                return True
+            if rr.success:
+                return False
+            # Never retry auth/token failures.
+            try:
+                errors = [str(e).lower() for e in (rr.errors or [])]
+            except Exception:
+                errors = []
+            if any("invalid_token" in e for e in errors):
+                return False
+            if any(e.startswith("http_401") or e.startswith("http_403") for e in errors):
+                return False
+            try:
+                raw = rr.raw_response
+                if isinstance(raw, dict):
+                    status = raw.get("status")
+                    if int(status) in (401, 403):
+                        return False
+            except Exception:
+                pass
+            # Never retry invalid VIN.
+            if any("invalid_vin" in e for e in errors):
+                return False
+            # Retry upstream and render failures once.
+            if rr.error_class in {ERROR_UPSTREAM_FETCH_FAILED, ERROR_PDF_RENDER_FAILED}:
+                return True
+            transient_markers = ("timeout", "http_500", "http_502", "http_503", "http_504", "exception")
+            return any(m in e for e in errors for m in transient_markers) or not errors
+
         async def _runner() -> ReportResult:
             acquired_report_slot = False
             try:
@@ -363,240 +415,290 @@ async def generate_vin_report(
                 )
 
             try:
-                fetch_budget = max(0.5, min(_remaining_s(), float(_CARFAX_TIMEOUT)))
-                rid = get_rid() or "-"
+                last_failure: Optional[ReportResult] = None
+                for upstream_attempt in (1, 2):
+                    fetch_budget = max(0.5, min(_remaining_s(), float(_CARFAX_TIMEOUT)))
+                    rid = get_rid() or "-"
 
-                async with atimed(
-                    "report.upstream",
-                    vin=normalized_vin,
-                    lang=requested_lang,
-                    fast=bool(fast_mode),
-                    budget_s=float(fetch_budget),
-                ):
-                    upstream = await _call_carfax_api(
-                        normalized_vin,
-                        total_timeout_s=fetch_budget,
-                        deadline=deadline,
-                        force_fresh=True,
-                    )
-
-                total_time = round(time.perf_counter() - start_t, 3)
-                status = upstream.get("status")
-                ctype = (upstream.get("ctype") or "").lower()
-                final_url = str(upstream.get("final_url") or "")
-
-                try:
-                    LOGGER.info(
-                        "report_decision rid=%s vin=%s path=%s status=%s ctype=%s total_time_sec=%s",
-                        rid,
-                        normalized_vin,
-                        str(upstream.get("_dv_path") or "upstream"),
-                        status,
-                        ctype or "-",
-                        total_time,
-                    )
-                except Exception:
-                    pass
-
-                # Only fail upstream fetch on HTTP >= 400 or on transport/token errors.
-                if not upstream.get("ok"):
-                    err = str(upstream.get("error") or upstream.get("err_text") or f"HTTP_{status if status is not None else 'NA'}")
-                    return ReportResult(
-                        success=False,
-                        user_message=VHR_FETCH_FAILED_USER_MESSAGE,
-                        errors=[err],
+                    async with atimed(
+                        "report.upstream",
                         vin=normalized_vin,
-                        raw_response={**(upstream or {}), "total_time_sec": total_time},
-                        error_class=ERROR_UPSTREAM_FETCH_FAILED,
-                    )
+                        lang=requested_lang,
+                        fast=bool(fast_mode),
+                        budget_s=float(fetch_budget),
+                        attempt=upstream_attempt,
+                    ):
+                        pdf_bytes_direct, upstream = await fetch_report_pdf_bytes(
+                            normalized_vin,
+                            options=None,
+                            lang=requested_lang,
+                            total_timeout_s=fetch_budget,
+                            deadline=deadline,
+                            force_fresh=True,
+                        )
 
-                if isinstance(status, int) and status >= 400:
-                    return ReportResult(
-                        success=False,
-                        user_message=VHR_FETCH_FAILED_USER_MESSAGE,
-                        errors=[f"HTTP_{status}"],
-                        vin=normalized_vin,
-                        raw_response={**(upstream or {}), "total_time_sec": total_time},
-                        error_class=ERROR_UPSTREAM_FETCH_FAILED,
-                    )
+                    total_time = round(time.perf_counter() - start_t, 3)
+                    status = upstream.get("status")
+                    ctype = (upstream.get("ctype") or "").lower()
+                    final_url = str(upstream.get("final_url") or "")
 
-                # Path A: upstream provides PDF bytes (optional).
-                pdf_bytes = upstream.get("pdf_bytes")
-                if isinstance(pdf_bytes, (bytes, bytearray)) and bytes(pdf_bytes) and "application/pdf" in ctype:
                     try:
                         LOGGER.info(
-                            "report_success rid=%s vin=%s upstream_mode=pdf pdf_bytes_len=%s total_time_sec=%s",
+                            "upstream_fetch rid=%s vin=%s attempt=%s fetch_status=%s fetch_final_url=%s ctype=%s total_time_sec=%s",
                             rid,
                             normalized_vin,
-                            len(bytes(pdf_bytes)),
+                            upstream_attempt,
+                            status if status is not None else "na",
+                            final_url or "-",
+                            ctype or "-",
                             total_time,
                         )
                     except Exception:
                         pass
 
-                    return ReportResult(
-                        success=True,
-                        user_message=_t("report.success.pdf_direct", requested_lang, "✅ Report ready."),
-                        pdf_bytes=bytes(pdf_bytes),
-                        pdf_filename=str(upstream.get("filename") or f"{normalized_vin}.pdf"),
-                        vin=normalized_vin,
-                        raw_response={**(upstream or {}), "total_time_sec": total_time, "upstream_mode": "pdf"},
-                        upstream_sha256=str(upstream.get("sha256") or "") or None,
-                        upstream_status=int(status) if isinstance(status, int) else None,
-                        upstream_content_type=str(upstream.get("ctype") or "") or None,
-                    )
+                    # Path A: OFFICIAL upstream PDF bytes.
+                    if isinstance(pdf_bytes_direct, (bytes, bytearray)) and bytes(pdf_bytes_direct):
+                        try:
+                            LOGGER.info(
+                                "report_success rid=%s vin=%s upstream_mode=pdf pdf_bytes_len=%s total_time_sec=%s",
+                                rid,
+                                normalized_vin,
+                                len(bytes(pdf_bytes_direct)),
+                                total_time,
+                            )
+                        except Exception:
+                            pass
 
-                # Path B (FIRST-CLASS): 201 JSON with htmlContent.
-                html_candidate: Optional[str] = None
-                json_payload = upstream.get("json")
-                if isinstance(json_payload, dict):
-                    html_candidate = _extract_html_from_upstream_json(cast(Dict[str, Any], json_payload))
+                        return ReportResult(
+                            success=True,
+                            user_message=_t("report.success.pdf_direct", requested_lang, "✅ Report ready."),
+                            pdf_bytes=bytes(pdf_bytes_direct),
+                            pdf_filename=str(upstream.get("filename") or f"{normalized_vin}.pdf"),
+                            vin=normalized_vin,
+                            raw_response={**(upstream or {}), "total_time_sec": total_time, "upstream_mode": "pdf"},
+                            upstream_sha256=str(upstream.get("sha256") or "") or None,
+                            upstream_status=int(status) if isinstance(status, int) else None,
+                            upstream_content_type=str(upstream.get("ctype") or "") or None,
+                        )
 
-                # Also accept direct HTML bodies (some upstream variants return text/html).
-                if not html_candidate:
-                    body_text = upstream.get("text")
-                    if isinstance(body_text, str):
-                        low = body_text.lstrip().lower()
-                        if low.startswith("<html") or "<!doctype html" in low:
-                            html_candidate = body_text
+                    # Only fail upstream fetch on HTTP >= 400 or on transport/token errors.
+                    if (not upstream.get("ok")) or (isinstance(status, int) and status >= 400):
+                        err = str(upstream.get("error") or upstream.get("err_text") or f"HTTP_{status if status is not None else 'NA'}")
+                        failure = ReportResult(
+                            success=False,
+                            user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                            errors=[err],
+                            vin=normalized_vin,
+                            raw_response={**(upstream or {}), "total_time_sec": total_time},
+                            error_class=ERROR_UPSTREAM_FETCH_FAILED,
+                        )
+                        last_failure = failure
+                        if upstream_attempt == 1 and _is_retryable_failure(failure):
+                            continue
+                        return failure
 
-                if not html_candidate:
-                    # Missing htmlContent is a hard failure per contract.
-                    try:
+                    # Path B: 201 JSON with htmlContent.
+                    html_candidate: Optional[str] = None
+                    json_payload = upstream.get("json")
+                    if isinstance(json_payload, dict):
+                        html_candidate = _extract_html_from_upstream_json(cast(Dict[str, Any], json_payload))
+
+                    # Also accept direct HTML bodies (some upstream variants return text/html).
+                    if not html_candidate:
+                        body_text = upstream.get("text")
+                        if isinstance(body_text, str):
+                            low = body_text.lstrip().lower()
+                            if low.startswith("<html") or "<!doctype html" in low:
+                                html_candidate = body_text
+
+                    if not html_candidate:
                         preview = ""
-                        if isinstance(upstream.get("text"), str):
-                            preview = _sanitize_preview(str(upstream.get("text") or ""))
-                        LOGGER.warning(
-                            "upstream_missing_htmlContent rid=%s vin=%s status=%s ctype=%s final_url=%s preview=%s error_class=%s",
+                        try:
+                            if isinstance(upstream.get("text"), str):
+                                preview = _sanitize_preview(str(upstream.get("text") or ""))
+                        except Exception:
+                            preview = ""
+                        try:
+                            LOGGER.warning(
+                                "upstream_missing_htmlContent rid=%s vin=%s attempt=%s fetch_status=%s fetch_final_url=%s ctype=%s preview=%s error_class=%s",
+                                rid,
+                                normalized_vin,
+                                upstream_attempt,
+                                status if status is not None else "na",
+                                final_url or "-",
+                                ctype or "-",
+                                preview,
+                                ERROR_UPSTREAM_FETCH_FAILED,
+                            )
+                        except Exception:
+                            pass
+                        failure = ReportResult(
+                            success=False,
+                            user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                            errors=["missing_htmlContent"],
+                            vin=normalized_vin,
+                            raw_response={**(upstream or {}), "total_time_sec": total_time},
+                            error_class=ERROR_UPSTREAM_FETCH_FAILED,
+                        )
+                        last_failure = failure
+                        if upstream_attempt == 1 and _is_retryable_failure(failure):
+                            continue
+                        return failure
+
+                    # Strict HTML fetch validation BEFORE rendering.
+                    html_len0 = len(html_candidate.encode("utf-8", errors="ignore"))
+                    preview0 = _sanitize_preview(html_candidate)
+                    try:
+                        LOGGER.info(
+                            "upstream_html_candidate rid=%s vin=%s attempt=%s fetch_status=%s fetch_final_url=%s html_bytes_len=%s preview=%s",
+                            rid,
+                            normalized_vin,
+                            upstream_attempt,
+                            status if status is not None else "na",
+                            final_url or "-",
+                            html_len0,
+                            preview0,
+                        )
+                    except Exception:
+                        pass
+                    if _looks_like_error_or_login_page(html_candidate):
+                        failure = ReportResult(
+                            success=False,
+                            user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                            errors=["upstream_html_error_page"],
+                            vin=normalized_vin,
+                            raw_response={**(upstream or {}), "total_time_sec": total_time, "html_bytes_len": html_len0, "html_preview": preview0},
+                            error_class=ERROR_UPSTREAM_FETCH_FAILED,
+                        )
+                        last_failure = failure
+                        if upstream_attempt == 1 and _is_retryable_failure(failure):
+                            continue
+                        return failure
+
+                    # Translate report HTML when requested (kept bounded by the overall reports deadline).
+                    delivered_lang = requested_lang
+                    translate_ms = None
+                    translated = False
+                    if requested_lang != "en":
+                        t_tr0 = time.perf_counter()
+                        try:
+                            html_out = await translate_html(html_candidate, requested_lang)
+                            if isinstance(html_out, str) and html_out.strip():
+                                translated = (html_out != html_candidate)
+                                html_candidate = html_out
+                        except Exception:
+                            # Hard fallback: preserve original content but ensure correct RTL styling.
+                            try:
+                                html_candidate = inject_rtl(html_candidate, lang=requested_lang)
+                            except Exception:
+                                pass
+                        translate_ms = round((time.perf_counter() - t_tr0) * 1000.0, 2)
+
+                    html_len = len(html_candidate.encode("utf-8", errors="ignore"))
+                    try:
+                        LOGGER.info(
+                            "upstream_ok rid=%s vin=%s upstream_mode=html status=%s ctype=%s final_url=%s html_bytes_len=%s lang=%s translated=%s translate_ms=%s",
                             rid,
                             normalized_vin,
                             status if status is not None else "na",
                             ctype or "-",
                             final_url or "-",
-                            preview,
-                            ERROR_UPSTREAM_FETCH_FAILED,
+                            html_len,
+                            delivered_lang,
+                            translated,
+                            translate_ms if translate_ms is not None else "-",
                         )
                     except Exception:
                         pass
-                    return ReportResult(
-                        success=False,
-                        user_message=VHR_FETCH_FAILED_USER_MESSAGE,
-                        errors=["missing_htmlContent"],
-                        vin=normalized_vin,
-                        raw_response={**(upstream or {}), "total_time_sec": total_time},
-                        error_class=ERROR_UPSTREAM_FETCH_FAILED,
-                    )
 
-                # Translate report HTML when requested (kept bounded by the overall reports deadline).
-                delivered_lang = requested_lang
-                translate_ms = None
-                translated = False
-                if requested_lang != "en":
-                    t_tr0 = time.perf_counter()
+                    # Render htmlContent to PDF (official delivered report).
+                    t_render0 = time.perf_counter()
+                    render_budget_ms = _deadline_remaining_ms(deadline, floor_ms=1500, cap_ms=120_000)
+                    pdf_rendered: Optional[bytes] = None
                     try:
-                        html_out = await translate_html(html_candidate, requested_lang)
-                        if isinstance(html_out, str) and html_out.strip():
-                            translated = (html_out != html_candidate)
-                            html_candidate = html_out
-                    except Exception:
-                        # Hard fallback: preserve original content but ensure correct RTL styling.
-                        try:
-                            html_candidate = inject_rtl(html_candidate, lang=requested_lang)
-                        except Exception:
-                            pass
-                    translate_ms = round((time.perf_counter() - t_tr0) * 1000.0, 2)
+                        acquire_ms = min(20_000, max(2_000, int(render_budget_ms * 0.5)))
+                        for render_attempt in (1, 2):
+                            try:
+                                pdf_rendered = await html_to_pdf_bytes_chromium(
+                                    html_str=html_candidate,
+                                    base_url="https://www.carfax.com/",
+                                    timeout_ms=render_budget_ms,
+                                    acquire_timeout_ms=acquire_ms,
+                                    wait_until="domcontentloaded",
+                                )
+                                if pdf_rendered:
+                                    break
+                            except PdfBusyError:
+                                if render_attempt == 1:
+                                    try:
+                                        from bot_core.services.pdf import close_pdf_engine
 
-                html_len = len(html_candidate.encode("utf-8", errors="ignore"))
-                try:
-                    LOGGER.info(
-                        "upstream_ok rid=%s vin=%s upstream_mode=html status=%s ctype=%s final_url=%s html_bytes_len=%s lang=%s translated=%s translate_ms=%s",
-                        rid,
-                        normalized_vin,
-                        status if status is not None else "na",
-                        ctype or "-",
-                        final_url or "-",
-                        html_len,
-                        delivered_lang,
-                        translated,
-                        translate_ms if translate_ms is not None else "-",
-                    )
-                except Exception:
-                    pass
-
-                # Render htmlContent to PDF (official delivered report).
-                t_render0 = time.perf_counter()
-                render_budget_ms = _deadline_remaining_ms(deadline, floor_ms=1500, cap_ms=120_000)
-                pdf_rendered: Optional[bytes] = None
-                try:
-                    # Avoid overly aggressive 2s queue timeouts; under load the single-page
-                    # PDF engine can be busy, but we should wait within the remaining budget.
-                    acquire_ms = min(20_000, max(2_000, int(render_budget_ms * 0.5)))
-
-                    for attempt in range(1, 4):
-                        try:
-                            pdf_rendered = await html_to_pdf_bytes_chromium(
-                                html_str=html_candidate,
-                                base_url="https://www.carfax.com/",
-                                timeout_ms=render_budget_ms,
-                                acquire_timeout_ms=acquire_ms,
-                                wait_until="domcontentloaded",
-                            )
-                            if pdf_rendered:
-                                break
-                        except PdfBusyError:
-                            # Backoff lightly and retry as long as we still have budget.
-                            if attempt >= 3:
+                                        await close_pdf_engine()
+                                    except Exception:
+                                        pass
+                                    continue
                                 pdf_rendered = None
                                 break
-                            await asyncio.sleep(0.35 * attempt)
-                        except Exception:
-                            pdf_rendered = None
-                            break
-                except Exception:
-                    pdf_rendered = None
+                            except Exception:
+                                pdf_rendered = None
+                                break
+                    except Exception:
+                        pdf_rendered = None
 
-                render_ms = (time.perf_counter() - t_render0) * 1000.0
-                pdf_len = len(pdf_rendered) if isinstance(pdf_rendered, (bytes, bytearray)) else 0
-                try:
-                    LOGGER.info(
-                        "render_result rid=%s vin=%s upstream_mode=html render_ms=%s pdf_bytes_len=%s",
-                        rid,
-                        normalized_vin,
-                        round(render_ms, 2),
-                        pdf_len,
-                    )
-                except Exception:
-                    pass
+                    render_ms = (time.perf_counter() - t_render0) * 1000.0
+                    pdf_len = len(pdf_rendered) if isinstance(pdf_rendered, (bytes, bytearray)) else 0
+                    try:
+                        LOGGER.info(
+                            "render_result rid=%s vin=%s upstream_mode=html render_ms=%s pdf_bytes_len=%s",
+                            rid,
+                            normalized_vin,
+                            round(render_ms, 2),
+                            pdf_len,
+                        )
+                    except Exception:
+                        pass
 
-                if not isinstance(pdf_rendered, (bytes, bytearray)) or not bytes(pdf_rendered):
+                    if not isinstance(pdf_rendered, (bytes, bytearray)) or not bytes(pdf_rendered):
+                        failure = ReportResult(
+                            success=False,
+                            user_message=PDF_RENDER_FAILED_USER_MESSAGE,
+                            errors=["pdf_render_failed"],
+                            vin=normalized_vin,
+                            raw_response={**(upstream or {}), "total_time_sec": total_time, "upstream_mode": "html"},
+                            error_class=ERROR_PDF_RENDER_FAILED,
+                        )
+                        last_failure = failure
+                        if upstream_attempt == 1 and _is_retryable_failure(failure):
+                            continue
+                        return failure
+
                     return ReportResult(
-                        success=False,
-                        user_message=PDF_RENDER_FAILED_USER_MESSAGE,
-                        errors=["pdf_render_failed"],
+                        success=True,
+                        user_message=_t("report.success.pdf_direct", requested_lang, "✅ Report ready."),
+                        pdf_bytes=bytes(pdf_rendered),
+                        pdf_filename=f"{normalized_vin}.pdf",
                         vin=normalized_vin,
-                        raw_response={**(upstream or {}), "total_time_sec": total_time, "upstream_mode": "html"},
-                        error_class=ERROR_PDF_RENDER_FAILED,
+                        raw_response={
+                            **(upstream or {}),
+                            "total_time_sec": total_time,
+                            "upstream_mode": "html",
+                            "_dv_fast": {
+                                "fast_mode": bool(fast_mode),
+                                "requested_lang": requested_lang,
+                                "delivered_lang": delivered_lang,
+                                "translated": bool(translated),
+                                "translate_ms": translate_ms,
+                                "total_sec": total_time,
+                            },
+                        },
                     )
 
-                return ReportResult(
-                    success=True,
-                    user_message=_t("report.success.pdf_direct", requested_lang, "✅ Report ready."),
-                    pdf_bytes=bytes(pdf_rendered),
-                    pdf_filename=f"{normalized_vin}.pdf",
+                return last_failure or ReportResult(
+                    success=False,
+                    user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                    errors=["unknown_failure"],
                     vin=normalized_vin,
-                    raw_response={
-                        **(upstream or {}),
-                        "total_time_sec": total_time,
-                        "upstream_mode": "html",
-                        "_dv_fast": {
-                            "fast_mode": bool(fast_mode),
-                            "requested_lang": requested_lang,
-                            "delivered_lang": delivered_lang,
-                            "translated": bool(translated),
-                            "translate_ms": translate_ms,
-                            "total_sec": total_time,
-                        },
-                    },
+                    error_class=ERROR_UPSTREAM_FETCH_FAILED,
                 )
             finally:
                 if acquired_report_slot:

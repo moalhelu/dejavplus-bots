@@ -210,29 +210,33 @@ def _looks_like_error_or_login_page(html: str) -> bool:
     raw = (html or "").lower()
     if not raw:
         return True
-    # Common blockers / bot protections
-    markers = (
+    # Only scan the beginning of the document for "soft" markers.
+    # Full HTML (especially inline JS bundles) may contain words like "login"/"404" even for valid pages.
+    head = raw.lstrip()[:20_000]
+
+    # Strong blockers / bot protections (scan entire doc).
+    strong_markers = (
+        "cloudflare",
+        "captcha",
+        "attention required",
         "access denied",
         "request blocked",
+    )
+    if any(m in raw for m in strong_markers):
+        return True
+
+    # Service/status style failures (scan only head).
+    soft_markers = (
         "forbidden",
         "unauthorized",
-        "login",
-        "sign in",
-        "cloudflare",
-        "attention required",
-        "captcha",
-        "not found",
-        "404",
-        "500",
         "service unavailable",
         "temporarily unavailable",
         "rate limit",
         "too many requests",
     )
-    if any(m in raw for m in markers):
+    if any(m in head for m in soft_markers):
         return True
     # If it doesn't even look like HTML, treat as invalid.
-    head = raw.lstrip()[:2000]
     if "<html" not in head and "<!doctype html" not in head:
         return True
     return False
@@ -621,9 +625,13 @@ async def generate_vin_report(
                                 pdf_rendered = await html_to_pdf_bytes_chromium(
                                     html_str=html_candidate,
                                     base_url="https://www.carfax.com/",
+                                    strip_scripts=False,
+                                    settle_ms=1500,
                                     timeout_ms=render_budget_ms,
                                     acquire_timeout_ms=acquire_ms,
-                                    wait_until="domcontentloaded",
+                                    wait_until="load",
+                                    fast_first_timeout_ms=1500,
+                                    fast_first_wait_until="domcontentloaded",
                                 )
                                 if pdf_rendered:
                                     break

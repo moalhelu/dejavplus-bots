@@ -491,6 +491,8 @@ async def html_to_pdf_bytes_chromium(
     url: Optional[str] = None,
     *,
     base_url: Optional[str] = None,
+    strip_scripts: bool = True,
+    settle_ms: Optional[int] = None,
     timeout_ms: Optional[int] = None,
     acquire_timeout_ms: Optional[int] = None,
     wait_until: Optional[str] = None,
@@ -553,6 +555,21 @@ async def html_to_pdf_bytes_chromium(
         if effective_fast_first_wait_until not in {"load", "domcontentloaded", "networkidle"}:
             effective_fast_first_wait_until = _pdf_fast_first_wait_until()
         chromium_count = _chromium_process_count_best_effort()
+        effective_settle_ms = 0
+        if settle_ms is not None:
+            try:
+                effective_settle_ms = int(settle_ms)
+            except Exception:
+                effective_settle_ms = 0
+        effective_settle_ms = max(0, min(effective_settle_ms, 10_000))
+
+        async def _maybe_settle() -> None:
+            if effective_settle_ms <= 0:
+                return
+            try:
+                await page.wait_for_timeout(effective_settle_ms)
+            except Exception:
+                return
 
         async with atimed(
             "pdf.chromium",
@@ -588,6 +605,7 @@ async def html_to_pdf_bytes_chromium(
                         if fast_first:
                             try:
                                 await page.goto(url, wait_until=effective_fast_first_wait_until, timeout=effective_fast_first_timeout_ms)
+                                await _maybe_settle()
                                 pdf_bytes = await _await_with_timeout(
                                     page.pdf(
                                     format="A4",
@@ -607,7 +625,11 @@ async def html_to_pdf_bytes_chromium(
                             # the DOM may still be sufficiently rendered for printing.
                             pass
                     elif html_str:
-                        clean = re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)
+                        clean = (
+                            re.sub(r"<script\b[^>]*>.*?</script>", "", html_str, flags=re.I | re.S)
+                            if strip_scripts
+                            else html_str
+                        )
                         if "<head" in clean.lower() and "<base" not in clean.lower():
                             base_href = _compute_base_href(base_url)
                             clean = re.sub(
@@ -619,6 +641,7 @@ async def html_to_pdf_bytes_chromium(
                         if fast_first:
                             try:
                                 await page.set_content(clean, wait_until=effective_fast_first_wait_until, timeout=effective_fast_first_timeout_ms)
+                                await _maybe_settle()
                                 pdf_bytes = await _await_with_timeout(
                                     page.pdf(
                                     format="A4",
@@ -640,6 +663,7 @@ async def html_to_pdf_bytes_chromium(
                     else:
                         return None
 
+                    await _maybe_settle()
                     pdf_bytes = await _await_with_timeout(
                         page.pdf(
                             format="A4",

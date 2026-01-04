@@ -2319,15 +2319,34 @@ async def _safe_background_handler(entry: Dict[str, Any], client: UltraMsgClient
                     msisdn = _normalize_recipient(raw_sender) or bridge_sender
                     if msisdn and bridge_sender:
                         user_ctx = _build_user_context(bridge_sender, entry)
+                        body_text = str(entry.get("body") or entry.get("text") or "")
                         try:
-                            vin = _extract_first_vin(str(entry.get("body") or entry.get("text") or ""))
+                            vin = _extract_first_vin(body_text)
                             if vin:
                                 rrid = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin, language=user_ctx.language, request_key=msg_id)
                                 refund_credit(user_ctx.user_id, rid=rrid, meta={"reason": "handler_error", "platform": "whatsapp", "vin": vin})
                         except Exception:
                             pass
-                        msg = _bridge.t("report.error.generic", user_ctx.language)
+
+                        # Choose the most accurate user-facing message.
+                        state_lower = (user_ctx.state or "").strip().lower()
+                        vin_like = bool(is_valid_vin(body_text) or _extract_first_vin(body_text))
+                        if vin_like:
+                            msg = _bridge.t("vin.error", user_ctx.language)
+                        elif state_lower in {"activation_phone", "activation"}:
+                            msg = _bridge.t("activation.error.retry", user_ctx.language)
+                        else:
+                            msg = _bridge.t("menu.selection_unknown", user_ctx.language)
+
                         await send_whatsapp_text(msisdn, f"{msg}", client=client)
+
+                        # Re-open the main menu for non-VIN flows to keep UX interactive.
+                        if not vin_like:
+                            try:
+                                _update_user_state(user_ctx.user_id, None)
+                                await _send_bridge_menu(msisdn, user_ctx, client)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 

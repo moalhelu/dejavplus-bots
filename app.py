@@ -908,6 +908,62 @@ def _user_lock(tg_id: str):
     return _user_locks[str(tg_id)]
 
 
+_TG_REPORT_QUEUES: Dict[str, deque] = {}
+_TG_REPORT_WORKERS: Dict[str, asyncio.Task[Any]] = {}
+_TG_REPORT_QUEUE_LOCK = asyncio.Lock()
+
+
+async def _tg_enqueue_report_job(tg_id: str, job: Dict[str, Any], context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Enqueue a Telegram VIN report job for this user; returns 1-based position in queue."""
+    tg_id = str(tg_id)
+    async with _TG_REPORT_QUEUE_LOCK:
+        q = _TG_REPORT_QUEUES.get(tg_id)
+        if not isinstance(q, deque):
+            q = deque()
+            _TG_REPORT_QUEUES[tg_id] = q
+        q.append(job)
+        pos = len(q)
+
+        worker = _TG_REPORT_WORKERS.get(tg_id)
+        if not worker or worker.done():
+            task = asyncio.create_task(_tg_report_worker(tg_id, context))
+            _TG_REPORT_WORKERS[tg_id] = task
+            try:
+                _track_bg_task(task, name=f"tg_report_worker:{tg_id}")
+            except Exception:
+                pass
+
+    return pos
+
+
+async def _tg_report_worker(tg_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_id = str(tg_id)
+    while True:
+        job: Optional[Dict[str, Any]] = None
+        async with _TG_REPORT_QUEUE_LOCK:
+            q = _TG_REPORT_QUEUES.get(tg_id)
+            if isinstance(q, deque) and q:
+                try:
+                    job = q.popleft()
+                except Exception:
+                    job = None
+            elif isinstance(q, deque) and not q:
+                _TG_REPORT_QUEUES.pop(tg_id, None)
+                _TG_REPORT_WORKERS.pop(tg_id, None)
+                return
+            else:
+                _TG_REPORT_QUEUES.pop(tg_id, None)
+                _TG_REPORT_WORKERS.pop(tg_id, None)
+                return
+
+        if not job:
+            continue
+        try:
+            await _tg_run_vin_report_job(context, job)
+        except Exception:
+            logger.error("tg_report_job_failed", extra={"tg_id": tg_id, "vin": job.get("vin")}, exc_info=True)
+
+
 SUPER_DASHBOARD_EVENTS_LIMIT = 15
 
 
@@ -4418,6 +4474,478 @@ async def _send_pdf_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, filen
                 await context.bot.send_document(chat_id=chat_id, document=fh, filename=os.path.basename(filename), caption=caption, parse_mode=ParseMode.HTML)
         except Exception:
             await context.bot.send_document(chat_id=chat_id, document=fh, filename=os.path.basename(filename), caption=caption, parse_mode=ParseMode.HTML)
+
+
+def _tg_extract_all_vins(text: str, *, primary: Optional[str] = None) -> List[str]:
+    raw = (text or "").strip()
+    candidates: List[str] = []
+    if primary:
+        candidates.append(primary)
+    try:
+        for m in VIN_RE.finditer(raw.upper()):
+            s = (m.group(0) or "").strip()
+            if s:
+                candidates.append(s)
+    except Exception:
+        pass
+    # fallback: normalize the whole text
+    try:
+        whole = _norm_vin(raw)
+        if whole:
+            candidates.append(whole)
+    except Exception:
+        pass
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        try:
+            v = (_norm_vin(cand) or "").strip().upper()
+        except Exception:
+            v = ""
+        if not v:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[str, Any]) -> None:
+    tg_id = str(job.get("tg_id") or "")
+    chat_id = int(job.get("chat_id") or 0)
+    username = job.get("username")
+    first_name = job.get("first_name")
+    vin = str(job.get("vin") or "").strip().upper()
+    raw_payload = job.get("raw_payload") or {}
+    request_key = str(job.get("request_key") or "") or None
+    progress_message_id = int(job.get("progress_message_id") or 0)
+
+    if not (tg_id and chat_id and vin and progress_message_id):
+        return
+
+    lock = _user_lock(tg_id)
+    header_snapshot: Optional[Dict[str, Any]] = None
+    report_lang = get_report_default_lang() or "en"
+    rid_charge: Optional[str] = None
+    bridge_user_ctx: Optional[_bridge.UserContext] = None
+
+    # Build header snapshot first (pre-reserve), then update after reserve.
+    async with lock:
+        db = _load_db()
+        u = _ensure_user(db, tg_id, username)
+        report_lang = _get_user_report_lang(u)
+
+        bridge_user_ctx = _bridge.UserContext(
+            user_id=tg_id,
+            language=report_lang,
+            phone=u.get("phone"),
+            metadata={
+                "username": username,
+                "first_name": first_name,
+                "user_data": {},
+                "db_user": u,
+            },
+        )
+
+        limit_allowed, limit_message, limit_reason = await _bridge.check_user_limits(
+            bridge_user_ctx,
+            storage=db,
+        )
+        _save_db(db)
+
+        if not limit_allowed:
+            # Edit the already-sent progress message with the limit text.
+            body = (limit_message or "").strip()
+            if not body and limit_reason in {"daily", "monthly", "both"}:
+                try:
+                    limit_response = await _bridge.request_limit_increase(
+                        bridge_user_ctx,
+                        storage=db,
+                        notifications=context,
+                        reason=limit_reason,
+                    )
+                    if isinstance(limit_response, _bridge.BridgeResponse) and limit_response.messages:
+                        body = "\n\n".join([m for m in limit_response.messages if m])
+                except Exception:
+                    body = ""
+            if not body:
+                body = "Limit reached."
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_message_id,
+                    text=re.sub(r"<[^>]+>", "", body),
+                )
+            except Exception:
+                pass
+            return
+
+        # Deterministic rid for exactly-once accounting.
+        rid_charge = compute_request_id(
+            platform="telegram",
+            user_id=str(tg_id),
+            vin=vin,
+            language=report_lang,
+            options={"product": "carfax_vhr"},
+            request_key=request_key,
+        )
+        try:
+            _reserve_credit(tg_id, rid=rid_charge, meta={"platform": "telegram", "vin": vin, "lang": report_lang})
+        except Exception:
+            logger.warning("reserve_credit failed", exc_info=True)
+
+        db2 = _load_db()
+        u2 = _ensure_user(db2, tg_id, username)
+        header_snapshot = {
+            "monthly_remaining": _remaining_monthly_reports(u2),
+            "monthly_limit": _safe_int((u2.get("limits", {}) or {}).get("monthly")),
+            "today_used": _safe_int((u2.get("limits", {}) or {}).get("today_used")),
+            "daily_limit": _safe_int((u2.get("limits", {}) or {}).get("daily")),
+            "days_left": _days_left(u2.get("expiry_date")),
+        }
+
+    if not header_snapshot:
+        header_snapshot = {
+            "monthly_remaining": None,
+            "monthly_limit": 0,
+            "today_used": 0,
+            "daily_limit": 0,
+            "days_left": None,
+        }
+
+    header = _build_vin_progress_header(vin, lang=report_lang, **header_snapshot)
+    progress_payload = header + "\n" + _make_progress_bar(0)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=progress_message_id,
+            text=progress_payload,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=progress_message_id,
+                text=re.sub(r"<[^>]+>", "", progress_payload),
+            )
+        except Exception:
+            pass
+
+    # Keep the existing progress mechanism (one active job per user).
+    context.chat_data["progress_header"] = header
+    cleanup_paths: List[str] = []
+
+    def _register_cleanup(path: Optional[str]) -> None:
+        if path and path not in cleanup_paths:
+            cleanup_paths.append(path)
+
+    stop_event = asyncio.Event()
+    context.chat_data["progress_cap"] = 80
+    progress_task = asyncio.create_task(_progress_updater(context, chat_id, progress_message_id, stop_event))
+    report_result: Optional[_ReportResult] = None
+    bridge_temp_files: List[str] = []
+
+    tg_total_timeout_s = float(os.getenv("TG_REPORT_TOTAL_TIMEOUT_SEC", "120") or 120)
+    tg_total_timeout_s = max(10.0, min(tg_total_timeout_s, 300.0))
+    tg_send_timeout_s = float(os.getenv("TG_REPORT_SEND_TIMEOUT_SEC", "60") or 60)
+    tg_send_timeout_s = max(10.0, min(tg_send_timeout_s, 300.0))
+    tg_t0 = time.perf_counter()
+
+    def _tg_remaining_s(floor: float = 1.0) -> float:
+        return max(floor, tg_total_timeout_s - (time.perf_counter() - tg_t0))
+
+    try:
+        try:
+            from bot_core.telemetry import new_rid as _new_rid, set_rid as _set_rid
+        except Exception:
+            _new_rid = None  # type: ignore
+            _set_rid = None  # type: ignore
+
+        rid = (_new_rid("tg-") if _new_rid else None)
+        rid_cm = None
+        try:
+            if _set_rid and rid:
+                rid_cm = _set_rid(rid)
+            else:
+                rid_cm = None
+            if rid_cm:
+                rid_cm.__enter__()
+
+            if bridge_user_ctx:
+                try:
+                    bridge_user_ctx.language = report_lang
+                except Exception:
+                    pass
+                vin_incoming = _bridge.IncomingMessage(
+                    platform="telegram",
+                    user_id=bridge_user_ctx.user_id,
+                    text=vin,
+                    raw=raw_payload,
+                )
+                try:
+                    vin_bridge_response = await asyncio.wait_for(
+                        _bridge.handle_text(
+                            bridge_user_ctx,
+                            vin_incoming,
+                            context=context,
+                            skip_limit_validation=True,
+                            deduct_credit=False,
+                        ),
+                        timeout=_tg_remaining_s(),
+                    )
+                except Exception as exc:
+                    logger.error("Bridge VIN handler failed: %s", exc, exc_info=True)
+                    vin_bridge_response = None
+                if isinstance(vin_bridge_response, _bridge.BridgeResponse):
+                    bridge_temp_files = list(vin_bridge_response.actions.get("temp_files", []))
+                    for temp_path in bridge_temp_files:
+                        _register_cleanup(temp_path)
+                    report_result = vin_bridge_response.actions.get("report_result")
+
+            if not report_result:
+                gen_attempts = int(os.getenv("TG_REPORT_RETRIES", "3") or 3)
+                gen_attempts = max(1, min(gen_attempts, 6))
+                gen_backoffs = [0.0, 1.0, 3.0, 7.0, 12.0, 20.0]
+                for i in range(gen_attempts):
+                    if i > 0:
+                        try:
+                            await asyncio.sleep(gen_backoffs[min(i, len(gen_backoffs) - 1)])
+                        except Exception:
+                            pass
+                    try:
+                        report_result = await asyncio.wait_for(
+                            _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(tg_id)),
+                            timeout=_tg_remaining_s(),
+                        )
+                    except asyncio.TimeoutError:
+                        report_result = _ReportResult(
+                            success=False,
+                            user_message=_bridge.t("report.error.timeout", report_lang),
+                            errors=["timeout"],
+                            vin=vin,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "tg_report_generation_failed",
+                            extra={"vin": vin, "tg_id": tg_id, "attempt": i + 1},
+                            exc_info=True,
+                        )
+                        report_result = _ReportResult(
+                            success=False,
+                            user_message=_bridge.t("report.error.fetch", report_lang),
+                            errors=[f"exception:{type(exc).__name__}"],
+                            vin=vin,
+                        )
+
+                    if report_result and getattr(report_result, "success", False) and getattr(report_result, "pdf_bytes", None):
+                        break
+                    if not _is_retryable_report_failure(report_result):
+                        break
+        except asyncio.TimeoutError:
+            report_result = _ReportResult(
+                success=False,
+                user_message=_bridge.t("report.error.timeout", report_lang),
+                errors=["sla_timeout"],
+                vin=vin,
+            )
+        finally:
+            try:
+                if rid_cm:
+                    rid_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+    finally:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(progress_task, timeout=2)
+        except Exception:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except Exception:
+                pass
+
+    if not report_result:
+        report_result = _ReportResult(
+            success=False,
+            user_message=_bridge.t("report.error.generic", report_lang),
+            errors=["bridge_failed"],
+            vin=vin,
+        )
+
+    try:
+        if not report_result.success:
+            err_text = _report_failure_user_message(report_result, report_lang)
+            refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False, rid=rid_charge)
+            refreshed_header = _build_vin_progress_header(
+                vin,
+                monthly_remaining=refund_snapshot["monthly_remaining"],
+                monthly_limit=refund_snapshot["monthly_limit"],
+                today_used=refund_snapshot["today_used"],
+                daily_limit=refund_snapshot["daily_limit"],
+                days_left=refund_snapshot["days_left"],
+                lang=report_lang,
+            )
+            refund_note = _bridge.t("report.refund.note", report_lang)
+            failure_note = f"\n\n{escape(err_text)}{refund_note}\n\n❌ Failed + refunded"
+            try:
+                await asyncio.wait_for(
+                    context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=progress_message_id,
+                        text=refreshed_header + "\n" + _make_progress_bar(100) + failure_note,
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    timeout=_tg_remaining_s(floor=1.0),
+                )
+            except Exception:
+                pass
+            user_label = f"TG:{tg_id}"
+            await _super_dashboard_event(
+                context,
+                _bridge.t("report.dashboard.failure", None, vin=vin, user=user_label, error=err_text),
+            )
+            return
+
+        delivered = False
+        delivery_note = ""
+
+        if report_result.pdf_bytes:
+            try:
+                context.chat_data["progress_cap"] = 95
+                pdf_bytes = bytes(report_result.pdf_bytes)
+
+                max_send_attempts = int(os.getenv("TG_DELIVERY_RETRIES", "3") or 3)
+                max_send_attempts = max(1, min(max_send_attempts, 6))
+                send_backoffs = [0.0, 1.0, 3.0, 7.0, 12.0, 20.0]
+                last_send_exc: Optional[BaseException] = None
+                sent_ok = False
+                for attempt in range(max_send_attempts):
+                    if attempt > 0:
+                        try:
+                            await asyncio.sleep(send_backoffs[min(attempt, len(send_backoffs) - 1)])
+                        except Exception:
+                            pass
+                    try:
+                        bio = BytesIO(pdf_bytes)
+                        bio.name = report_result.pdf_filename or f"{vin}.pdf"
+                        await asyncio.wait_for(
+                            context.bot.send_document(
+                                chat_id=chat_id,
+                                document=bio,
+                                filename=bio.name,
+                                caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                parse_mode=ParseMode.HTML,
+                            ),
+                            timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
+                        )
+                        sent_ok = True
+                        break
+                    except asyncio.TimeoutError as exc:
+                        last_send_exc = exc
+                    except Exception as exc:
+                        last_send_exc = exc
+                        logger.warning("tg_send_document_failed vin=%s attempt=%s", vin, attempt + 1, exc_info=True)
+
+                if not sent_ok:
+                    raise (last_send_exc or RuntimeError("tg_send_document_failed"))
+            except asyncio.TimeoutError:
+                report_result = _ReportResult(
+                    success=False,
+                    user_message=_bridge.t("report.error.timeout", report_lang),
+                    errors=["send_timeout"],
+                    vin=vin,
+                )
+            except Exception as exc:
+                report_result = _ReportResult(
+                    success=False,
+                    user_message=_bridge.t("report.error.fetch", report_lang),
+                    errors=[f"send_failed:{exc}"],
+                    vin=vin,
+                )
+            delivery_note = _bridge.t("report.success.pdf_note", report_lang)
+            delivered = bool(report_result and report_result.success)
+
+        if delivered:
+            finalize_snapshot = await _finalize_report_request(context, tg_id, delivered=True, rid=rid_charge)
+            success_header = _build_vin_progress_header(
+                vin,
+                monthly_remaining=finalize_snapshot["monthly_remaining"],
+                monthly_limit=finalize_snapshot["monthly_limit"],
+                today_used=finalize_snapshot["today_used"],
+                daily_limit=finalize_snapshot["daily_limit"],
+                days_left=finalize_snapshot["days_left"],
+                lang=report_lang,
+            )
+            note = delivery_note or _bridge.t("report.success.note", report_lang)
+            try:
+                await asyncio.wait_for(
+                    context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=progress_message_id,
+                        text=success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or ""),
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    timeout=_tg_remaining_s(floor=1.0),
+                )
+            except Exception:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or ""),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            remaining_credit = finalize_snapshot["monthly_remaining"]
+            remaining_txt = _bridge.t("report.summary.unlimited", report_lang) if remaining_credit is None else str(remaining_credit)
+            user_label = f"TG:{tg_id}"
+            await _super_dashboard_event(
+                context,
+                _bridge.t("report.dashboard.success", None, vin=vin, user=user_label, remaining=remaining_txt),
+            )
+            return
+
+        refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False, rid=rid_charge)
+        refreshed_header = _build_vin_progress_header(
+            vin,
+            monthly_remaining=refund_snapshot["monthly_remaining"],
+            monthly_limit=refund_snapshot["monthly_limit"],
+            today_used=refund_snapshot["today_used"],
+            daily_limit=refund_snapshot["daily_limit"],
+            days_left=refund_snapshot["days_left"],
+            lang=report_lang,
+        )
+        try:
+            pdf_failure_note = "\n\n" + _bridge.t("report.error.pdf", report_lang) + _bridge.t("report.refund.note", report_lang) + "\n\n❌ Failed + refunded"
+            await asyncio.wait_for(
+                context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_message_id,
+                    text=refreshed_header + "\n" + _make_progress_bar(100) + pdf_failure_note,
+                    parse_mode=ParseMode.HTML,
+                ),
+                timeout=_tg_remaining_s(floor=1.0),
+            )
+        except Exception:
+            pass
+        user_label = f"TG:{tg_id}"
+        await _super_dashboard_event(
+            context,
+            _bridge.t("report.dashboard.pdf_failure", None, vin=vin, user=user_label),
+        )
+    finally:
+        for path in cleanup_paths:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+        _cleanup_temp_files(bridge_temp_files)
 def _normalize_phone(raw: str, cc: Optional[str]) -> Optional[str]:
     s = (raw or "").strip().replace(" ", "").replace("-", "")
     if s.startswith("+") and s[1:].isdigit() and 9 <= len(s) <= 16:
@@ -5283,559 +5811,71 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     if vin:
-        # Prevent duplicate concurrent report generations per user.
-        # A repeated VIN message should not start a second pipeline (causes saturation and "stuck" UX).
-        try:
-            if isinstance(context.user_data, dict):
-                inflight = context.user_data.get("vin_inflight")
-            else:
-                inflight = None
-        except Exception:
-            inflight = None
-
-        if isinstance(inflight, dict) and inflight.get("vin"):
+        vins = _tg_extract_all_vins(txt, primary=vin)
+        if not vins:
             try:
-                started_at = float(inflight.get("started_at") or 0.0)
-            except Exception:
-                started_at = 0.0
-            if started_at and (time.time() - started_at) < 900:
-                # Same VIN -> silently ignore duplicates; different VIN -> tell user it's already processing.
-                try:
-                    if str(inflight.get("vin") or "").strip().upper() != str(vin).strip().upper():
-                        lang_hint = (bridge_user_ctx.language if bridge_user_ctx else None)
-                        await update.message.reply_text(_bridge.t("report.processing.already", lang_hint), parse_mode=ParseMode.HTML)
-                except Exception:
-                    pass
-                return
-
-        if isinstance(context.user_data, dict):
-            try:
-                context.user_data["vin_inflight"] = {
-                    "vin": vin,
-                    "started_at": time.time(),
-                    "progress_message_id": None,
-                }
+                await update.message.reply_text(_menu_hint_text(lang))
             except Exception:
                 pass
+            return
 
-        lock = _user_lock(tg_id)
-        header_snapshot: Optional[Dict[str, Any]] = None
+        # Build a quick header snapshot once, then ACK each VIN immediately with its own progress message.
         report_lang = get_report_default_lang() or "en"
-        rid_charge: Optional[str] = None
-
-        async with lock:
-            db = _load_db()
-            u = _ensure_user(db, tg_id, update.effective_user.username)
-
-            report_lang = _get_user_report_lang(u)
-
-            if not bridge_user_ctx:
-                bridge_user_ctx = _bridge.UserContext(
-                    user_id=tg_id,
-                    language=report_lang,
-                    phone=u.get("phone"),
-                    metadata={
-                        "username": update.effective_user.username if update and update.effective_user else None,
-                        "first_name": update.effective_user.first_name if update and update.effective_user else None,
-                        "user_data": dict(context.user_data) if context and isinstance(context.user_data, dict) else {},
-                        "db_user": u,
-                    },
-                )
-            else:
-                bridge_user_ctx.language = report_lang
-                bridge_user_ctx.metadata.setdefault("db_user", u)
-
-            limit_allowed, limit_message, limit_reason = await _bridge.check_user_limits(
-                bridge_user_ctx,
-                storage=db,
-            )
-            _save_db(db)
-
-            if not limit_allowed:
-                if limit_reason in {"daily", "monthly", "both"}:
-                    limit_response = await _bridge.request_limit_increase(
-                        bridge_user_ctx,
-                        storage=db,
-                        notifications=context,
-                        reason=limit_reason,
-                    )
-                    if limit_message:
-                        limit_response.messages.insert(0, limit_message)
-                else:
-                    limit_response = _bridge.BridgeResponse()
-                    if limit_message:
-                        limit_response.messages.append(limit_message)
-                await _send_bridge_responses(update, limit_response, context=context)
-                # IMPORTANT: we did not start a report pipeline; clear in-flight marker.
-                # Otherwise users can get stuck with "already processing" for 15 minutes
-                # after a daily limit rejection, even if an admin resets the counter.
-                try:
-                    if isinstance(context.user_data, dict):
-                        inflight_block = context.user_data.get("vin_inflight")
-                        if isinstance(inflight_block, dict) and str(inflight_block.get("vin") or "") == str(vin):
-                            context.user_data.pop("vin_inflight", None)
-                except Exception:
-                    pass
-                return
-
-            # Deterministic rid for exactly-once accounting.
-            request_key: Optional[str] = None
-            try:
-                request_key = str(getattr(update.effective_message, "message_id", None) or "") or None
-            except Exception:
-                request_key = None
-            if not request_key:
-                try:
-                    request_key = str(getattr(update, "update_id", None) or "") or None
-                except Exception:
-                    request_key = None
-            rid_charge = compute_request_id(
-                platform="telegram",
-                user_id=str(tg_id),
-                vin=vin,
-                language=report_lang,
-                options={"product": "carfax_vhr"},
-                request_key=request_key,
-            )
-            try:
-                _reserve_credit(tg_id, rid=rid_charge, meta={"platform": "telegram", "vin": vin, "lang": report_lang})
-            except Exception:
-                logger.warning("reserve_credit failed", exc_info=True)
-
-            # Refresh snapshot from disk after reserve (rid-aware path writes via storage helpers).
-            db2 = _load_db()
-            u2 = _ensure_user(db2, tg_id, update.effective_user.username)
-            header_snapshot = {
-                "monthly_remaining": _remaining_monthly_reports(u2),
-                "monthly_limit": _safe_int((u2.get("limits", {}) or {}).get("monthly")),
-                "today_used": _safe_int((u2.get("limits", {}) or {}).get("today_used")),
-                "daily_limit": _safe_int((u2.get("limits", {}) or {}).get("daily")),
-                "days_left": _days_left(u2.get("expiry_date")),
-            }
-
-        if not header_snapshot:
-            header_snapshot = {
-                "monthly_remaining": None,
-                "monthly_limit": 0,
-                "today_used": 0,
-                "daily_limit": 0,
-                "days_left": None,
-            }
-
-        header = _build_vin_progress_header(vin, lang=report_lang, **header_snapshot)
-        progress_payload = header + "\n" + _make_progress_bar(0)
+        header_snapshot: Dict[str, Any] = {
+            "monthly_remaining": None,
+            "monthly_limit": 0,
+            "today_used": 0,
+            "daily_limit": 0,
+            "days_left": None,
+        }
         try:
-            msg = await update.message.reply_text(progress_payload, parse_mode=ParseMode.HTML)
-        except Exception as exc:
-            logger.error("progress_send_failed", exc_info=True)
-            safe_payload = re.sub(r"<[^>]+>", "", progress_payload)
-            msg = await update.message.reply_text(safe_payload)
-        context.chat_data["progress_header"] = header
-
-        try:
-            if isinstance(context.user_data, dict) and isinstance(context.user_data.get("vin_inflight"), dict):
-                if context.user_data["vin_inflight"].get("vin") == vin:
-                    context.user_data["vin_inflight"]["progress_message_id"] = getattr(msg, "message_id", None)
+            async with _user_lock(tg_id):
+                db0 = _load_db()
+                u0 = _ensure_user(db0, tg_id, update.effective_user.username)
+                report_lang = _get_user_report_lang(u0)
+                header_snapshot = {
+                    "monthly_remaining": _remaining_monthly_reports(u0),
+                    "monthly_limit": _safe_int((u0.get("limits", {}) or {}).get("monthly")),
+                    "today_used": _safe_int((u0.get("limits", {}) or {}).get("today_used")),
+                    "daily_limit": _safe_int((u0.get("limits", {}) or {}).get("daily")),
+                    "days_left": _days_left(u0.get("expiry_date")),
+                }
         except Exception:
             pass
 
-        cleanup_paths: List[str] = []
-
-        def _register_cleanup(path: Optional[str]) -> None:
-            if path and path not in cleanup_paths:
-                cleanup_paths.append(path)
-
-        stop_event = asyncio.Event()
-        context.chat_data["progress_cap"] = 80
-        progress_task = asyncio.create_task(_progress_updater(context, update.effective_chat.id, msg.message_id, stop_event))
-        report_result: Optional[_ReportResult] = None
-        bridge_pdf_path: Optional[str] = None
-        bridge_temp_files: List[str] = []
-        # Telegram time budgets: keep them independent from the WhatsApp TOTAL_BUDGET_SEC.
-        # Reliability > overly strict SLA; reports pipeline also has its own internal deadline.
-        tg_total_timeout_s = float(os.getenv("TG_REPORT_TOTAL_TIMEOUT_SEC", "120") or 120)
-        tg_total_timeout_s = max(10.0, min(tg_total_timeout_s, 300.0))
-        tg_send_timeout_s = float(os.getenv("TG_REPORT_SEND_TIMEOUT_SEC", "60") or 60)
-        tg_send_timeout_s = max(10.0, min(tg_send_timeout_s, 300.0))
-        tg_t0 = time.perf_counter()
-
-        def _tg_remaining_s(floor: float = 1.0) -> float:
-            return max(floor, tg_total_timeout_s - (time.perf_counter() - tg_t0))
-
-        # Correlate all timing logs for this request.
+        base_key = None
         try:
-            from bot_core.telemetry import new_rid as _new_rid, set_rid as _set_rid
+            base_key = str(getattr(update.effective_message, "message_id", None) or "")
         except Exception:
-            _new_rid = None  # type: ignore
-            _set_rid = None  # type: ignore
-
-        rid = (_new_rid("tg-") if _new_rid else None)
-
-        rid_cm = None
-        try:
-            if _set_rid and rid:
-                rid_cm = _set_rid(rid)
-            else:
-                rid_cm = None
-
-            if rid_cm:
-                rid_cm.__enter__()
-
-            if bridge_user_ctx:
-                try:
-                    bridge_user_ctx.language = report_lang
-                except Exception:
-                    pass
-                vin_incoming = _bridge.IncomingMessage(
-                    platform="telegram",
-                    user_id=bridge_user_ctx.user_id,
-                    text=vin,
-                    raw=raw_payload,
-                )
-                try:
-                    vin_bridge_response = await asyncio.wait_for(
-                        _bridge.handle_text(
-                            bridge_user_ctx,
-                            vin_incoming,
-                            context=context,
-                            skip_limit_validation=True,
-                            deduct_credit=False,
-                        ),
-                        timeout=_tg_remaining_s(),
-                    )
-                except Exception as exc:
-                    logger.error("Bridge VIN handler failed: %s", exc, exc_info=True)
-                    vin_bridge_response = None
-                if isinstance(vin_bridge_response, _bridge.BridgeResponse):
-                    bridge_temp_files = list(vin_bridge_response.actions.get("temp_files", []))
-                    for temp_path in bridge_temp_files:
-                        _register_cleanup(temp_path)
-                    report_result = vin_bridge_response.actions.get("report_result")
-                    pdf_doc = next((doc for doc in vin_bridge_response.documents if doc.get("type") == "pdf" and doc.get("path")), None)
-                    if pdf_doc:
-                        bridge_pdf_path = pdf_doc.get("path")
-
-            if not report_result:
-                gen_attempts = int(os.getenv("TG_REPORT_RETRIES", "3") or 3)
-                gen_attempts = max(1, min(gen_attempts, 6))
-                gen_backoffs = [0.0, 1.0, 3.0, 7.0, 12.0, 20.0]
-                last_exc: Optional[BaseException] = None
-                for i in range(gen_attempts):
-                    if i > 0:
-                        try:
-                            await asyncio.sleep(gen_backoffs[min(i, len(gen_backoffs) - 1)])
-                        except Exception:
-                            pass
-                    try:
-                        report_result = await asyncio.wait_for(
-                            _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(tg_id)),
-                            timeout=_tg_remaining_s(),
-                        )
-                    except asyncio.TimeoutError:
-                        report_result = _ReportResult(
-                            success=False,
-                            user_message=_bridge.t("report.error.timeout", report_lang),
-                            errors=["timeout"],
-                            vin=vin,
-                        )
-                    except Exception as exc:
-                        last_exc = exc
-                        logger.error(
-                            "tg_report_generation_failed",
-                            extra={"vin": vin, "tg_id": tg_id, "attempt": i + 1},
-                            exc_info=True,
-                        )
-                        report_result = _ReportResult(
-                            success=False,
-                            user_message=_bridge.t("report.error.fetch", report_lang),
-                            errors=[f"exception:{type(exc).__name__}"],
-                            vin=vin,
-                        )
-
-                    if report_result and getattr(report_result, "success", False) and getattr(report_result, "pdf_bytes", None):
-                        break
-                    if not _is_retryable_report_failure(report_result):
-                        break
-        except asyncio.TimeoutError:
-            # SLA timeout anywhere in the fast pipeline.
-            report_result = _ReportResult(
-                success=False,
-                user_message=_bridge.t("report.error.timeout", report_lang),
-                errors=["sla_timeout"],
-                vin=vin,
-            )
-        finally:
+            base_key = ""
+        if not base_key:
             try:
-                if rid_cm:
-                    rid_cm.__exit__(None, None, None)
+                base_key = str(getattr(update, "update_id", None) or "")
             except Exception:
-                pass
-            stop_event.set()
+                base_key = ""
+        if not base_key:
+            base_key = str(int(time.time()))
+
+        for i, v in enumerate(vins):
+            header = _build_vin_progress_header(v, lang=report_lang, **header_snapshot)
+            progress_payload = header + "\n" + _make_progress_bar(0)
             try:
-                await asyncio.wait_for(progress_task, timeout=2)
+                msg = await update.message.reply_text(progress_payload, parse_mode=ParseMode.HTML)
             except Exception:
-                progress_task.cancel()
-                # IMPORTANT: always await/capture the task after cancellation.
-                # Otherwise its last in-flight edit (often 90%) can race and overwrite
-                # the final 100% message, leaving the UX stuck at 90%.
-                try:
-                    await progress_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    logger.warning("progress task failed", exc_info=True)
+                msg = await update.message.reply_text(re.sub(r"<[^>]+>", "", progress_payload))
 
-        if not report_result:
-            report_result = _ReportResult(
-                success=False,
-                user_message=_bridge.t("report.error.generic", report_lang),
-                errors=["bridge_failed"],
-                vin=vin,
-            )
-
-        try:
-            if not report_result.success:
-                err_text = _report_failure_user_message(report_result, report_lang)
-                refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False, rid=rid_charge)
-                refreshed_header = _build_vin_progress_header(
-                    vin,
-                    monthly_remaining=refund_snapshot["monthly_remaining"],
-                    monthly_limit=refund_snapshot["monthly_limit"],
-                    today_used=refund_snapshot["today_used"],
-                    daily_limit=refund_snapshot["daily_limit"],
-                    days_left=refund_snapshot["days_left"],
-                    lang=report_lang,
-                )
-                refund_note = _bridge.t("report.refund.note", report_lang)
-                # Terminal finalizer: always end with the exact failure marker.
-                failure_note = f"\n\n{escape(err_text)}{refund_note}\n\n❌ Failed + refunded"
-                try:
-                    await asyncio.wait_for(
-                        msg.edit_text(
-                            refreshed_header + "\n" + _make_progress_bar(100) + failure_note,
-                            parse_mode=ParseMode.HTML,
-                        ),
-                        timeout=_tg_remaining_s(floor=1.0),
-                    )
-                except Exception:
-                    pass
-                context.chat_data["progress_header"] = refreshed_header
-                user_label = _display_name(u) if u else f"TG:{tg_id}"
-                await _super_dashboard_event(
-                    context,
-                    _bridge.t("report.dashboard.failure", None, vin=vin, user=user_label, error=err_text),
-                )
-                return
-
-            delivered = False
-            delivery_note = ""
-            pdf_local_path: Optional[str] = None
-            requested_lang = (report_lang or "en").lower()
-            delivered_lang = requested_lang
-            fast_skipped_translation = False
-
-            if report_result.pdf_bytes:
-                try:
-                    # We are now past generation and entering the upload/send phase.
-                    context.chat_data["progress_cap"] = 95
-                    pdf_bytes = bytes(report_result.pdf_bytes)
-                    delivered_sha256 = hashlib.sha256(pdf_bytes).hexdigest() if pdf_bytes else None
-                    upstream_sha256 = getattr(report_result, "upstream_sha256", None)
-                    if upstream_sha256 and delivered_sha256 and upstream_sha256 != delivered_sha256:
-                        logger.error(
-                            "tg_upstream_pdf_parity_mismatch vin=%s upstream_sha256=%s delivered_sha256=%s",
-                            vin,
-                            upstream_sha256,
-                            delivered_sha256,
-                        )
-                        raise RuntimeError("upstream_pdf_parity_mismatch")
-
-                    max_send_attempts = int(os.getenv("TG_DELIVERY_RETRIES", "3") or 3)
-                    max_send_attempts = max(1, min(max_send_attempts, 6))
-                    send_backoffs = [0.0, 1.0, 3.0, 7.0, 12.0, 20.0]
-                    last_send_exc: Optional[BaseException] = None
-                    sent_ok = False
-                    for attempt in range(max_send_attempts):
-                        if attempt > 0:
-                            try:
-                                await asyncio.sleep(send_backoffs[min(attempt, len(send_backoffs) - 1)])
-                            except Exception:
-                                pass
-                        try:
-                            bio = BytesIO(pdf_bytes)
-                            bio.name = report_result.pdf_filename or f"{vin}.pdf"
-                            try:
-                                from bot_core.telemetry import atimed
-                            except Exception:
-                                atimed = None
-                            if atimed:
-                                async with atimed(
-                                    "tg.send_document",
-                                    bytes=len(pdf_bytes),
-                                    via="bytes",
-                                    vin=vin,
-                                    upstream_sha256=(upstream_sha256 or ""),
-                                    delivered_sha256=(delivered_sha256 or ""),
-                                ):
-                                    await asyncio.wait_for(
-                                        context.bot.send_document(
-                                            chat_id=update.effective_chat.id,
-                                            document=bio,
-                                            filename=bio.name,
-                                            caption=f"📄 تقرير VIN <code>{vin}</code>",
-                                            parse_mode=ParseMode.HTML,
-                                        ),
-                                        timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
-                                    )
-                            else:
-                                await asyncio.wait_for(
-                                    context.bot.send_document(
-                                        chat_id=update.effective_chat.id,
-                                        document=bio,
-                                        filename=bio.name,
-                                        caption=f"📄 تقرير VIN <code>{vin}</code>",
-                                        parse_mode=ParseMode.HTML,
-                                    ),
-                                    timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
-                                )
-                            sent_ok = True
-                            break
-                        except asyncio.TimeoutError as exc:
-                            last_send_exc = exc
-                        except Exception as exc:
-                            last_send_exc = exc
-                            logger.warning("tg_send_document_failed vin=%s attempt=%s", vin, attempt + 1, exc_info=True)
-
-                    if not sent_ok:
-                        raise (last_send_exc or RuntimeError("tg_send_document_failed"))
-                    try:
-                        logger.info(
-                            "tg_pdf_delivered vin=%s bytes=%s upstream_sha256=%s delivered_sha256=%s",
-                            vin,
-                            len(pdf_bytes),
-                            upstream_sha256 or "-",
-                            delivered_sha256 or "-",
-                        )
-                    except Exception:
-                        pass
-                except asyncio.TimeoutError:
-                    report_result = _ReportResult(
-                        success=False,
-                        user_message=_bridge.t("report.error.timeout", report_lang),
-                        errors=["send_timeout"],
-                        vin=vin,
-                    )
-                except Exception as exc:
-                    report_result = _ReportResult(
-                        success=False,
-                        user_message=_bridge.t("report.error.fetch", report_lang),
-                        errors=[f"send_failed:{exc}"],
-                        vin=vin,
-                    )
-                delivery_note = _bridge.t("report.success.pdf_note", report_lang)
-                delivered = bool(report_result and report_result.success)
-
-            # Determine Fast Mode translation decision from reports metadata.
-            try:
-                rr = getattr(report_result, "raw_response", None)
-                if isinstance(rr, dict):
-                    dv = rr.get("_dv_fast") or {}
-                    if isinstance(dv, dict):
-                        fast_skipped_translation = bool(dv.get("skipped_translation"))
-                        delivered_lang = str(dv.get("delivered_lang") or delivered_lang).lower()
-                        requested_lang = str(dv.get("requested_lang") or requested_lang).lower()
-            except Exception:
-                pass
-
-            if delivered:
-                finalize_snapshot = await _finalize_report_request(context, tg_id, delivered=True, rid=rid_charge)
-                success_header = _build_vin_progress_header(
-                    vin,
-                    monthly_remaining=finalize_snapshot["monthly_remaining"],
-                    monthly_limit=finalize_snapshot["monthly_limit"],
-                    today_used=finalize_snapshot["today_used"],
-                    daily_limit=finalize_snapshot["daily_limit"],
-                    days_left=finalize_snapshot["days_left"],
-                    lang=report_lang,
-                )
-                note = delivery_note or _bridge.t("report.success.note", report_lang)
-
-                extra_block = ""
-                try:
-                    # Always end on an explicit "completed" state.
-                    # We edit the same progress message to avoid leaving it at 90%.
-                    await asyncio.wait_for(
-                        msg.edit_text(
-                            success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block,
-                            parse_mode=ParseMode.HTML,
-                        ),
-                        timeout=_tg_remaining_s(floor=1.0),
-                    )
-                except Exception:
-                    # If editing fails (e.g., message no longer editable), send a final
-                    # completion message anyway so the user always sees 100%.
-                    try:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=success_header + "\n" + _make_progress_bar(100) + "\n\n" + (note or "") + extra_block,
-                            parse_mode=ParseMode.HTML,
-                        )
-                    except Exception:
-                        pass
-                context.chat_data["progress_header"] = success_header
-                remaining_credit = finalize_snapshot["monthly_remaining"]
-                remaining_txt = _bridge.t("report.summary.unlimited", report_lang) if remaining_credit is None else str(remaining_credit)
-                user_label = _display_name(finalize_snapshot.get("user", {})) if finalize_snapshot.get("user") else f"TG:{tg_id}"
-                await _super_dashboard_event(
-                    context,
-                    _bridge.t("report.dashboard.success", None, vin=vin, user=user_label, remaining=remaining_txt),
-                )
-                return
-            else:
-                refund_snapshot = await _finalize_report_request(context, tg_id, delivered=False, rid=rid_charge)
-                refreshed_header = _build_vin_progress_header(
-                    vin,
-                    monthly_remaining=refund_snapshot["monthly_remaining"],
-                    monthly_limit=refund_snapshot["monthly_limit"],
-                    today_used=refund_snapshot["today_used"],
-                    daily_limit=refund_snapshot["daily_limit"],
-                    days_left=refund_snapshot["days_left"],
-                    lang=report_lang,
-                )
-                try:
-                    pdf_failure_note = "\n\n" + _bridge.t("report.error.pdf", report_lang) + _bridge.t("report.refund.note", report_lang) + "\n\n❌ Failed + refunded"
-                    await asyncio.wait_for(
-                        msg.edit_text(
-                            refreshed_header + "\n" + _make_progress_bar(100) + pdf_failure_note,
-                            parse_mode=ParseMode.HTML,
-                        ),
-                        timeout=_tg_remaining_s(floor=1.0),
-                    )
-                except Exception:
-                    pass
-                context.chat_data["progress_header"] = refreshed_header
-                user_label = _display_name(u) if u else f"TG:{tg_id}"
-                await _super_dashboard_event(
-                    context,
-                    _bridge.t("report.dashboard.pdf_failure", None, vin=vin, user=user_label),
-                )
-                return
-        finally:
-            for path in cleanup_paths:
-                try:
-                    if path and os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    pass
-
-            # Clear in-flight marker.
-            try:
-                if isinstance(context.user_data, dict):
-                    inflight2 = context.user_data.get("vin_inflight")
-                    if isinstance(inflight2, dict) and str(inflight2.get("vin") or "") == str(vin):
-                        context.user_data.pop("vin_inflight", None)
-            except Exception:
-                pass
+            job = {
+                "tg_id": str(tg_id),
+                "chat_id": int(update.effective_chat.id),
+                "username": (update.effective_user.username if update and update.effective_user else None),
+                "first_name": (update.effective_user.first_name if update and update.effective_user else None),
+                "vin": str(v),
+                "raw_payload": raw_payload,
+                "request_key": f"{base_key}:{i}",
+                "progress_message_id": int(getattr(msg, "message_id", 0) or 0),
+            }
+            await _tg_enqueue_report_job(str(tg_id), job, context)
+        return
 
     # ===== Menu routing =====
     if txt in MAIN_MENU_TEXTS:

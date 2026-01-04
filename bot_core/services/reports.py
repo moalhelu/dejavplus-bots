@@ -273,8 +273,7 @@ def _extract_safe_viewer_url(json_payload: Any, html_candidate: Optional[str]) -
         path = (parsed.path or "").lower()
         # Explicitly reject window-sticker flows (they often return a sticker error page).
         if "sticker" in path or "window" in path:
-            if "sticker" in path:
-                return False
+            return False
         q = (parsed.query or "").lower()
         if "window" in q and "sticker" in q:
             return False
@@ -864,16 +863,35 @@ async def generate_vin_report(
                             if pdf_rendered:
                                 break
                             try:
+                                # Recompute remaining budget because prefetch/translation may have consumed time.
+                                render_budget_ms = _deadline_remaining_ms(deadline, floor_ms=1500, cap_ms=120_000)
+                                acquire_ms = min(20_000, max(2_000, int(render_budget_ms * 0.5)))
+
+                                # Fast-first attempt for HTML bootstrap pages: domcontentloaded + short settle.
+                                # If it yields an empty/broken PDF, fall back to a slower "load" attempt.
+                                attempt_wait_until = "load"
+                                attempt_settle_ms = 1500
+                                attempt_timeout_ms = render_budget_ms
+                                attempt_fast_first_timeout_ms = 1500
+                                attempt_block_types: Optional[set[str]] = None
+                                if fast_mode and render_attempt == 1:
+                                    attempt_wait_until = "domcontentloaded"
+                                    attempt_settle_ms = 900
+                                    attempt_timeout_ms = min(render_budget_ms, 8_000)
+                                    attempt_fast_first_timeout_ms = min(1_200, attempt_timeout_ms)
+                                    attempt_block_types = {"image", "media"}
+
                                 pdf_rendered = await html_to_pdf_bytes_chromium(
                                     html_str=html_candidate,
                                     base_url="https://www.carfax.com/",
                                     strip_scripts=False,
-                                    settle_ms=1500,
-                                    timeout_ms=render_budget_ms,
+                                    settle_ms=attempt_settle_ms,
+                                    timeout_ms=attempt_timeout_ms,
                                     acquire_timeout_ms=acquire_ms,
-                                    wait_until="load",
-                                    fast_first_timeout_ms=1500,
+                                    wait_until=attempt_wait_until,
+                                    fast_first_timeout_ms=attempt_fast_first_timeout_ms,
                                     fast_first_wait_until="domcontentloaded",
+                                    block_resource_types=attempt_block_types,
                                 )
                                 if pdf_rendered:
                                     break

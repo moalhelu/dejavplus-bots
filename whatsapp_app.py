@@ -1836,6 +1836,10 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
         LOGGER.warning("Ignoring non-public WHATSAPP_PUBLIC_URL base: %s", public_url)
         public_url = None
 
+    # Speed: if we have a public base URL, prefer UltraMsg URL delivery.
+    # Base64 delivery can be noticeably slower due to large payload uploads.
+    prefer_url_delivery = (os.getenv("WA_PREFER_URL_DELIVERY", "1") or "1").strip().lower() not in {"0", "false", "off"}
+
     upstream_sha256 = document.get("upstream_sha256")
 
     # If we have bytes, prefer them (no disk).
@@ -1869,35 +1873,43 @@ async def _relay_pdf_document(client: UltraMsgClient, msisdn: str, document: Dic
                 pass
             raw_len = len(raw_bytes)
             b64len = _b64_len(raw_len)
-            # Use base64 whenever possible (and within documented UltraMsg limits).
-            if raw_len <= wa_max_b64_bytes and b64len <= UM_MAX_BASE64_LEN:
-                base64_payload = base64.b64encode(raw_bytes).decode("ascii")
-            else:
-                if not public_url:
-                    public_url = await _ensure_public_url()
-                if not _is_public_http_base(public_url):
-                    public_url = None
-                if not public_url:
-                    LOGGER.warning(
-                        "WhatsApp PDF too large for base64 and no public URL (raw=%s, b64=%s, cap_raw=%s, cap_b64=%s).",
-                        raw_len,
-                        b64len,
-                        wa_max_b64_bytes,
-                        UM_MAX_BASE64_LEN,
-                    )
-                    try:
-                        await send_whatsapp_text(
-                            msisdn,
-                            "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير جداً ولا يوجد رابط عام صالح. "
-                            "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين عام) ثم أعد المحاولة.",
-                            client=client,
-                        )
-                    except Exception:
-                        pass
-                    return False
+
+            # If a public URL is configured, prefer URL delivery for speed.
+            if prefer_url_delivery and public_url and _is_public_http_base(public_url):
                 token = await _put_one_shot_blob(raw_bytes, filename=filename, media_type="application/pdf")
                 url_value = f"{public_url}/download/{token}"
-                LOGGER.info("Serving PDF via one-shot URL: %s", url_value)
+                LOGGER.info("wa_delivery_mode=url msisdn=%s bytes=%s url=%s", msisdn, raw_len, url_value)
+            else:
+                # Use base64 whenever possible (and within documented UltraMsg limits).
+                if raw_len <= wa_max_b64_bytes and b64len <= UM_MAX_BASE64_LEN:
+                    base64_payload = base64.b64encode(raw_bytes).decode("ascii")
+                    LOGGER.info("wa_delivery_mode=base64 msisdn=%s bytes=%s b64=%s", msisdn, raw_len, b64len)
+                else:
+                    if not public_url:
+                        public_url = await _ensure_public_url()
+                    if not _is_public_http_base(public_url):
+                        public_url = None
+                    if not public_url:
+                        LOGGER.warning(
+                            "WhatsApp PDF too large for base64 and no public URL (raw=%s, b64=%s, cap_raw=%s, cap_b64=%s).",
+                            raw_len,
+                            b64len,
+                            wa_max_b64_bytes,
+                            UM_MAX_BASE64_LEN,
+                        )
+                        try:
+                            await send_whatsapp_text(
+                                msisdn,
+                                "⚠️ تعذّر إرسال ملف PDF عبر واتساب لأن الملف كبير جداً ولا يوجد رابط عام صالح. "
+                                "رجاءً اضبط WHATSAPP_PUBLIC_URL (ngrok أو دومين عام) ثم أعد المحاولة.",
+                                client=client,
+                            )
+                        except Exception:
+                            pass
+                        return False
+                    token = await _put_one_shot_blob(raw_bytes, filename=filename, media_type="application/pdf")
+                    url_value = f"{public_url}/download/{token}"
+                    LOGGER.info("wa_delivery_mode=url_fallback msisdn=%s bytes=%s url=%s", msisdn, raw_len, url_value)
 
         elif path_value:
             # Backward compatibility: legacy callers may still pass a temp path.

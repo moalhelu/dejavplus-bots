@@ -282,7 +282,6 @@ def _extract_html_from_upstream_json(payload: Any) -> Optional[str]:
     return None
 
 
-async def fetch_report_pdf_bytes(
 def _canonical_api_base() -> str:
     """Canonical DejaVuPlus base URL per docs.
 

@@ -867,6 +867,25 @@ def _is_menu_selection_candidate(text: str) -> bool:
     return 1 <= value <= 99
 
 
+def _extract_numeric_token(text: str) -> Optional[str]:
+    """Extract a 1-2 digit numeric token from user text.
+
+    WhatsApp users sometimes reply with keycap emoji like "3️⃣" or include extra whitespace.
+    This helper normalizes that into a plain digit string when possible.
+    """
+
+    if not text:
+        return None
+    candidate = (text or "").strip()
+    if candidate.isdigit():
+        return candidate
+    # Match a standalone 1-2 digit token (ASCII or Unicode digits).
+    m = re.search(r"(?<!\d)(\d{1,2})(?!\d)", candidate)
+    if m:
+        return m.group(1)
+    return None
+
+
 def _update_user_state(user_id: str, state: Optional[str]) -> None:
     db = _load_db()
     _ensure_user(db, user_id, None)
@@ -1194,6 +1213,9 @@ async def handle_incoming_whatsapp_message(
 
     LOGGER.info("📩 Incoming WhatsApp from %s: %s", msisdn, text_body)
 
+    # Normalize numeric replies like "3️⃣" -> "3" for menu/language flows.
+    numeric_token = _extract_numeric_token(text_body) or None
+
     enriched_event = dict(event)
     enriched_event.setdefault("sender", bridge_sender)
     telegram_context = _get_notification_context()
@@ -1209,8 +1231,8 @@ async def handle_incoming_whatsapp_message(
     state_lower = (user_ctx.state or "").lower()
     if state_lower == "language_choice":
         LOGGER.debug("whatsapp: in language_choice flow, skip button text mapping")
-    elif not button_id and text_body and text_body.isdigit():
-        mapped_id = _map_text_to_button(text_body, user_ctx.state, is_super_admin(user_ctx.user_id))
+    elif not button_id and numeric_token and numeric_token.isdigit():
+        mapped_id = _map_text_to_button(numeric_token, user_ctx.state, is_super_admin(user_ctx.user_id))
         if mapped_id:
             button_id = mapped_id
             # Make digit-based fallback behave like an interactive button click.
@@ -1245,8 +1267,8 @@ async def handle_incoming_whatsapp_message(
 
     if state_lower == "language_choice":
         LOGGER.debug("whatsapp: entering language_choice handler (state=%s, text=%s)", state_lower, text_body)
-        if text_body and text_body.isdigit():
-            choice = text_body.strip()
+        choice = (numeric_token or "").strip()
+        if choice and choice.isdigit():
             lang_map = {"1": "ar", "2": "en", "3": "ku", "4": "ckb"}
             selected_lang = lang_map.get(choice)
             if selected_lang:
@@ -1273,17 +1295,17 @@ async def handle_incoming_whatsapp_message(
         else:
             tmp = _resolve_menu_selection(button_id, user_ctx)
             menu_selection_text = await tmp if asyncio.iscoroutine(tmp) else tmp
-    elif text_body and text_body.isdigit():
+    elif numeric_token and numeric_token.isdigit():
         # Prefer main-menu selection whenever the digit maps to a known menu item.
         # This keeps the bot responsive even if a stale/unknown state is stored.
-        if _is_menu_selection_candidate(text_body):
-            tmp = _resolve_menu_selection(text_body, user_ctx)
+        if _is_menu_selection_candidate(numeric_token):
+            tmp = _resolve_menu_selection(numeric_token, user_ctx)
             mapped = await tmp if asyncio.iscoroutine(tmp) else tmp
             if mapped:
-                LOGGER.info("whatsapp: handling menu choice %s for user %s", text_body, user_ctx.user_id)
+                LOGGER.info("whatsapp: handling menu choice %s for user %s", numeric_token, user_ctx.user_id)
                 menu_selection_text = mapped
             else:
-                LOGGER.debug("whatsapp: digit '%s' did not map to any menu item (state=%s)", text_body, state_lower)
+                LOGGER.debug("whatsapp: digit '%s' did not map to any menu item (state=%s)", numeric_token, state_lower)
 
     if exit_to_main_menu:
         LOGGER.info("whatsapp: exiting to main menu (state=%s)", user_ctx.state)

@@ -38,7 +38,7 @@ from bot_core.config import get_env
 from bot_core.telemetry import atimed, get_rid
 from bot_core.utils.vin import normalize_vin
 
-from bot_core.services.pdf import html_to_pdf_bytes_chromium
+from bot_core.services.pdf import html_to_pdf_bytes_chromium, fetch_page_html_chromium
 from bot_core.services.translation import inject_rtl, translate_html
 from bot_core.services.pdf import PdfBusyError
 
@@ -672,6 +672,38 @@ async def generate_vin_report(
                     except Exception:
                         viewer_url = None
 
+                    # If the upstream htmlContent is a JS bootstrap, translation can produce weak results
+                    # (or even break) because the content isn't present yet.
+                    # For non-English requests, prefer a quick Chromium fetch of the fully-rendered HTML
+                    # from the viewer URL (old-engine style), then translate that static DOM.
+                    render_budget_ms = _deadline_remaining_ms(deadline, floor_ms=1500, cap_ms=120_000)
+                    acquire_ms = min(20_000, max(2_000, int(render_budget_ms * 0.5)))
+                    if requested_lang != "en" and isinstance(viewer_url, str) and viewer_url:
+                        try:
+                            fetch_html_budget_ms = max(2_500, min(12_000, int(render_budget_ms * 0.45)))
+                            html_full = await fetch_page_html_chromium(
+                                viewer_url,
+                                wait_until="domcontentloaded",
+                                timeout_ms=fetch_html_budget_ms,
+                                acquire_timeout_ms=min(acquire_ms, 8_000),
+                                block_resource_types={"image", "media"} if fast_mode else None,
+                            )
+                            if isinstance(html_full, str) and html_full.strip() and not _looks_like_error_or_login_page(html_full):
+                                html_candidate = html_full
+                                try:
+                                    LOGGER.info(
+                                        "viewer_html_prefetched rid=%s vin=%s lang=%s bytes_len=%s url=%s",
+                                        get_rid() or "-",
+                                        normalized_vin,
+                                        requested_lang,
+                                        len(html_candidate.encode("utf-8", errors="ignore")),
+                                        viewer_url,
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
                     # Translate report HTML when requested (kept bounded by the overall reports deadline).
                     delivered_lang = requested_lang
                     translate_ms = None
@@ -710,11 +742,9 @@ async def generate_vin_report(
 
                     # Render htmlContent to PDF (official delivered report).
                     t_render0 = time.perf_counter()
-                    render_budget_ms = _deadline_remaining_ms(deadline, floor_ms=1500, cap_ms=120_000)
                     pdf_rendered: Optional[bytes] = None
                     try:
-                        acquire_ms = min(20_000, max(2_000, int(render_budget_ms * 0.5)))
-
+                        # acquire_ms / render_budget_ms computed earlier (also used for optional viewer HTML prefetch).
                         # Fast path (old engine style): if we have a safe viewer URL, print it directly.
                         # Keep English-only to avoid changing translation behavior.
                         if requested_lang == "en" and isinstance(viewer_url, str) and viewer_url:

@@ -187,12 +187,34 @@ _PDF_PLAYWRIGHT = None
 _PDF_BROWSER = None
 _PDF_BROWSER_LOCK = asyncio.Lock()
 
-# Hard cap on total pages (idle + in-flight).
-# Production stability requirement: global PDF render concurrency must be 1.
-_PDF_PAGE_MAX = int(os.getenv("PDF_PAGE_MAX", "1") or 1)
-if _PDF_PAGE_MAX != 1:
-    # Enforce stability contract even if env overrides.
-    _PDF_PAGE_MAX = 1
+def _default_pdf_page_max() -> int:
+    """Conservative default for total pages (idle + in-flight).
+
+    We keep this small to avoid RAM spikes on unknown hosts, but allow a
+    modest speedup under load on typical multi-core machines.
+    """
+
+    try:
+        cpu_count = os.cpu_count() or 1
+    except Exception:
+        cpu_count = 1
+    # 2 pages is a practical sweet spot: reduces queueing without becoming heavy.
+    return 2 if cpu_count >= 4 else 1
+
+
+# Hard cap on total pages (idle + in-flight). If PDF_PAGE_MAX is unset, pick a
+# conservative auto default; if set, respect it within a safety cap.
+_raw_pdf_page_max = os.getenv("PDF_PAGE_MAX")
+if _raw_pdf_page_max is None:
+    _PDF_PAGE_MAX = _default_pdf_page_max()
+else:
+    try:
+        _PDF_PAGE_MAX = int((_raw_pdf_page_max or "").strip() or "1")
+    except Exception:
+        _PDF_PAGE_MAX = 1
+
+# Safety cap: keep it small by default even if someone misconfigures it.
+_PDF_PAGE_MAX = max(1, min(_PDF_PAGE_MAX, 4))
 
 # Limit concurrent renders to the available page capacity.
 _PDF_RENDER_SEM = asyncio.Semaphore(_PDF_PAGE_MAX)

@@ -21,7 +21,7 @@ import re
 import secrets
 import subprocess
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
@@ -223,6 +223,21 @@ def _extract_first_vin(text: Optional[str]) -> Optional[str]:
     return None
 
 
+def _extract_all_vins(text: Optional[str]) -> List[str]:
+    if not text:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for tok in re.findall(r"[A-Za-z0-9]{17}", text):
+        candidate = tok.strip().upper()
+        if not candidate or candidate in seen:
+            continue
+        if is_valid_vin(candidate):
+            seen.add(candidate)
+            out.append(candidate)
+    return out
+
+
 def _compute_whatsapp_rid(*, user_id: str, vin: str, language: str, request_key: Optional[str] = None) -> str:
     # Charge idempotency is per inbound WhatsApp request (message id).
     return compute_request_id(
@@ -363,9 +378,73 @@ _ONE_SHOT_TOTAL_BYTES = 0
 # Track background tasks (startup loops) so exceptions are never lost.
 _BG_TASKS: set[asyncio.Task[Any]] = set()
 
-# One in-flight VIN report task per WhatsApp user.
-_WA_REPORT_TASKS: Dict[str, asyncio.Task[Any]] = {}
-_WA_REPORT_TASKS_LOCK = asyncio.Lock()
+# Per-user FIFO queue + worker so fast users can send many VINs.
+_WA_REPORT_QUEUES: Dict[str, "deque[Dict[str, Any]]"] = {}
+_WA_REPORT_WORKERS: Dict[str, asyncio.Task[Any]] = {}
+_WA_REPORT_QUEUE_LOCK = asyncio.Lock()
+
+
+async def _wa_report_worker(user_id: str) -> None:
+    while True:
+        async with _WA_REPORT_QUEUE_LOCK:
+            q = _WA_REPORT_QUEUES.get(str(user_id))
+            if not q:
+                _WA_REPORT_QUEUES.pop(str(user_id), None)
+                _WA_REPORT_WORKERS.pop(str(user_id), None)
+                return
+            job = q.popleft()
+
+        vin = str(job.get("vin") or "").strip().upper()
+        msisdn = str(job.get("msisdn") or "").strip()
+        lang = str(job.get("lang") or "ar").strip().lower() or "ar"
+        rid_for_request = str(job.get("rid") or "").strip()
+        client = job.get("client")
+        try:
+            if not client:
+                client = _build_client()
+        except Exception:
+            client = _build_client()
+
+        try:
+            with set_rid(rid_for_request or None):
+                await _wa_run_vin_report_job(
+                    user_id=str(user_id),
+                    msisdn=msisdn,
+                    vin=vin,
+                    lang=lang,
+                    client=client,
+                    rid_for_request=rid_for_request,
+                )
+        except Exception:
+            LOGGER.exception("whatsapp: queued report job crashed user=%s vin=%s", user_id, vin)
+            try:
+                refund_credit(str(user_id), rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin, "reason": "worker_exception"})
+            except Exception:
+                pass
+
+
+async def _wa_enqueue_report_job(*, user_id: str, msisdn: str, vin: str, lang: str, client: UltraMsgClient, rid_for_request: str) -> int:
+    """Enqueue a VIN for reliable sequential processing. Returns 1-based position in queue."""
+
+    async with _WA_REPORT_QUEUE_LOCK:
+        q = _WA_REPORT_QUEUES.setdefault(str(user_id), deque())
+        q.append(
+            {
+                "user_id": str(user_id),
+                "msisdn": msisdn,
+                "vin": vin,
+                "lang": lang,
+                "client": client,
+                "rid": rid_for_request,
+            }
+        )
+        pos = len(q)
+        existing = _WA_REPORT_WORKERS.get(str(user_id))
+        if existing is None or existing.done():
+            worker = asyncio.create_task(_wa_report_worker(str(user_id)))
+            _WA_REPORT_WORKERS[str(user_id)] = worker
+            _track_bg_task(worker, name=f"wa_worker:{user_id}")
+        return pos
 
 # Simple on-disk report cache to reduce user-visible failures.
 _WA_REPORT_CACHE_DIR = Path(os.getenv("WA_REPORT_CACHE_DIR", "temp_static/report_cache") or "temp_static/report_cache")
@@ -1259,10 +1338,11 @@ async def handle_incoming_whatsapp_message(
 
     # VIN detection must win over menu/language numeric parsing.
     # Users often paste VINs while still "inside" a menu state.
-    vin_in_text = _extract_first_vin(text_body)
+    vin_list = _extract_all_vins(text_body)
+    vin_in_text = vin_list[0] if vin_list else None
 
     # Normalize numeric replies like "3️⃣" -> "3" for menu/language flows.
-    numeric_token = None if vin_in_text else (_extract_numeric_token(text_body) or None)
+    numeric_token = None if vin_list else (_extract_numeric_token(text_body) or None)
 
     enriched_event = dict(event)
     enriched_event.setdefault("sender", bridge_sender)
@@ -1313,7 +1393,7 @@ async def handle_incoming_whatsapp_message(
     manual_texts: List[str] = []
     manual_send_menu = False
 
-    if state_lower == "language_choice" and not vin_in_text:
+    if state_lower == "language_choice" and not vin_list:
         LOGGER.debug("whatsapp: entering language_choice handler (state=%s, text=%s)", state_lower, text_body)
         choice = (numeric_token or "").strip()
         if choice and choice.isdigit():
@@ -1344,7 +1424,7 @@ async def handle_incoming_whatsapp_message(
             return {"status": "ok", "responses": 0, "reason": "language_ignore"}
 
     # If a VIN is present, exit any stale flow state and proceed with VIN handling.
-    if vin_in_text and state_lower:
+    if vin_list and state_lower:
         try:
             LOGGER.info("whatsapp: VIN detected; exiting active state=%s user=%s", state_lower, user_ctx.user_id)
         except Exception:
@@ -1438,7 +1518,7 @@ async def handle_incoming_whatsapp_message(
 
         # UX: If the user sends anything that's NOT a VIN and there's no active flow,
         # show the main menu instead of attempting report processing.
-        if text_body and not vin_in_text:
+        if text_body and not vin_list:
             latest_state = (_load_db().get("users", {}).get(user_ctx.user_id, {}) or {}).get("state")
             latest_state_lower = (latest_state or "").strip().lower()
             if not latest_state_lower or latest_state_lower == "main_menu":
@@ -1460,86 +1540,87 @@ async def handle_incoming_whatsapp_message(
                     await _send_bridge_menu(msisdn, user_ctx, client)
                     return {"status": "ok", "responses": 1}
 
-        # If user sent a VIN (or included one in the message), send ONE processing message (no progress spam)
-        if vin_in_text:
-            vin_clean = vin_in_text.strip().upper()
-            rid_for_request = _compute_whatsapp_rid(user_id=user_ctx.user_id, vin=vin_clean, language=user_ctx.language, request_key=msg_id)
+        # If user sent a VIN (or included one in the message), acknowledge each VIN immediately
+        # and enqueue jobs to run sequentially per user.
+        if vin_list:
+            responses_sent = 0
+            last_reason: Optional[str] = None
+            accepted: List[str] = []
 
-            # In-flight guard: do not reserve or start multiple report jobs per user.
-            async with _WA_REPORT_TASKS_LOCK:
-                existing = _WA_REPORT_TASKS.get(str(user_ctx.user_id))
-                if existing is not None and not existing.done():
-                    LOGGER.info("whatsapp: report already in-flight user=%s vin=%s", user_ctx.user_id, vin_clean)
-                    return {"status": "ok", "responses": 1, "reason": "inflight"}
+            for vin_clean in vin_list:
+                rid_for_request = _compute_whatsapp_rid(
+                    user_id=user_ctx.user_id,
+                    vin=vin_clean,
+                    language=user_ctx.language,
+                    request_key=msg_id,
+                )
 
-            # Enforce subscription/service/usage limits BEFORE reserving credit or starting jobs.
-            # Previously the WhatsApp VIN fast-path skipped limit validation, allowing reports
-            # beyond the daily/monthly limits.
-            try:
-                limit_allowed, limit_message, limit_reason = await _bridge.check_user_limits(user_ctx)
-            except Exception as exc:
-                LOGGER.warning("whatsapp: limit check failed user=%s vin=%s error=%s", user_ctx.user_id, vin_clean, exc)
-                limit_allowed, limit_message, limit_reason = True, None, None
+                # Enforce subscription/service/usage limits BEFORE reserving credit or starting jobs.
+                try:
+                    limit_allowed, limit_message, limit_reason = await _bridge.check_user_limits(user_ctx)
+                except Exception as exc:
+                    LOGGER.warning("whatsapp: limit check failed user=%s vin=%s error=%s", user_ctx.user_id, vin_clean, exc)
+                    limit_allowed, limit_message, limit_reason = True, None, None
 
-            if not limit_allowed:
-                if limit_message:
-                    await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(limit_message), client=client)
+                if not limit_allowed:
+                    if limit_message:
+                        await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(limit_message), client=client)
+                        responses_sent += 1
 
-                if limit_reason in {"daily", "monthly", "both"}:
-                    try:
-                        limit_resp = await _bridge.request_limit_increase(
-                            user_ctx,
-                            notifications=telegram_context,
-                            reason=limit_reason,
-                        )
-                        for msg in (limit_resp.messages or []):
-                            if msg:
-                                await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(str(msg)), client=client)
-                    except Exception as exc:
-                        LOGGER.warning(
-                            "whatsapp: limit increase request failed user=%s reason=%s error=%s",
-                            user_ctx.user_id,
-                            limit_reason,
-                            exc,
-                        )
+                    if limit_reason in {"daily", "monthly", "both"}:
+                        try:
+                            limit_resp = await _bridge.request_limit_increase(
+                                user_ctx,
+                                notifications=telegram_context,
+                                reason=limit_reason,
+                            )
+                            for msg in (limit_resp.messages or []):
+                                if msg:
+                                    await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(str(msg)), client=client)
+                                    responses_sent += 1
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "whatsapp: limit increase request failed user=%s reason=%s error=%s",
+                                user_ctx.user_id,
+                                limit_reason,
+                                exc,
+                            )
 
-                return {"status": "ok", "responses": 1, "reason": f"limit:{limit_reason or 'blocked'}"}
+                    last_reason = f"limit:{limit_reason or 'blocked'}"
+                    break
 
-            # Snapshot counters for the progress header; reload after reserve for accurate used counts.
-            db_snapshot = _load_db()
-            user_record = db_snapshot.get("users", {}).get(user_ctx.user_id, {}) or {}
+                # Reserve credit immediately on VIN receipt; downstream handler will commit/refund
+                try:
+                    reserve_credit(user_ctx.user_id, rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin_clean})
+                    pre_reserved_credit = True
+                    LOGGER.info("whatsapp: credit reserved on receipt for vin=%s user=%s", vin_clean, user_ctx.user_id)
+                except Exception:
+                    LOGGER.exception("whatsapp: failed to reserve credit vin=%s user=%s", vin_clean, user_ctx.user_id)
 
-            # Reserve credit immediately on VIN receipt; downstream handler will commit/refund
-            try:
-                reserve_credit(user_ctx.user_id, rid=rid_for_request, meta={"platform": "whatsapp", "vin": vin_clean})
-                pre_reserved_credit = True
-                LOGGER.info("whatsapp: credit reserved on receipt for vin=%s user=%s", vin_clean, user_ctx.user_id)
-            except Exception as exc:
-                LOGGER.exception("whatsapp: failed to reserve credit vin=%s user=%s", vin_clean, user_ctx.user_id)
+                # Send per-VIN progress header immediately.
+                db_snapshot2 = _load_db()
+                user_record2 = db_snapshot2.get("users", {}).get(user_ctx.user_id, {}) or {}
+                limits2 = user_record2.get("limits", {})
+                monthly_limit = _safe_int(limits2.get("monthly"))
+                monthly_remaining = remaining_monthly_reports(user_record2)
+                daily_limit = _safe_int(limits2.get("daily"))
+                daily_used = _safe_int(limits2.get("today_used"))
+                expiry_days = days_left(user_record2.get("expiry_date"))
 
-            db_snapshot2 = _load_db()
-            user_record2 = db_snapshot2.get("users", {}).get(user_ctx.user_id, {}) or {}
-            limits2 = user_record2.get("limits", {})
-            monthly_limit = _safe_int(limits2.get("monthly"))
-            monthly_remaining = remaining_monthly_reports(user_record2)
-            daily_limit = _safe_int(limits2.get("daily"))
-            daily_used = _safe_int(limits2.get("today_used"))
-            expiry_days = days_left(user_record2.get("expiry_date"))
+                progress_msg = _build_vin_progress_header(
+                    vin_clean,
+                    monthly_remaining=monthly_remaining,
+                    monthly_limit=monthly_limit,
+                    today_used=daily_used,
+                    daily_limit=daily_limit,
+                    days_left=expiry_days,
+                    language=user_ctx.language,
+                )
+                await send_whatsapp_text(msisdn, progress_msg, client=client)
+                responses_sent += 1
 
-            progress_msg = _build_vin_progress_header(
-                vin_clean,
-                monthly_remaining=monthly_remaining,
-                monthly_limit=monthly_limit,
-                today_used=daily_used,
-                daily_limit=daily_limit,
-                days_left=expiry_days,
-                language=user_ctx.language,
-            )
-            await send_whatsapp_text(msisdn, progress_msg, client=client)
-
-            # Dedicated background job: generate + deliver PDF, then commit/refund.
-            job = asyncio.create_task(
-                _wa_run_vin_report_job(
+                # Enqueue for sequential processing.
+                await _wa_enqueue_report_job(
                     user_id=str(user_ctx.user_id),
                     msisdn=msisdn,
                     vin=vin_clean,
@@ -1547,12 +1628,10 @@ async def handle_incoming_whatsapp_message(
                     client=client,
                     rid_for_request=rid_for_request,
                 )
-            )
-            _track_bg_task(job, name=f"wa_report:{user_ctx.user_id}:{vin_clean}")
-            async with _WA_REPORT_TASKS_LOCK:
-                _WA_REPORT_TASKS[str(user_ctx.user_id)] = job
+                accepted.append(vin_clean)
+                last_reason = "queued"
 
-            return {"status": "ok", "responses": 1, "vin": vin_clean}
+            return {"status": "ok", "responses": responses_sent, "vins": accepted, "reason": last_reason or "queued"}
 
         try:
             resp = await _bridge.handle_text(

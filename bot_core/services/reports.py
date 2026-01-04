@@ -68,7 +68,7 @@ def _empty_errors() -> List[str]:
 
 _HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 _HTTP_SESSION_LOCK = asyncio.Lock()
-_CARFAX_SEM = asyncio.Semaphore(int(os.getenv("CARFAX_MAX_CONCURRENCY", "12") or 12))
+_CARFAX_SEM = asyncio.Semaphore(int(os.getenv("CARFAX_MAX_CONCURRENCY", "6") or 6))
 
 # Upstream HTTP timeouts:
 # - fast attempt: keeps median latency low
@@ -512,7 +512,25 @@ async def generate_vin_report(
 
             try:
                 last_failure: Optional[ReportResult] = None
-                for upstream_attempt in (1, 2):
+                def _retry_delay_s(attempt: int, rr: Optional[ReportResult]) -> float:
+                    if attempt <= 1:
+                        return 0.0
+                    # Gentle backoff to ride out transient upstream edge errors (e.g., 522).
+                    base = 0.6 if attempt == 2 else 1.2
+                    try:
+                        if rr and isinstance(rr.raw_response, dict):
+                            st = rr.raw_response.get("status")
+                            if isinstance(st, int) and st in (429, 500, 502, 503, 504, 520, 521, 522, 523, 524):
+                                base = 0.8 if attempt == 2 else 1.6
+                    except Exception:
+                        pass
+                    try:
+                        # Small deterministic jitter to avoid thundering herd.
+                        return min(3.0, base + ((hash(normalized_vin) % 100) / 500.0))
+                    except Exception:
+                        return min(3.0, base)
+
+                for upstream_attempt in (1, 2, 3):
                     per_attempt_cap = _CARFAX_HTTP_TIMEOUT_FAST if upstream_attempt == 1 else _CARFAX_HTTP_TIMEOUT_SLOW
                     fetch_budget = max(0.5, min(_remaining_s(), float(per_attempt_cap)))
                     rid = get_rid() or "-"
@@ -591,6 +609,20 @@ async def generate_vin_report(
                         )
                         last_failure = failure
                         if upstream_attempt == 1 and _is_retryable_failure(failure):
+                            delay = _retry_delay_s(upstream_attempt + 1, failure)
+                            if delay > 0:
+                                try:
+                                    await asyncio.sleep(min(delay, max(0.0, _remaining_s())))
+                                except Exception:
+                                    pass
+                            continue
+                        if upstream_attempt == 2 and _is_retryable_failure(failure):
+                            delay = _retry_delay_s(upstream_attempt + 1, failure)
+                            if delay > 0:
+                                try:
+                                    await asyncio.sleep(min(delay, max(0.0, _remaining_s())))
+                                except Exception:
+                                    pass
                             continue
                         return failure
 
@@ -639,6 +671,20 @@ async def generate_vin_report(
                         )
                         last_failure = failure
                         if upstream_attempt == 1 and _is_retryable_failure(failure):
+                            delay = _retry_delay_s(upstream_attempt + 1, failure)
+                            if delay > 0:
+                                try:
+                                    await asyncio.sleep(min(delay, max(0.0, _remaining_s())))
+                                except Exception:
+                                    pass
+                            continue
+                        if upstream_attempt == 2 and _is_retryable_failure(failure):
+                            delay = _retry_delay_s(upstream_attempt + 1, failure)
+                            if delay > 0:
+                                try:
+                                    await asyncio.sleep(min(delay, max(0.0, _remaining_s())))
+                                except Exception:
+                                    pass
                             continue
                         return failure
 
@@ -669,6 +715,20 @@ async def generate_vin_report(
                         )
                         last_failure = failure
                         if upstream_attempt == 1 and _is_retryable_failure(failure):
+                            delay = _retry_delay_s(upstream_attempt + 1, failure)
+                            if delay > 0:
+                                try:
+                                    await asyncio.sleep(min(delay, max(0.0, _remaining_s())))
+                                except Exception:
+                                    pass
+                            continue
+                        if upstream_attempt == 2 and _is_retryable_failure(failure):
+                            delay = _retry_delay_s(upstream_attempt + 1, failure)
+                            if delay > 0:
+                                try:
+                                    await asyncio.sleep(min(delay, max(0.0, _remaining_s())))
+                                except Exception:
+                                    pass
                             continue
                         return failure
 
@@ -828,6 +888,20 @@ async def generate_vin_report(
                         )
                         last_failure = failure
                         if upstream_attempt == 1 and _is_retryable_failure(failure):
+                            delay = _retry_delay_s(upstream_attempt + 1, failure)
+                            if delay > 0:
+                                try:
+                                    await asyncio.sleep(min(delay, max(0.0, _remaining_s())))
+                                except Exception:
+                                    pass
+                            continue
+                        if upstream_attempt == 2 and _is_retryable_failure(failure):
+                            delay = _retry_delay_s(upstream_attempt + 1, failure)
+                            if delay > 0:
+                                try:
+                                    await asyncio.sleep(min(delay, max(0.0, _remaining_s())))
+                                except Exception:
+                                    pass
                             continue
                         return failure
 
@@ -972,7 +1046,16 @@ async def _call_carfax_api(
                         txt = body.decode("utf-8", errors="ignore")
                     except Exception:
                         txt = ""
-                    return {"ok": False, "status": status, "ctype": ctype, "err_text": txt, "final_url": final_url, "sha256": sha256, "_dv_path": "non_200"}
+                    return {
+                        "ok": False,
+                        "error": f"http_{status}",
+                        "status": status,
+                        "ctype": ctype,
+                        "err_text": txt,
+                        "final_url": final_url,
+                        "sha256": sha256,
+                        "_dv_path": "non_200",
+                    }
 
                 # NOTE: We do not validate PDF headers or content.
                 if "application/pdf" in ctype and body:

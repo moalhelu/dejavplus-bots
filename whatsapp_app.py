@@ -912,6 +912,17 @@ def _extract_numeric_token(text: str) -> Optional[str]:
     return None
 
 
+def _report_options_prompt(language: Optional[str]) -> str:
+    """Legacy helper kept for backward compatibility.
+
+    This prompt used to be part of an older WhatsApp UX. It's now only referenced
+    for dedup/suppression logic; returning an empty string is sufficient and
+    prevents crashes on deployments that still hit this path.
+    """
+
+    return ""
+
+
 def _update_user_state(user_id: str, state: Optional[str]) -> None:
     db = _load_db()
     _ensure_user(db, user_id, None)

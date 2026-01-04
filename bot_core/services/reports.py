@@ -221,17 +221,32 @@ def _looks_like_error_or_login_page(html: str) -> bool:
     head = raw.lstrip()[:20_000]
 
     # Strong blockers / bot protections (scan entire doc).
-    strong_markers = (
+    # Keep this list *tight* to avoid false positives on valid VHR pages.
+    hard_blockers = (
         "cloudflare",
         "captcha",
         "attention required",
         "access denied",
         "request blocked",
-        "uh-oh!",
-        "window sticker",
-        "we have a problem with your window sticker",
     )
-    if any(m in raw for m in strong_markers):
+    if any(m in raw for m in hard_blockers):
+        return True
+
+    # Allowlist: common valid Carfax VHR pages.
+    # If the title/helmet indicates a vehicle history report, do not reject the page
+    # just because it contains generic words like "window sticker" somewhere.
+    if "carfax vehicle history" in head or "vehicle history report" in head:
+        # But still reject the known window-sticker failure page.
+        if "we have a problem with your window sticker" in raw or "problem with your window sticker" in raw:
+            return True
+        return False
+
+    # Carfax-specific failure pages (seen in production as PDFs).
+    carfax_fail_markers = (
+        "we have a problem with your window sticker",
+        "problem with your window sticker",
+    )
+    if any(m in raw for m in carfax_fail_markers):
         return True
 
     # Service/status style failures (scan only head).

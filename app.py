@@ -99,6 +99,95 @@ LANG_BUTTON_TEXTS = tuple(info["label"] for info in REPORT_LANG_INFO.values())
 RTL_REPORT_LANGS = {"ar", "ku", "ckb"}
 
 
+WA_POST_ACTIVATION_NOTICE_V1 = (
+    "📢 إشعار من الإدارة\n\n"
+    "🔔 تنويه لمستخدمي بوت واتساب\n\n"
+    "لتغيير لغة التقارير داخل البوت،\n"
+    "يرجى إرسال رقم 3 الى البوت\n"
+    "ثم رقم اللغة فقط بدون أي نص إضافي،\n"
+    "وكل رقم يكون برسالة منفصلة.\n\n"
+    "🌐 اللغات المتاحة:\n"
+    "1️⃣ عربي\n"
+    "2️⃣ انجليزي\n"
+    "3️⃣ كوردی\n\n"
+    "⚠️ ملاحظة مهمة:\n"
+    "أرسل رقم واحد فقط\n"
+    "بدون كتابة أي كلام\n"
+    "برسالة مستقلة"
+)
+
+
+TG_POST_ACTIVATION_NOTICE_V1 = (
+    "📢 <b>إشعار من الإدارة</b>\n\n"
+    "🔔 تنويه لمستخدمي بوت تيليغرام\n\n"
+    "لتغيير لغة التقارير داخل البوت:\n"
+    "افتح القائمة الرئيسية ثم اضغط على زر <b>🌐 اللغة</b>، وبعدها اختر اللغة.\n\n"
+    "🌐 اللغات المتاحة:\n"
+    "• عربي\n"
+    "• English\n"
+    "• كوردی"
+)
+
+
+def _activation_request_info(db: Dict[str, Any], target_tg: str, user: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[str]]:
+    phone = None
+    platform = None
+    try:
+        for req in db.get("activation_requests", []) or []:
+            if str(req.get("tg_id")) == str(target_tg):
+                phone = req.get("phone") or None
+                platform = req.get("platform") or None
+                break
+    except Exception:
+        pass
+    if not phone and isinstance(user, dict):
+        phone = user.get("phone") or None
+    return phone, platform
+
+
+def _is_probable_whatsapp_user(*, target_tg: str, user: Dict[str, Any], platform: Optional[str], phone: Optional[str]) -> bool:
+    if (platform or "").strip().lower() == "whatsapp":
+        return True
+    if not phone:
+        return False
+    phone_digits = str(phone).strip().lstrip("+")
+    # WhatsApp-only users use tg_id == phone digits (country code + number).
+    if str(target_tg).strip() == phone_digits and len(phone_digits) > 10 and not (user.get("tg_username") or "").strip():
+        return True
+    return False
+
+
+async def _post_activation_admin_notice_if_needed(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    db: Dict[str, Any],
+    user: Dict[str, Any],
+    target_tg: str,
+    first_activation: bool,
+    is_whatsapp: bool,
+) -> None:
+    if not first_activation:
+        return
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    notices = user.setdefault("notices", {})
+
+    if is_whatsapp:
+        if notices.get("wa_post_activation_notice_v1"):
+            return
+        ok = await _notify_user(context, target_tg, WA_POST_ACTIVATION_NOTICE_V1, preferred_channel="wa")
+        if ok:
+            notices["wa_post_activation_notice_v1"] = today_str
+            _save_db(db)
+        return
+
+    if notices.get("tg_post_activation_notice_v1"):
+        return
+    ok = await _notify_user(context, target_tg, TG_POST_ACTIVATION_NOTICE_V1, preferred_channel="tg")
+    if ok:
+        notices["tg_post_activation_notice_v1"] = today_str
+        _save_db(db)
+
+
 def _is_upstream_unauthorized_result(rr: Optional["_ReportResult"]) -> bool:
     if not rr:
         return False
@@ -2558,6 +2647,10 @@ async def pending_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # اشتراك شهري
     if action == "monthly":
+        first_activation = not bool(u.get("activation_date"))
+        phone, platform = _activation_request_info(db, target_tg, u)
+        is_whatsapp = _is_probable_whatsapp_user(target_tg=target_tg, user=u, platform=platform, phone=phone)
+
         _remove_pending_request(db, target_tg)
         preset = _resolve_activation_preset(db, "monthly")
         days = preset["days"]
@@ -2579,17 +2672,25 @@ async def pending_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
         if not u.get("activation_date"):
             u["activation_date"] = today.strftime("%Y-%m-%d")
+        if first_activation:
+            _set_user_report_lang(u, "en")
         _audit(u, admin_tg, "monthly_activate_from_pending", add_days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
         _save_db(db)
-        await _notify_user(
+
+        activation_msg = (
+            f"🟢 تم تفعيل اشتراكك لمدة <b>{days}</b> يوم.\n"
+            f"• حد يومي: <b>{daily_limit}</b> تقرير\n"
+            f"• حد شهري: <b>{monthly_limit}</b> تقرير\n"
+            f"• تاريخ الانتهاء: <code>{u['expiry_date']}</code>"
+        )
+        await _notify_user(context, target_tg, activation_msg, preferred_channel=("wa" if is_whatsapp else "tg"))
+        await _post_activation_admin_notice_if_needed(
             context,
-            target_tg,
-            (
-                f"🟢 تم تفعيل اشتراكك لمدة <b>{days}</b> يوم.\n"
-                f"• حد يومي: <b>{daily_limit}</b> تقرير\n"
-                f"• حد شهري: <b>{monthly_limit}</b> تقرير\n"
-                f"• تاريخ الانتهاء: <code>{u['expiry_date']}</code>"
-            ),
+            db=db,
+            user=u,
+            target_tg=target_tg,
+            first_activation=first_activation,
+            is_whatsapp=is_whatsapp,
         )
         await _notify_supers(
             context,
@@ -2602,6 +2703,10 @@ async def pending_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # تجربة مجانية
     if action == "trial":
+        first_activation = not bool(u.get("activation_date"))
+        phone, platform = _activation_request_info(db, target_tg, u)
+        is_whatsapp = _is_probable_whatsapp_user(target_tg=target_tg, user=u, platform=platform, phone=phone)
+
         _remove_pending_request(db, target_tg)
         preset = _resolve_activation_preset(db, "trial")
         days = preset["days"]
@@ -2613,17 +2718,25 @@ async def pending_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u["activation_date"] = today.strftime("%Y-%m-%d")
         u["expiry_date"] = (today + timedelta(days=days)).strftime("%Y-%m-%d")
         _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
+        if first_activation:
+            _set_user_report_lang(u, "en")
         _audit(u, admin_tg, "trial_activate", days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
         _save_db(db)
-        await _notify_user(
+
+        activation_msg = (
+            f"🧪 تم تفعيل تجربة لمدة <b>{days}</b> يوم.\n"
+            f"• الحد الأقصى اليومي: <b>{daily_limit}</b> تقرير\n"
+            f"• الحد الشهري: <b>{monthly_limit}</b> تقرير\n"
+            f"• ينتهي في: <code>{u['expiry_date']}</code>"
+        )
+        await _notify_user(context, target_tg, activation_msg, preferred_channel=("wa" if is_whatsapp else "tg"))
+        await _post_activation_admin_notice_if_needed(
             context,
-            target_tg,
-            (
-                f"🧪 تم تفعيل تجربة لمدة <b>{days}</b> يوم.\n"
-                f"• الحد الأقصى اليومي: <b>{daily_limit}</b> تقرير\n"
-                f"• الحد الشهري: <b>{monthly_limit}</b> تقرير\n"
-                f"• ينتهي في: <code>{u['expiry_date']}</code>"
-            ),
+            db=db,
+            user=u,
+            target_tg=target_tg,
+            first_activation=first_activation,
+            is_whatsapp=is_whatsapp,
         )
         await _notify_supers(
             context,
@@ -3518,6 +3631,10 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await _render_usercard(update, context, target_tg)
 
         if action == "monthly":
+            first_activation = not bool(u.get("activation_date"))
+            phone, platform = _activation_request_info(db, target_tg, u)
+            is_whatsapp = _is_probable_whatsapp_user(target_tg=target_tg, user=u, platform=platform, phone=phone)
+
             preset = _resolve_activation_preset(db, "monthly")
             days = preset["days"]
             daily_limit = preset["daily"]
@@ -3538,18 +3655,26 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
             if not u.get("activation_date"):
                 u["activation_date"] = today.strftime("%Y-%m-%d")
+            if first_activation:
+                _set_user_report_lang(u, "en")
             _audit(u, admin_tg, "monthly_activate", add_days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _remove_pending_request(db, target_tg)
             _save_db(db)
-            await _notify_user(
+
+            activation_msg = (
+                f"🟢 تم تفعيل اشتراك لمدة <b>{days}</b> يوم.\n"
+                f"• حد يومي: <b>{daily_limit}</b> تقرير\n"
+                f"• حد شهري: <b>{monthly_limit}</b> تقرير\n"
+                f"• تاريخ الانتهاء: <code>{u['expiry_date']}</code>"
+            )
+            await _notify_user(context, target_tg, activation_msg, preferred_channel=("wa" if is_whatsapp else "tg"))
+            await _post_activation_admin_notice_if_needed(
                 context,
-                target_tg,
-                (
-                    f"🟢 تم تفعيل اشتراك لمدة <b>{days}</b> يوم.\n"
-                    f"• حد يومي: <b>{daily_limit}</b> تقرير\n"
-                    f"• حد شهري: <b>{monthly_limit}</b> تقرير\n"
-                    f"• تاريخ الانتهاء: <code>{u['expiry_date']}</code>"
-                ),
+                db=db,
+                user=u,
+                target_tg=target_tg,
+                first_activation=first_activation,
+                is_whatsapp=is_whatsapp,
             )
             await _notify_supers(
                 context,
@@ -3558,6 +3683,10 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await _render_usercard(update, context, target_tg)
 
         if action == "trial":
+            first_activation = not bool(u.get("activation_date"))
+            phone, platform = _activation_request_info(db, target_tg, u)
+            is_whatsapp = _is_probable_whatsapp_user(target_tg=target_tg, user=u, platform=platform, phone=phone)
+
             preset = _resolve_activation_preset(db, "trial")
             days = preset["days"]
             daily_limit = preset["daily"]
@@ -3568,18 +3697,26 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["activation_date"] = today.strftime("%Y-%m-%d")
             u["expiry_date"] = (today + timedelta(days=days)).strftime("%Y-%m-%d")
             _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
+            if first_activation:
+                _set_user_report_lang(u, "en")
             _audit(u, admin_tg, "trial_activate", days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _remove_pending_request(db, target_tg)
             _save_db(db)
-            await _notify_user(
+
+            activation_msg = (
+                f"🧪 تم تفعيل تجربة لمدة <b>{days}</b> يوم.\n"
+                f"• الحد اليومي: <b>{daily_limit}</b> تقرير\n"
+                f"• الحد الشهري: <b>{monthly_limit}</b> تقرير\n"
+                f"• ينتهي في: <code>{u['expiry_date']}</code>"
+            )
+            await _notify_user(context, target_tg, activation_msg, preferred_channel=("wa" if is_whatsapp else "tg"))
+            await _post_activation_admin_notice_if_needed(
                 context,
-                target_tg,
-                (
-                    f"🧪 تم تفعيل تجربة لمدة <b>{days}</b> يوم.\n"
-                    f"• الحد اليومي: <b>{daily_limit}</b> تقرير\n"
-                    f"• الحد الشهري: <b>{monthly_limit}</b> تقرير\n"
-                    f"• ينتهي في: <code>{u['expiry_date']}</code>"
-                ),
+                db=db,
+                user=u,
+                target_tg=target_tg,
+                first_activation=first_activation,
+                is_whatsapp=is_whatsapp,
             )
             await _notify_supers(
                 context,
@@ -3588,26 +3725,39 @@ async def usercard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await _render_usercard(update, context, target_tg)
 
         if action == "enable30":
+            first_activation = not bool(u.get("activation_date"))
+            phone, platform = _activation_request_info(db, target_tg, u)
+            is_whatsapp = _is_probable_whatsapp_user(target_tg=target_tg, user=u, platform=platform, phone=phone)
+
             preset = _resolve_activation_preset(db, "monthly")
             days = preset["days"]
             daily_limit = preset["daily"]
             monthly_limit = preset["monthly"]
             u["is_active"] = True
-            u["activation_date"] = datetime.utcnow().strftime("%Y-%m-%d")
+            if not u.get("activation_date"):
+                u["activation_date"] = datetime.utcnow().strftime("%Y-%m-%d")
             u["expiry_date"] = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
             _set_user_limits(u, daily_limit=daily_limit, monthly_limit=monthly_limit)
+            if first_activation:
+                _set_user_report_lang(u, "en")
             _audit(u, admin_tg, "enable30", days=days, daily_limit=daily_limit, monthly_limit=monthly_limit)
             _remove_pending_request(db, target_tg)
             _save_db(db)
-            await _notify_user(
+
+            activation_msg = (
+                f"✅ تم تفعيل حسابك لمدة <b>{days}</b> يوم.\n"
+                f"• حد يومي: <b>{daily_limit}</b> تقرير\n"
+                f"• حد شهري: <b>{monthly_limit}</b> تقرير\n"
+                f"• تاريخ الانتهاء: <code>{u['expiry_date']}</code>"
+            )
+            await _notify_user(context, target_tg, activation_msg, preferred_channel=("wa" if is_whatsapp else "tg"))
+            await _post_activation_admin_notice_if_needed(
                 context,
-                target_tg,
-                (
-                    f"✅ تم تفعيل حسابك لمدة <b>{days}</b> يوم.\n"
-                    f"• حد يومي: <b>{daily_limit}</b> تقرير\n"
-                    f"• حد شهري: <b>{monthly_limit}</b> تقرير\n"
-                    f"• تاريخ الانتهاء: <code>{u['expiry_date']}</code>"
-                ),
+                db=db,
+                user=u,
+                target_tg=target_tg,
+                first_activation=first_activation,
+                is_whatsapp=is_whatsapp,
             )
             await _notify_supers(
                 context,
@@ -4720,6 +4870,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if op == "activate_custom":
             try:
+                first_activation = not bool(u.get("activation_date"))
                 raw_parts = [p.strip() for p in txt.split(",")]
                 parts = [p for p in raw_parts if p]
                 add_bal = 0
@@ -4745,6 +4896,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 extra_reports = max(0, add_bal)
                 effective_monthly = monthly_limit + extra_reports
                 _set_user_limits(u, daily_limit=daily_limit, monthly_limit=effective_monthly)
+                if first_activation:
+                    _set_user_report_lang(u, "en")
                 _audit(
                     u,
                     tg_id,
@@ -4762,16 +4915,24 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if extra_reports
                     else ""
                 )
-                await _notify_user(
+
+                phone, platform = _activation_request_info(db, target, u)
+                is_whatsapp = _is_probable_whatsapp_user(target_tg=target, user=u, platform=platform, phone=phone)
+                activation_msg = (
+                    f"✅ تفعيل {days} يوم.\n"
+                    f"• حد يومي: <b>{daily_limit}</b> تقرير\n"
+                    f"• حد شهري: <b>{effective_monthly}</b> تقرير\n"
+                    f"• الانتهاء: <code>{u['expiry_date']}</code>"
+                    + bonus_line
+                )
+                await _notify_user(context, target, activation_msg, preferred_channel=("wa" if is_whatsapp else "tg"))
+                await _post_activation_admin_notice_if_needed(
                     context,
-                    target,
-                    (
-                        f"✅ تفعيل {days} يوم.\n"
-                        f"• حد يومي: <b>{daily_limit}</b> تقرير\n"
-                        f"• حد شهري: <b>{effective_monthly}</b> تقرير\n"
-                        f"• الانتهاء: <code>{u['expiry_date']}</code>"
-                        + bonus_line
-                    ),
+                    db=db,
+                    user=u,
+                    target_tg=target,
+                    first_activation=first_activation,
+                    is_whatsapp=is_whatsapp,
                 )
                 await _notify_supers(context, f"✅ (Admin:{tg_id}) تفعيل مخصّص للمستخدم {_fmt_tg_with_phone(target)}.")
                 context.user_data["await"] = None

@@ -227,6 +227,9 @@ def _looks_like_error_or_login_page(html: str) -> bool:
         "attention required",
         "access denied",
         "request blocked",
+        "uh-oh!",
+        "window sticker",
+        "we have a problem with your window sticker",
     )
     if any(m in raw for m in strong_markers):
         return True
@@ -268,16 +271,22 @@ def _extract_safe_viewer_url(json_payload: Any, html_candidate: Optional[str]) -
         if not host or (host != "carfax.com" and not host.endswith(".carfax.com")):
             return False
         path = (parsed.path or "").lower()
+        # Explicitly reject window-sticker flows (they often return a sticker error page).
+        if "sticker" in path or "window" in path:
+            if "sticker" in path:
+                return False
+        q = (parsed.query or "").lower()
+        if "window" in q and "sticker" in q:
+            return False
         # Avoid obvious non-document assets.
         if any(path.endswith(ext) for ext in (".js", ".css", ".json", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2", ".ttf")):
             return False
-        # Prefer URLs that look like report pages.
-        if any(tok in path for tok in ("vhr", "vehicle", "history", "report")):
+        # Only accept URLs that clearly look like report pages.
+        # (Previously we accepted almost any non-asset path, which could pick unrelated Carfax pages.)
+        tokens = ("vhr", "vehicle", "history", "report")
+        if any(tok in path for tok in tokens) or any(tok in q for tok in tokens):
             return True
-        # If it's a very short/empty path, it is unlikely to be the viewer.
-        if path in {"", "/"}:
-            return False
-        return True
+        return False
 
     # 1) Try common keys in JSON (including nested locations).
     common_keys = {
@@ -738,6 +747,24 @@ async def generate_vin_report(
                     except Exception:
                         viewer_url = None
 
+                    async def _viewer_url_looks_usable(u: Optional[str]) -> bool:
+                        if not u:
+                            return False
+                        try:
+                            # Lightweight validation: fetch a fast DOM snapshot and reject known error pages.
+                            html_probe = await fetch_page_html_chromium(
+                                u,
+                                wait_until="domcontentloaded",
+                                timeout_ms=2500,
+                                acquire_timeout_ms=2500,
+                                block_resource_types={"image", "media", "font"},
+                            )
+                            if not isinstance(html_probe, str) or not html_probe.strip():
+                                return False
+                            return not _looks_like_error_or_login_page(html_probe)
+                        except Exception:
+                            return False
+
                     # If the upstream htmlContent is a JS bootstrap, translation can produce weak results
                     # (or even break) because the content isn't present yet.
                     # For non-English requests, prefer a quick Chromium fetch of the fully-rendered HTML
@@ -815,6 +842,9 @@ async def generate_vin_report(
                         # Keep English-only to avoid changing translation behavior.
                         if requested_lang == "en" and isinstance(viewer_url, str) and viewer_url:
                             try:
+                                if not await _viewer_url_looks_usable(viewer_url):
+                                    viewer_url = None
+                                    raise RuntimeError("viewer_url_invalid")
                                 url_budget_ms = max(1_500, min(12_000, int(render_budget_ms * 0.5)))
                                 pdf_url = await html_to_pdf_bytes_chromium(
                                     url=viewer_url,

@@ -2495,15 +2495,62 @@ async def pending_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = _load_db()
     u = _ensure_user(db, target_tg, None) if target_tg else None
 
+    if action == "list":
+        # Return to pending list
+        return await q.edit_message_text(
+            _bridge.t("pending.list.title", lang),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pending_keyboard(db),
+        )
+
     if action == "phone" and target_tg:
         phone = None
+        platform = None
         for req in db.get("activation_requests", []):
             if str(req.get("tg_id")) == target_tg:
                 phone = req.get("phone")
+                platform = req.get("platform")
                 break
         phone = phone or (u.get("phone") if u else None) or "—"
-        await q.answer(f"📞 {phone}", show_alert=True)
-        return
+        platform_label = (platform or "unknown").upper()
+
+        preset_trial = _resolve_activation_preset(db, "trial")
+        preset_monthly = _resolve_activation_preset(db, "monthly")
+
+        card_text = (
+            "🛂 <b>بطاقة طلب التفعيل</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"• المستخدم: <code>{escape(str(target_tg))}</code>\n"
+            f"• الرقم: <code>{escape(str(phone))}</code>\n"
+            f"• المنصة: <b>{escape(platform_label)}</b>\n\n"
+            "اختر نوع التفعيل:\n"
+        )
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    f"🧪 تجربة {preset_trial['days']} يوم — {preset_trial['daily']}/{preset_trial['monthly']}",
+                    callback_data=f"pending:trial:{target_tg}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"🟢 شهري {preset_monthly['days']} يوم — {preset_monthly['daily']}/{preset_monthly['monthly']}",
+                    callback_data=f"pending:monthly:{target_tg}",
+                )
+            ],
+            [
+                InlineKeyboardButton("🧾 تفعيل مخصّص", callback_data=f"pending:activate_custom:{target_tg}"),
+                InlineKeyboardButton("🔎 فتح البطاقة", callback_data=f"pending:open:{target_tg}"),
+            ],
+            [
+                InlineKeyboardButton("⛔ رفض", callback_data=f"pending:deny:{target_tg}"),
+                InlineKeyboardButton("↩️ رجوع", callback_data="pending:list"),
+            ],
+            [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu:show")],
+        ])
+
+        return await q.edit_message_text(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
     # فتح بطاقة
     if action == "open" and target_tg:
@@ -4335,8 +4382,73 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # سوبر أدمن يرسل رقم هاتف/معرّف -> افتح البطاقة مباشرة
+    # سوبر أدمن: إدخال رقم يبدأ بـ + (واتساب) لإنشاء/فتح بطاقة تفعيل مباشرة
     if _is_super_admin(tg_id):
+        normalized_input = (txt or "").strip().replace(" ", "").replace("-", "")
+        if normalized_input.startswith("00") and normalized_input[2:].isdigit():
+            normalized_input = f"+{normalized_input[2:]}"
+
+        wa_phone = _normalize_phone(normalized_input, None)
+        if wa_phone:
+            target_tg = wa_phone.lstrip("+")
+            db_admin = _load_db()
+            target_user = _ensure_user(db_admin, target_tg, None)
+            target_user["phone"] = wa_phone
+
+            pending = db_admin.setdefault("activation_requests", [])
+            existing_req = next((r for r in pending if str(r.get("tg_id")) == str(target_tg)), None)
+            if existing_req:
+                existing_req["phone"] = wa_phone
+                existing_req["platform"] = existing_req.get("platform") or "whatsapp"
+                existing_req["ts"] = _now_str()
+                created = False
+            else:
+                pending.append({"tg_id": str(target_tg), "ts": _now_str(), "phone": wa_phone, "platform": "whatsapp"})
+                created = True
+
+            _save_db(db_admin)
+
+            preset_trial = _resolve_activation_preset(db_admin, "trial")
+            preset_monthly = _resolve_activation_preset(db_admin, "monthly")
+
+            info_lines = [
+                "🛂 <b>طلب تفعيل (واتساب)</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"📞 الرقم: <code>{escape(wa_phone)}</code>",
+            ]
+            if created:
+                info_lines.append("✅ تم إنشاء طلب تفعيل لهذا الرقم.")
+            info_lines.append("\nاختر نوع التفعيل:")
+            card_text = "\n".join(info_lines)
+
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        f"🧪 تجربة {preset_trial['days']} يوم — {preset_trial['daily']}/{preset_trial['monthly']}",
+                        callback_data=f"pending:trial:{target_tg}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"🟢 شهري {preset_monthly['days']} يوم — {preset_monthly['daily']}/{preset_monthly['monthly']}",
+                        callback_data=f"pending:monthly:{target_tg}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton("🧾 تفعيل مخصّص", callback_data=f"pending:activate_custom:{target_tg}"),
+                    InlineKeyboardButton("🔎 فتح البطاقة", callback_data=f"pending:open:{target_tg}"),
+                ],
+                [
+                    InlineKeyboardButton("⛔ رفض", callback_data=f"pending:deny:{target_tg}"),
+                    InlineKeyboardButton("📝 قائمة المنتظرين", callback_data="pending:list"),
+                ],
+                [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu:show")],
+            ])
+
+            await _panel_message(update, context, card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+
+        # fallback: فتح بطاقة مستخدم موجود عبر رقم/معرّف (بدون إنشاء طلب)
         phone_candidate = re.sub(r"[^\d+]", "", txt)
         if phone_candidate and len(phone_candidate) >= 6:
             db_lookup = _load_db()

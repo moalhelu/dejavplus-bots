@@ -69,8 +69,15 @@ def _empty_errors() -> List[str]:
 _HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 _HTTP_SESSION_LOCK = asyncio.Lock()
 _CARFAX_SEM = asyncio.Semaphore(int(os.getenv("CARFAX_MAX_CONCURRENCY", "12") or 12))
-_CARFAX_TIMEOUT = float(os.getenv("CARFAX_HTTP_TIMEOUT", "8") or 8)
-_CARFAX_TIMEOUT = max(1.0, min(_CARFAX_TIMEOUT, 10.0))
+
+# Upstream HTTP timeouts:
+# - fast attempt: keeps median latency low
+# - slow retry: recovers from occasional upstream slowness without instant refunds
+_CARFAX_HTTP_TIMEOUT_FAST = float(os.getenv("CARFAX_HTTP_TIMEOUT_FAST", os.getenv("CARFAX_HTTP_TIMEOUT", "8") or 8) or 8)
+_CARFAX_HTTP_TIMEOUT_FAST = max(1.0, min(_CARFAX_HTTP_TIMEOUT_FAST, 15.0))
+
+_CARFAX_HTTP_TIMEOUT_SLOW = float(os.getenv("CARFAX_HTTP_TIMEOUT_SLOW", "22") or 22)
+_CARFAX_HTTP_TIMEOUT_SLOW = max(_CARFAX_HTTP_TIMEOUT_FAST, min(_CARFAX_HTTP_TIMEOUT_SLOW, 45.0))
 
 # Total wall-clock budget for generating a report end-to-end.
 # 10s is too tight in real-world conditions (translation + Chromium render), and can cause
@@ -152,10 +159,8 @@ async def _get_http_session() -> aiohttp.ClientSession:
         if _HTTP_SESSION and not _HTTP_SESSION.closed:
             return _HTTP_SESSION
         connector = aiohttp.TCPConnector(limit=50, limit_per_host=0, enable_cleanup_closed=True, ttl_dns_cache=60)
-        _HTTP_SESSION = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=_CARFAX_TIMEOUT),
-            connector=connector,
-        )
+        # Use a permissive session timeout; we pass per-request timeouts for each attempt.
+        _HTTP_SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_CARFAX_HTTP_TIMEOUT_SLOW), connector=connector)
         return _HTTP_SESSION
 
 
@@ -508,7 +513,8 @@ async def generate_vin_report(
             try:
                 last_failure: Optional[ReportResult] = None
                 for upstream_attempt in (1, 2):
-                    fetch_budget = max(0.5, min(_remaining_s(), float(_CARFAX_TIMEOUT)))
+                    per_attempt_cap = _CARFAX_HTTP_TIMEOUT_FAST if upstream_attempt == 1 else _CARFAX_HTTP_TIMEOUT_SLOW
+                    fetch_budget = max(0.5, min(_remaining_s(), float(per_attempt_cap)))
                     rid = get_rid() or "-"
 
                     async with atimed(
@@ -909,17 +915,20 @@ async def _call_carfax_api(
 
     # Cap request time budget (best-effort) so end-to-end report stays fast.
     try:
-        budget = float(total_timeout_s) if total_timeout_s is not None else float(_CARFAX_TIMEOUT)
+        budget = float(total_timeout_s) if total_timeout_s is not None else float(_CARFAX_HTTP_TIMEOUT_FAST)
     except Exception:
-        budget = float(_CARFAX_TIMEOUT)
-    budget = max(0.5, min(budget, float(_CARFAX_TIMEOUT)))
+        budget = float(_CARFAX_HTTP_TIMEOUT_FAST)
+    # Allow the caller to request a longer budget (slow retry), but keep an absolute cap.
+    budget = max(0.5, min(budget, float(_CARFAX_HTTP_TIMEOUT_SLOW)))
     if deadline is not None:
         # Leave a small headroom so downstream stages can still run.
         rem = max(0.0, float(deadline) - time.perf_counter())
         budget = min(budget, max(0.5, rem - 0.25))
         if budget <= 0.55:
             return {"ok": False, "error": "deadline_exceeded"}
-    request_timeout = aiohttp.ClientTimeout(total=budget)
+    # Defensive: keep connection establishment bounded so we don't burn the whole budget on a dead socket.
+    connect_s = min(3.0, max(0.5, budget))
+    request_timeout = aiohttp.ClientTimeout(total=budget, connect=connect_s, sock_read=budget)
 
     url = _carfax_url(vin, ts_ms=(int(time.time() * 1000) if force_fresh else None))
 
@@ -989,9 +998,17 @@ async def _call_carfax_api(
                 return {"ok": True, "text": body.decode("utf-8", errors="ignore"), "status": status, "final_url": final_url, "ctype": ctype, "sha256": sha256, "_dv_path": f"html_or_text_{status}"}
 
     except asyncio.TimeoutError:
-        return {"ok": False, "error": "timeout", "_dv_path": "timeout"}
+        return {"ok": False, "error": "timeout", "status": 0, "ctype": "", "final_url": "", "_dv_path": "timeout"}
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "_dv_path": "exception"}
+        return {
+            "ok": False,
+            "error": str(exc),
+            "exc_type": type(exc).__name__,
+            "status": 0,
+            "ctype": "",
+            "final_url": "",
+            "_dv_path": "exception",
+        }
     finally:
         if acquired:
             try:
@@ -1593,7 +1610,7 @@ async def _fetch_page_html_http_only(url: str) -> Optional[str]:
     session = await _get_http_session()
     # Keep this relatively small so it can be a fast path.
     timeout_s = float(os.getenv("CARFAX_HTML_HTTP_TIMEOUT", "6") or 6)
-    timeout_s = max(2.0, min(timeout_s, float(_CARFAX_TIMEOUT)))
+    timeout_s = max(2.0, min(timeout_s, float(_CARFAX_HTTP_TIMEOUT_SLOW)))
     async with session.get(url, timeout=timeout_s) as resp:
         ctype = (resp.headers.get("Content-Type", "") or "").lower()
         if resp.status in (200, 201) and "text/html" in ctype:

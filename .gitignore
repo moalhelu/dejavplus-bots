@@ -8,6 +8,9 @@ __pycache__/
 db.json
 backups/db-*.json
 
+# Ignore local DB merge scratch files
+tools/db_merge/*.json
+
 # Ignore misc logs
 pdf_errors.log
 

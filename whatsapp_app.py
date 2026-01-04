@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -61,6 +62,31 @@ load_dotenv(override=True)
 configure_logging()
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _code_version() -> str:
+    """Best-effort code version for log/debugging."""
+
+    for key in ("BOT_VERSION", "BOT_CODE_VERSION", "GIT_SHA", "RENDER_GIT_COMMIT"):
+        val = os.getenv(key)
+        if val and str(val).strip():
+            return str(val).strip()
+    try:
+        repo_root = Path(__file__).resolve().parent
+        if (repo_root / ".git").exists():
+            out = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(repo_root),
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+            sha = (out or "").strip()
+            if sha:
+                return sha
+    except Exception:
+        pass
+    return "unknown"
 
 # Deduplicate inbound webhooks (providers can retry). Keep a bounded TTL cache.
 _WA_SEEN_MSGS: "OrderedDict[str, float]" = OrderedDict()
@@ -1313,6 +1339,21 @@ async def handle_incoming_whatsapp_message(
         await _send_bridge_menu(msisdn, user_ctx, client)
         return {"status": "ok", "responses": 1}
 
+    # Final guard: if user is at the main menu and sends a numeric token,
+    # never route it into report processing.
+    if (
+        not language_choice_handled
+        and not menu_selection_text
+        and not button_id
+        and numeric_token
+        and numeric_token.isdigit()
+        and (state_lower in {None, "", "main_menu"})
+    ):
+        LOGGER.info("whatsapp: numeric menu token '%s' did not resolve; re-sending menu", numeric_token)
+        _update_user_state(user_ctx.user_id, None)
+        await _send_bridge_menu(msisdn, user_ctx, client)
+        return {"status": "ok", "responses": 1, "reason": "menu_rerender"}
+
     if menu_selection_text:
         selection_msg = _bridge.IncomingMessage(
             platform="whatsapp",
@@ -2330,6 +2371,7 @@ def run() -> None:
         WHATSAPP_PORT,
         ULTRAMSG_INSTANCE_ID or "<unset>",
     )
+    LOGGER.info("WhatsApp code version: %s", _code_version())
     # reload=False to avoid subprocess event loop issues on Windows
     uvicorn.run(
         "whatsapp_app:app",

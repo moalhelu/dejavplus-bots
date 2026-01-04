@@ -31,6 +31,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from html import escape
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, cast
 
 from bot_core.config import get_env
@@ -240,6 +241,93 @@ def _looks_like_error_or_login_page(html: str) -> bool:
     if "<html" not in head and "<!doctype html" not in head:
         return True
     return False
+
+
+def _extract_safe_viewer_url(json_payload: Any, html_candidate: Optional[str]) -> Optional[str]:
+    """Best-effort extraction of a Carfax *viewer page* URL.
+
+    This is intentionally conservative:
+    - Only https URLs
+    - Only on *.carfax.com
+    - Only page-like paths (avoid .js/.css/.json/assets)
+    """
+
+    def _is_safe_url(u: str) -> bool:
+        try:
+            parsed = urlparse(u)
+        except Exception:
+            return False
+        if (parsed.scheme or "").lower() != "https":
+            return False
+        host = (parsed.hostname or "").lower()
+        if not host or (host != "carfax.com" and not host.endswith(".carfax.com")):
+            return False
+        path = (parsed.path or "").lower()
+        # Avoid obvious non-document assets.
+        if any(path.endswith(ext) for ext in (".js", ".css", ".json", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2", ".ttf")):
+            return False
+        # Prefer URLs that look like report pages.
+        if any(tok in path for tok in ("vhr", "vehicle", "history", "report")):
+            return True
+        # If it's a very short/empty path, it is unlikely to be the viewer.
+        if path in {"", "/"}:
+            return False
+        return True
+
+    # 1) Try common keys in JSON (including nested locations).
+    common_keys = {
+        "url",
+        "viewerurl",
+        "viewer_url",
+        "reporturl",
+        "report_url",
+        "reportlink",
+        "report_link",
+        "htmlurl",
+        "html_url",
+        "link",
+        "linkurl",
+    }
+
+    def _walk(node: Any) -> Optional[str]:
+        if node is None:
+            return None
+        if isinstance(node, dict):
+            for k, v in node.items():
+                kl = str(k).strip().lower()
+                if kl in common_keys and isinstance(v, str) and v.startswith("https://") and _is_safe_url(v):
+                    return v
+            for v in node.values():
+                out = _walk(v)
+                if out:
+                    return out
+            return None
+        if isinstance(node, list):
+            for item in node:
+                out = _walk(item)
+                if out:
+                    return out
+            return None
+        if isinstance(node, str):
+            s = node.strip()
+            if s.startswith("https://") and _is_safe_url(s):
+                return s
+        return None
+
+    candidate = _walk(json_payload)
+    if candidate:
+        return candidate
+
+    # 2) Fall back to scanning HTML for https links.
+    if isinstance(html_candidate, str) and html_candidate:
+        try:
+            for m in re.finditer(r"https://[^\s\"'<>]+", html_candidate):
+                u = m.group(0)
+                if _is_safe_url(u):
+                    return u
+        except Exception:
+            return None
+    return None
 
 
 async def fetch_report_pdf_bytes(
@@ -578,6 +666,12 @@ async def generate_vin_report(
                             continue
                         return failure
 
+                    viewer_url: Optional[str] = None
+                    try:
+                        viewer_url = _extract_safe_viewer_url(json_payload, html_candidate)
+                    except Exception:
+                        viewer_url = None
+
                     # Translate report HTML when requested (kept bounded by the overall reports deadline).
                     delivered_lang = requested_lang
                     translate_ms = None
@@ -620,7 +714,29 @@ async def generate_vin_report(
                     pdf_rendered: Optional[bytes] = None
                     try:
                         acquire_ms = min(20_000, max(2_000, int(render_budget_ms * 0.5)))
+
+                        # Fast path (old engine style): if we have a safe viewer URL, print it directly.
+                        # Keep English-only to avoid changing translation behavior.
+                        if requested_lang == "en" and isinstance(viewer_url, str) and viewer_url:
+                            try:
+                                url_budget_ms = max(1_500, min(12_000, int(render_budget_ms * 0.5)))
+                                pdf_url = await html_to_pdf_bytes_chromium(
+                                    url=viewer_url,
+                                    timeout_ms=url_budget_ms,
+                                    acquire_timeout_ms=min(acquire_ms, 8_000),
+                                    wait_until="domcontentloaded",
+                                    fast_first_timeout_ms=min(1_500, url_budget_ms),
+                                    fast_first_wait_until="domcontentloaded",
+                                    settle_ms=750,
+                                )
+                                if pdf_url:
+                                    pdf_rendered = pdf_url
+                            except Exception:
+                                pdf_rendered = None
+
                         for render_attempt in (1, 2):
+                            if pdf_rendered:
+                                break
                             try:
                                 pdf_rendered = await html_to_pdf_bytes_chromium(
                                     html_str=html_candidate,

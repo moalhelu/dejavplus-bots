@@ -6496,6 +6496,19 @@ async def _smart_fallback(update, context):
     txt = (update.message.text or "").strip() if update and update.message and update.message.text else ""
     tg_id = str(update.effective_user.id) if update and update.effective_user else ""
 
+    # If the message looks like a phone number (e.g. WhatsApp +countrycode...),
+    # do not treat it as a VIN-like candidate and do not override previous handlers.
+    try:
+        phone_candidate = (txt or "").strip().replace(" ", "").replace("-", "")
+        if phone_candidate.startswith("00") and phone_candidate[2:].isdigit():
+            phone_candidate = f"+{phone_candidate[2:]}"
+        if phone_candidate.startswith("+") and phone_candidate[1:].isdigit() and 9 <= len(phone_candidate) <= 16:
+            return
+        if phone_candidate.isdigit() and 10 <= len(phone_candidate) <= 16:
+            return
+    except Exception:
+        pass
+
     # Resolve language for friendly fallback response
     try:
         db = _load_db()

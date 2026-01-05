@@ -1160,6 +1160,11 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "en": "\n\n✅ Delivered (PDF).",
         "ku": "\n\n✅ نێردرا (PDF).",
     },
+    "report.success.pdf_caption": {
+        "ar": "📄 تقرير VIN <code>{vin}</code>",
+        "en": "📄 VIN report <code>{vin}</code>",
+        "ku": "📄 ڕاپۆرتی VIN <code>{vin}</code>",
+    },
     "report.success.pdf_direct": {
         "ar": "✅ تم استلام ملف PDF مباشر.",
         "en": "✅ Received a direct PDF file.",

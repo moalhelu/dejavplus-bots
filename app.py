@@ -5076,7 +5076,7 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
                                 chat_id=chat_id,
                                 document=bio,
                                 filename=bio.name,
-                                caption=f"📄 تقرير VIN <code>{vin}</code>",
+                                caption=_bridge.t("report.success.pdf_caption", report_lang, vin=vin),
                                 parse_mode=ParseMode.HTML,
                             ),
                             timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),

@@ -6061,6 +6061,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # the main menu.
         if isinstance(chat_data, dict):
             chat_data["suppress_fallback"] = True
+        try:
+            if isinstance(getattr(context, "user_data", None), dict):
+                context.user_data["suppress_fallback"] = True
+        except Exception:
+            pass
         vins = _tg_extract_all_vins(txt, primary=vin)
         if not vins:
             try:
@@ -6941,7 +6946,10 @@ async def _commands_disabled(update, context):
 # === Global smart fallback handler (text) ===
 async def _smart_fallback(update, context):
     chat_data = context.chat_data if isinstance(getattr(context, "chat_data", None), dict) else {}
-    if isinstance(chat_data, dict) and chat_data.pop("suppress_fallback", False):
+    user_data = context.user_data if isinstance(getattr(context, "user_data", None), dict) else {}
+    if (isinstance(chat_data, dict) and chat_data.pop("suppress_fallback", False)) or (
+        isinstance(user_data, dict) and user_data.pop("suppress_fallback", False)
+    ):
         return
 
     txt = (update.message.text or "").strip() if update and update.message and update.message.text else ""
@@ -6970,6 +6978,11 @@ async def _smart_fallback(update, context):
 
     vin_try = _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
     looks_like_vin = bool(re.search(r"[A-Za-z0-9]{10,}", (txt or "")))
+
+    # If this message contains a valid VIN candidate, do not open the main menu.
+    # (The VIN report flow is handled elsewhere.)
+    if vin_try:
+        return
 
     if txt in ALL_BUTTON_LABELS or not txt:
         return 

@@ -748,24 +748,6 @@ _PANEL_MESSAGES: Dict[str, Dict[str, int]] = {}
 
 async def _panel_message(update, context: ContextTypes.DEFAULT_TYPE, text: str, *, parse_mode=None, reply_markup=None):
     """Edit the existing panel message if possible; otherwise send a new one and remember it."""
-    # If the incoming update is a VIN message, never show the main menu panel as a reaction.
-    # Users expect VIN -> extraction/progress/PDF only.
-    try:
-        incoming_txt = ""
-        if update and getattr(update, "message", None):
-            incoming_txt = ((update.message.text or "").strip() or (update.message.caption or "").strip())
-        incoming_vin = (_bridge._extract_vin_candidate(incoming_txt) or _norm_vin(incoming_txt)) if incoming_txt else None
-        is_main_menu_panel = bool(text and text.strip().startswith("🏠") and any(label in text for label in MAIN_MENU_TEXTS))
-        if incoming_vin and is_main_menu_panel:
-            chat_data = getattr(context, "chat_data", None)
-            if isinstance(chat_data, dict):
-                chat_data["suppress_fallback"] = True
-            if isinstance(getattr(context, "user_data", None), dict):
-                context.user_data["suppress_fallback"] = True
-            return None
-    except Exception:
-        pass
-
     bot = context.bot if context else update.get_bot()
     chat_id = update.effective_chat.id if update and update.effective_chat else None
     user_id = str(update.effective_user.id) if update and update.effective_user else None
@@ -6997,10 +6979,24 @@ async def _smart_fallback(update, context):
     vin_try = _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
     looks_like_vin = bool(re.search(r"[A-Za-z0-9]{10,}", (txt or "")))
 
-    # If this message contains a valid VIN candidate, do not open the main menu.
-    # (The VIN report flow is handled elsewhere.)
-    if vin_try:
-        return
+    # If any VIN report is in-flight for this user, never force-open the main menu.
+    try:
+        if tg_id:
+            async with _TG_INFLIGHT_LOCK:
+                bucket = _TG_INFLIGHT.get(str(tg_id))
+                if isinstance(bucket, dict) and bucket:
+                    return
+    except Exception:
+        pass
+
+    # Robust VIN detection: even if bridge parsing fails, don't show the menu.
+    try:
+        if vin_try:
+            return
+        if txt and VIN_RE.search((txt or "").upper()):
+            return
+    except Exception:
+        pass
 
     if txt in ALL_BUTTON_LABELS or not txt:
         return 

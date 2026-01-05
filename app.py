@@ -736,7 +736,7 @@ def _tg_contact_url(u: Dict[str, Any]) -> Optional[str]:
 
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ContextTypes, filters, ApplicationHandlerStop
 )
 from telegram.ext import filters as _filters
 
@@ -6130,7 +6130,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "progress_message_id": int(getattr(msg, "message_id", 0) or 0),
             }
             await _tg_submit_report_job(context, job)
-        return
+        # Hard-stop further handlers (e.g. global fallback) for this update.
+        raise ApplicationHandlerStop
 
     # ===== Menu routing =====
     if txt in MAIN_MENU_TEXTS:

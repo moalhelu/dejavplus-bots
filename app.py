@@ -736,7 +736,7 @@ def _tg_contact_url(u: Dict[str, Any]) -> Optional[str]:
 
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters, ApplicationHandlerStop
+    ContextTypes, filters
 )
 from telegram.ext import filters as _filters
 
@@ -6130,8 +6130,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "progress_message_id": int(getattr(msg, "message_id", 0) or 0),
             }
             await _tg_submit_report_job(context, job)
-        # Hard-stop further handlers (e.g. global fallback) for this update.
-        raise ApplicationHandlerStop
+        return
 
     # ===== Menu routing =====
     if txt in MAIN_MENU_TEXTS:
@@ -7007,6 +7006,15 @@ async def _smart_fallback(update, context):
 # === Global error handler ===
 async def _on_error(update, context):
     try:
+        # For VIN messages, never render the main menu as an error fallback.
+        try:
+            txt = (update.message.text or "").strip() if update and getattr(update, "message", None) else ""
+            if txt:
+                vin_try = _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
+                if vin_try:
+                    return
+        except Exception:
+            pass
         # log minimal info and show a friendly message (edit or send)
         tg_id = str(update.effective_user.id) if update and update.effective_user else ""
         db = _load_db()

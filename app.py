@@ -6056,6 +6056,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     if vin:
+        # VIN flow is handled here (progress + background job). Prevent the global
+        # smart fallback handler from also firing on the same update and opening
+        # the main menu.
+        if isinstance(chat_data, dict):
+            chat_data["suppress_fallback"] = True
         vins = _tg_extract_all_vins(txt, primary=vin)
         if not vins:
             try:

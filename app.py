@@ -7009,14 +7009,8 @@ async def _smart_fallback(update, context):
             parse_mode=ParseMode.HTML
         )
 
-    # Default fallback: gently redirect to main menu
-    return await _panel_message(
-        update,
-        context,
-        _main_menu_prompt_text(lang),
-        reply_markup=build_main_menu(tg_id, lang),
-        parse_mode=ParseMode.HTML,
-    )
+    # No automatic main-menu fallback.
+    return
 # === Global error handler ===
 async def _on_error(update, context):
     try:

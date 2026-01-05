@@ -5949,6 +5949,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ===== Bridge delegation (platform-agnostic flows) =====
+    # IMPORTANT: VIN text should always start report extraction immediately.
+    # If we delegate to bridge first, it may respond with a menu action and the user
+    # experiences an unexpected main-menu open instead of report generation.
 
     bridge_text_payload = txt or ((update.message.caption or "").strip() if update and update.message else "")
     bridge_vin_candidate = _bridge._extract_vin_candidate(bridge_text_payload) if bridge_text_payload else None
@@ -5983,7 +5986,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _send_bridge_responses(update, bridge_photo_responses, context=context)
                 return
 
-    if bridge_user_ctx and not bridge_vin_candidate:
+    # Detect VIN before routing plain text to bridge.
+    vin = bridge_vin_candidate or _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
+
+    if bridge_user_ctx and not vin:
         incoming_text = _bridge.IncomingMessage(
             platform="telegram",
             user_id=bridge_user_ctx.user_id,
@@ -5994,7 +6000,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bridge_text_responses:
             # Intercept menu action to render native Telegram keyboard (Old System)
             if isinstance(bridge_text_responses, _bridge.BridgeResponse) and bridge_text_responses.actions.get("menu"):
-                lang_menu = bridge_user_ctx.language or _get_user_report_lang(u) if u else None
+                lang_menu = bridge_user_ctx.language or lang
                 await _panel_message(
                     update,
                     context,
@@ -6011,9 +6017,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_data["suppress_fallback"] = True
             return
 
-    vin = bridge_vin_candidate or _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
-
-# ===== VIN detection =====
+    # ===== VIN detection =====
     # استثناء زريّ المساعدة والتقرير الجديد قبل فحص VIN
     if txt == "🆘 المساعدة والتواصل":
         lang = _get_user_report_lang(u) if u else None

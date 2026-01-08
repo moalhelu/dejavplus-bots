@@ -1341,6 +1341,14 @@ async def handle_incoming_whatsapp_message(
     vin_list = _extract_all_vins(text_body)
     vin_in_text = vin_list[0] if vin_list else None
 
+    # If the user sent a 17-char VIN-like token but it isn't valid, do NOT open the menu.
+    # Instead, respond with a localized validation message.
+    try:
+        _candidate17 = re.sub(r"[\s\-]+", "", (text_body or "").strip())
+    except Exception:
+        _candidate17 = (text_body or "").strip()
+    looks_like_vin_17 = bool(_candidate17) and len(_candidate17) == 17
+
     # Normalize numeric replies like "3️⃣" -> "3" for menu/language flows.
     numeric_token = None if vin_list else (_extract_numeric_token(text_body) or None)
 
@@ -1352,6 +1360,13 @@ async def handle_incoming_whatsapp_message(
     media_url = _detect_media_url(enriched_event)
     user_ctx = _build_user_context(bridge_sender, enriched_event)
     LOGGER.debug("whatsapp inbound state=%s", user_ctx.state)
+
+    if looks_like_vin_17 and not vin_list:
+        try:
+            await send_whatsapp_text(msisdn, _clean_html_for_whatsapp(_bridge.t("vin.invalid", user_ctx.language)), client=client)
+        except Exception:
+            pass
+        return {"status": "ok", "reason": "invalid_vin"}
     pre_reserved_credit = False
     rid_for_request: Optional[str] = None
 

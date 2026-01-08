@@ -5028,7 +5028,7 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
                 lang=report_lang,
             )
             refund_note = _bridge.t("report.refund.note", report_lang)
-            failure_note = f"\n\n{escape(err_text)}{refund_note}\n\n❌ Failed + refunded"
+            failure_note = f"\n\n{escape(err_text)}{refund_note}"
             try:
                 await asyncio.wait_for(
                     _tg_edit_inflight_messages(
@@ -5160,7 +5160,7 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
             lang=report_lang,
         )
         try:
-            pdf_failure_note = "\n\n" + _bridge.t("report.error.pdf", report_lang) + _bridge.t("report.refund.note", report_lang) + "\n\n❌ Failed + refunded"
+            pdf_failure_note = "\n\n" + _bridge.t("report.error.pdf", report_lang) + _bridge.t("report.refund.note", report_lang)
             await asyncio.wait_for(
                 _tg_edit_inflight_messages(
                     context,

@@ -6044,21 +6044,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not vin:
-        # If the user sent exactly 17 characters (VIN length) but it's not a valid VIN,
-        # reply with an explicit validation message instead of opening/showing menus.
-        try:
-            candidate17 = re.sub(r"[\s\-]+", "", (txt or "").strip())
-        except Exception:
-            candidate17 = (txt or "").strip()
-        if candidate17 and len(candidate17) == 17:
-            try:
-                await update.message.reply_text(_bridge.t("vin.invalid", lang), parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
-            if isinstance(chat_data, dict):
-                chat_data["suppress_fallback"] = True
-            return
-
         try:
             await update.message.reply_text(_menu_hint_text(lang))
         except Exception:
@@ -6992,11 +6977,7 @@ async def _smart_fallback(update, context):
         lang = None
 
     vin_try = _bridge._extract_vin_candidate(txt) or _norm_vin(txt)
-    try:
-        candidate17 = re.sub(r"[\s\-]+", "", (txt or "").strip())
-    except Exception:
-        candidate17 = (txt or "").strip()
-    looks_like_vin_17 = bool(candidate17) and len(candidate17) == 17
+    looks_like_vin = bool(re.search(r"[A-Za-z0-9]{10,}", (txt or "")))
 
     # If any VIN report is in-flight for this user, never force-open the main menu.
     try:
@@ -7019,12 +7000,14 @@ async def _smart_fallback(update, context):
 
     if txt in ALL_BUTTON_LABELS or not txt:
         return 
-    if looks_like_vin_17 and not vin_try:
-        try:
-            await update.message.reply_text(_bridge.t("vin.invalid", lang), parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        return
+    if looks_like_vin and not vin_try:
+        return await _panel_message(
+            update,
+            context,
+            _bridge.t("common.invalid_vin", lang),
+            reply_markup=build_main_menu(tg_id),
+            parse_mode=ParseMode.HTML
+        )
 
     # No automatic main-menu fallback.
     return

@@ -1336,24 +1336,7 @@ async def handle_incoming_whatsapp_message(
 
     LOGGER.info("📩 Incoming WhatsApp from %s: %s", msisdn, text_body)
 
-    # VIN detection must win over menu/language numeric parsing.
-    # Users often paste VINs while still "inside" a menu state.
-    # If a user sends a 17-char VIN-like token that is invalid, reply with a
-    # localized "please verify VIN" message and do NOT open the main menu.
-    try:
-        tokens_17 = re.findall(r"[A-Za-z0-9]{17}", text_body or "")
-        if tokens_17 and not any(is_valid_vin(t.strip().upper()) for t in tokens_17):
-            await send_whatsapp_text(msisdn, _bridge.t("common.invalid_vin", user_ctx.language), client=client)
-            return {"status": "ok", "reason": "invalid_vin"}
-    except Exception:
-        pass
-
-    vin_list = _extract_all_vins(text_body)
-    vin_in_text = vin_list[0] if vin_list else None
-
-    # Normalize numeric replies like "3️⃣" -> "3" for menu/language flows.
-    numeric_token = None if vin_list else (_extract_numeric_token(text_body) or None)
-
+    # Build context early so we can localize any immediate replies.
     enriched_event = dict(event)
     enriched_event.setdefault("sender", bridge_sender)
     telegram_context = _get_notification_context()
@@ -1362,6 +1345,35 @@ async def handle_incoming_whatsapp_message(
     media_url = _detect_media_url(enriched_event)
     user_ctx = _build_user_context(bridge_sender, enriched_event)
     LOGGER.debug("whatsapp inbound state=%s", user_ctx.state)
+
+    # VIN detection must win over menu/language numeric parsing.
+    # Users often paste VINs while still "inside" a menu state.
+    # If a user sends a VIN-like token (commonly 15/16/17/18 chars) that is invalid,
+    # reply with a
+    # localized "please verify VIN" message and do NOT open the main menu.
+    try:
+        vin_attempts: List[str] = []
+        for part in re.split(r"\s+", text_body or ""):
+            cleaned = re.sub(r"[^A-Za-z0-9]", "", part or "").strip()
+            if not cleaned:
+                continue
+            if 15 <= len(cleaned) <= 18 and any(c.isalpha() for c in cleaned) and any(c.isdigit() for c in cleaned):
+                vin_attempts.append(cleaned.upper())
+
+        valid_vins = [v for v in vin_attempts if len(v) == 17 and is_valid_vin(v)]
+        if vin_attempts and not valid_vins:
+            await send_whatsapp_text(msisdn, _bridge.t("common.invalid_vin", user_ctx.language), client=client)
+            return {"status": "ok", "reason": "invalid_vin"}
+    except Exception:
+        pass
+
+    # Prefer VINs we already validated from cleaned tokens (supports e.g. "VIN: XXXXX").
+    vin_list = valid_vins if "valid_vins" in locals() and valid_vins else _extract_all_vins(text_body)
+    vin_in_text = vin_list[0] if vin_list else None
+
+    # Normalize numeric replies like "3️⃣" -> "3" for menu/language flows.
+    numeric_token = None if vin_list else (_extract_numeric_token(text_body) or None)
+
     pre_reserved_credit = False
     rid_for_request: Optional[str] = None
 

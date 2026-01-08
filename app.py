@@ -5287,13 +5287,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_main_menu_single()
         return
 
-    # If user sends a 17-char VIN-like token that is NOT a valid VIN, reply with a
-    # localized "please verify VIN" message (and do NOT open the main menu).
-    # This prevents confusing UX where invalid VINs get treated as menu triggers.
+    # If user sends a VIN-like token (commonly 15/16/17/18 chars) that is invalid,
+    # reply with a localized "please verify VIN" message (and do NOT open the main menu).
+    # This prevents confusing UX where VIN-like strings get treated as menu triggers.
     try:
-        compact = re.sub(r"[\s-]", "", (txt or ""))
-        if len(compact) == 17 and re.fullmatch(r"[A-Za-z0-9]{17}", compact):
-            if _norm_vin(compact) is None:
+        compact = re.sub(r"[^A-Za-z0-9]", "", (txt or "")).strip()
+        if 15 <= len(compact) <= 18 and any(c.isalpha() for c in compact) and any(c.isdigit() for c in compact):
+            invalid = (len(compact) != 17) or (_norm_vin(compact) is None)
+            if invalid:
                 if isinstance(chat_data, dict):
                     chat_data["suppress_fallback"] = True
                 await _panel_message(

@@ -195,9 +195,6 @@ class ReportResult:
 
 ERROR_UPSTREAM_FETCH_FAILED = "UPSTREAM_FETCH_FAILED"
 ERROR_PDF_RENDER_FAILED = "PDF_RENDER_FAILED"
-
-VHR_FETCH_FAILED_USER_MESSAGE = "Could not fetch the Vehicle History Report for this VIN. Credit refunded."
-
 PDF_RENDER_FAILED_USER_MESSAGE = "Failed to generate the PDF right now. Credit refunded."
 
 
@@ -624,7 +621,7 @@ async def generate_vin_report(
                         err = str(upstream.get("error") or upstream.get("err_text") or f"HTTP_{status if status is not None else 'NA'}")
                         failure = ReportResult(
                             success=False,
-                            user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                            user_message=_t("report.error.generic", requested_lang, "⚠️ Please verify the VIN is correct or try again."),
                             errors=[err],
                             vin=normalized_vin,
                             raw_response={**(upstream or {}), "total_time_sec": total_time},
@@ -686,7 +683,7 @@ async def generate_vin_report(
                             pass
                         failure = ReportResult(
                             success=False,
-                            user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                            user_message=_t("report.error.generic", requested_lang, "⚠️ Please verify the VIN is correct or try again."),
                             errors=["missing_htmlContent"],
                             vin=normalized_vin,
                             raw_response={**(upstream or {}), "total_time_sec": total_time},
@@ -730,7 +727,7 @@ async def generate_vin_report(
                     if _looks_like_error_or_login_page(html_candidate):
                         failure = ReportResult(
                             success=False,
-                            user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                            user_message=_t("report.error.generic", requested_lang, "⚠️ Please verify the VIN is correct or try again."),
                             errors=["upstream_html_error_page"],
                             vin=normalized_vin,
                             raw_response={**(upstream or {}), "total_time_sec": total_time, "html_bytes_len": html_len0, "html_preview": preview0},
@@ -991,7 +988,7 @@ async def generate_vin_report(
 
                 return last_failure or ReportResult(
                     success=False,
-                    user_message=VHR_FETCH_FAILED_USER_MESSAGE,
+                    user_message=_t("report.error.generic", requested_lang, "⚠️ Please verify the VIN is correct or try again."),
                     errors=["unknown_failure"],
                     vin=normalized_vin,
                     error_class=ERROR_UPSTREAM_FETCH_FAILED,

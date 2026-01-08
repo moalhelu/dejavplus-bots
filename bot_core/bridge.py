@@ -1111,9 +1111,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
     },
     # Reports / VIN processing
     "report.error.generic": {
-        "ar": "⚠️ تعذّر معالجة التقرير.",
-        "en": "⚠️ Could not process the report.",
-        "ku": "⚠️ نەتوانرا ڕاپۆرت کاربکات.",
+        "ar": "⚠️ الرجاء التأكد من رقم الشاصي الصحيح أو إعادة المحاولة.",
+        "en": "⚠️ Please verify the VIN is correct or try again.",
+        "ku": "⚠️ تکایە دڵنیابە لە دروستی ژمارەی شاسی (VIN) یان دووبارە هەوڵ بدە.",
     },
     "report.error.fetch": {
         "ar": "⚠️ فشل جلب التقرير.",

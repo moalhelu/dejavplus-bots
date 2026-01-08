@@ -1338,6 +1338,16 @@ async def handle_incoming_whatsapp_message(
 
     # VIN detection must win over menu/language numeric parsing.
     # Users often paste VINs while still "inside" a menu state.
+    # If a user sends a 17-char VIN-like token that is invalid, reply with a
+    # localized "please verify VIN" message and do NOT open the main menu.
+    try:
+        tokens_17 = re.findall(r"[A-Za-z0-9]{17}", text_body or "")
+        if tokens_17 and not any(is_valid_vin(t.strip().upper()) for t in tokens_17):
+            await send_whatsapp_text(msisdn, _bridge.t("common.invalid_vin", user_ctx.language), client=client)
+            return {"status": "ok", "reason": "invalid_vin"}
+    except Exception:
+        pass
+
     vin_list = _extract_all_vins(text_body)
     vin_in_text = vin_list[0] if vin_list else None
 

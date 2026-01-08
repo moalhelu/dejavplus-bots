@@ -5286,6 +5286,25 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if lower_txt in MENU_SHOW_KEYWORDS:
         await _show_main_menu_single()
         return
+
+    # If user sends a 17-char VIN-like token that is NOT a valid VIN, reply with a
+    # localized "please verify VIN" message (and do NOT open the main menu).
+    # This prevents confusing UX where invalid VINs get treated as menu triggers.
+    try:
+        compact = re.sub(r"[\s-]", "", (txt or ""))
+        if len(compact) == 17 and re.fullmatch(r"[A-Za-z0-9]{17}", compact):
+            if _norm_vin(compact) is None:
+                if isinstance(chat_data, dict):
+                    chat_data["suppress_fallback"] = True
+                await _panel_message(
+                    update,
+                    context,
+                    _bridge.t("common.invalid_vin", lang),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+    except Exception:
+        pass
     raw_payload = _bridge_raw_payload(update)
     bridge_user_ctx = _build_bridge_user_context(update, context)
     
@@ -7001,12 +7020,12 @@ async def _smart_fallback(update, context):
     if txt in ALL_BUTTON_LABELS or not txt:
         return 
     if looks_like_vin and not vin_try:
+        # VIN-like but invalid: inform the user without opening the main menu.
         return await _panel_message(
             update,
             context,
             _bridge.t("common.invalid_vin", lang),
-            reply_markup=build_main_menu(tg_id),
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
 
     # No automatic main-menu fallback.

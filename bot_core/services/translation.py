@@ -155,11 +155,46 @@ _KU_LATIN_MAP = {
 def _latin_ku_to_arabic(text: str) -> str:
     if not text:
         return text
-    out = []
+    # Preserve HTML tags and entities.
+    # Telegram messages use HTML parse mode with tags like <b> and <code>.
+    # Transliteration must never modify tag names/entities, otherwise Telegram raises:
+    # "Can't parse entities: unsupported start tag ...".
+    out: list[str] = []
+    in_tag = False
+    in_entity = False
+    entity_len = 0
+
     for ch in text:
+        if in_tag:
+            out.append(ch)
+            if ch == ">":
+                in_tag = False
+            continue
+
+        if in_entity:
+            out.append(ch)
+            entity_len += 1
+            # End entity at ';' or bail out if it looks malformed/too long.
+            if ch == ";" or entity_len >= 32:
+                in_entity = False
+                entity_len = 0
+            continue
+
+        if ch == "<":
+            in_tag = True
+            out.append(ch)
+            continue
+
+        if ch == "&":
+            in_entity = True
+            entity_len = 0
+            out.append(ch)
+            continue
+
         lower = ch.lower()
         mapped = _KU_LATIN_MAP.get(lower)
         out.append(mapped if mapped else ch)
+
     return "".join(out)
 
 

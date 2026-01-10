@@ -5071,19 +5071,6 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
                     try:
                         bio = BytesIO(pdf_bytes)
                         bio.name = report_result.pdf_filename or f"{vin}.pdf"
-                        # RTL (especially Kurdish) PDFs can be larger due to render/translation, and Telegram
-                        # upload can intermittently time out. Allow a larger bounded send timeout for big PDFs.
-                        send_timeout_s = float(tg_send_timeout_s)
-                        if report_lang in {"ku", "ckb"}:
-                            try:
-                                pdf_mb = float(len(pdf_bytes)) / (1024.0 * 1024.0)
-                                if pdf_mb >= 6.0:
-                                    send_timeout_s = max(send_timeout_s, 120.0)
-                                if pdf_mb >= 12.0:
-                                    send_timeout_s = max(send_timeout_s, 180.0)
-                            except Exception:
-                                pass
-                        send_timeout_s = max(10.0, min(send_timeout_s, 300.0))
                         await asyncio.wait_for(
                             context.bot.send_document(
                                 chat_id=chat_id,
@@ -5092,7 +5079,7 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
                                 caption=_bridge.t("report.success.pdf_caption", report_lang, vin=vin),
                                 parse_mode=ParseMode.HTML,
                             ),
-                            timeout=min(send_timeout_s, _tg_remaining_s(floor=1.0)),
+                            timeout=min(tg_send_timeout_s, _tg_remaining_s(floor=1.0)),
                         )
                         sent_ok = True
                         break

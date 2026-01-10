@@ -4887,10 +4887,6 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
     bridge_temp_files: List[str] = []
 
     tg_total_timeout_s = float(os.getenv("TG_REPORT_TOTAL_TIMEOUT_SEC", "120") or 120)
-    # Kurdish/RTL reports can be slower due to translation + Chromium render.
-    # Keep this scoped to Telegram to avoid changing upstream service behavior.
-    if report_lang in {"ku", "ckb"}:
-        tg_total_timeout_s = max(tg_total_timeout_s, 180.0)
     tg_total_timeout_s = max(10.0, min(tg_total_timeout_s, 300.0))
     tg_send_timeout_s = float(os.getenv("TG_REPORT_SEND_TIMEOUT_SEC", "60") or 60)
     tg_send_timeout_s = max(10.0, min(tg_send_timeout_s, 300.0))
@@ -4929,14 +4925,12 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
                 )
                 try:
                     vin_bridge_response = await asyncio.wait_for(
-                        asyncio.shield(
-                            _bridge.handle_text(
-                                bridge_user_ctx,
-                                vin_incoming,
-                                context=context,
-                                skip_limit_validation=True,
-                                deduct_credit=False,
-                            )
+                        _bridge.handle_text(
+                            bridge_user_ctx,
+                            vin_incoming,
+                            context=context,
+                            skip_limit_validation=True,
+                            deduct_credit=False,
                         ),
                         timeout=_tg_remaining_s(),
                     )
@@ -4961,9 +4955,7 @@ async def _tg_run_vin_report_job(context: ContextTypes.DEFAULT_TYPE, job: Dict[s
                             pass
                     try:
                         report_result = await asyncio.wait_for(
-                            asyncio.shield(
-                                _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(tg_id))
-                            ),
+                            _generate_vin_report(vin, language=report_lang, fast_mode=True, user_id=str(tg_id)),
                             timeout=_tg_remaining_s(),
                         )
                     except asyncio.TimeoutError:

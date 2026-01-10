@@ -179,10 +179,27 @@ def _apply_kurdish_arabic_to_soup(soup: Any) -> None:
     if soup is None:
         return
     try:
+        # IMPORTANT: keep this step lightweight.
+        # Some upstream reports are very large; rewriting every text node is expensive and can
+        # cause intermittent timeouts (especially in Telegram flows with strict time budgets).
+        # We only transliterate nodes that still contain Latin letters.
+        processed = 0
+        max_nodes = 2500
         for element in soup.find_all(text=True):
             if element.parent and element.parent.name in ("script", "style", "noscript"):
                 continue
-            element.replace_with(_ensure_kurdish_arabic(str(element)))
+            raw = str(element)
+            if not raw:
+                continue
+            # Fast skip: nothing Latin -> nothing to transliterate.
+            if not re.search(r"[A-Za-z]", raw):
+                continue
+            out = _ensure_kurdish_arabic(raw)
+            if out != raw:
+                element.replace_with(out)
+                processed += 1
+                if processed >= max_nodes:
+                    break
     except Exception:
         return
 

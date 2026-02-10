@@ -4,10 +4,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from datetime import datetime, date, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Optional, Final
+
+from contextlib import contextmanager
 
 from bot_core.request_ledger import reserve_once as _ledger_reserve_once, commit_once as _ledger_commit_once, refund_once as _ledger_refund_once
 
@@ -17,6 +20,57 @@ from bot_core.telemetry import log_timing, timed
 _DB_LOCK = Lock()
 # Default to 1 retained backup; env DB_BACKUP_RETENTION can override
 _BACKUP_RETENTION: Final[int] = max(1, int(os.getenv("DB_BACKUP_RETENTION", "1") or "1"))
+
+
+@contextmanager
+def _db_file_lock(path: str):
+    """Cross-process lock to protect db.json read/write.
+
+    We run both Telegram and WhatsApp bots concurrently in separate processes.
+    A plain threading.Lock is not enough and can lead to db corruption on Windows.
+    """
+
+    lock_path = path + ".lock"
+    Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
+
+    fh = None
+    try:
+        fh = open(lock_path, "a+", encoding="utf-8")
+        if os.name == "nt":
+            import msvcrt
+
+            # Lock 1 byte; must seek to start for consistent locking.
+            try:
+                fh.seek(0)
+            except Exception:
+                pass
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if fh is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    try:
+                        fh.seek(0)
+                    except Exception:
+                        pass
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 def _blank_db() -> Dict[str, Any]:
@@ -42,13 +96,26 @@ def _db_path() -> str:
 def load_db() -> Dict[str, Any]:
     path = _db_path()
     with timed("db.load", file=Path(path).name):
-        if not os.path.exists(path):
-            return _blank_db()
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            return _blank_db()
+        with _db_file_lock(path):
+            if not os.path.exists(path):
+                return _blank_db()
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                # If the DB is corrupted/truncated, try the most recent backup.
+                try:
+                    src = Path(path)
+                    backup_dir = src.parent / "backups"
+                    pattern = f"{src.stem}-*{src.suffix or '.json'}"
+                    backups = sorted(backup_dir.glob(pattern))
+                    if backups:
+                        with open(backups[-1], "r", encoding="utf-8") as bfh:
+                            data = json.load(bfh)
+                    else:
+                        return _blank_db()
+                except Exception:
+                    return _blank_db()
         for key in ("users", "activation_requests", "settings"):
             data.setdefault(key, _blank_db()[key])
         _sanitize_settings(data.get("settings", {}))
@@ -57,27 +124,41 @@ def load_db() -> Dict[str, Any]:
 
 def save_db(db: Dict[str, Any]) -> None:
     path = _db_path()
-    tmp_path = path + ".tmp"
+    # Per-process temp file to avoid cross-process collisions.
+    tmp_path = f"{path}.{os.getpid()}.tmp"
     with _DB_LOCK:
         with timed("db.save", file=Path(path).name):
-            _sanitize_settings(db.setdefault("settings", {}))
-            serialized = json.dumps(db, ensure_ascii=False, indent=2)
+            with _db_file_lock(path):
+                _sanitize_settings(db.setdefault("settings", {}))
+                serialized = json.dumps(db, ensure_ascii=False, indent=2)
 
-            try:
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as existing_fh:
-                        existing = existing_fh.read()
-                    if existing == serialized:
-                        log_timing("db.save.noop", 0.0, file=Path(path).name, bytes=len(serialized))
-                        return
-            except Exception:
-                # If we can't read existing content, fall back to normal save.
-                pass
+                try:
+                    if os.path.exists(path):
+                        with open(path, "r", encoding="utf-8") as existing_fh:
+                            existing = existing_fh.read()
+                        if existing == serialized:
+                            log_timing("db.save.noop", 0.0, file=Path(path).name, bytes=len(serialized))
+                            return
+                except Exception:
+                    # If we can't read existing content, fall back to normal save.
+                    pass
 
-            _backup_existing_db(path)
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                fh.write(serialized)
-            os.replace(tmp_path, path)
+                _backup_existing_db(path)
+                with open(tmp_path, "w", encoding="utf-8") as fh:
+                    fh.write(serialized)
+                os.replace(tmp_path, path)
+
+                # Best-effort cleanup if older temp files exist (e.g. previous crash).
+                try:
+                    stale = Path(path).parent.glob(f"{Path(path).name}.*.tmp")
+                    for p in stale:
+                        if str(p) != tmp_path:
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
 
 def _default_user(tg_id: str, tg_username: Optional[str]) -> Dict[str, Any]:

@@ -317,6 +317,7 @@ def _renewal_admin_keyboard(tg_id: str, days: int, daily: int, monthly: int) -> 
     data_dismiss = f"renewal:dismiss:{tg_id}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔁 جدّد الخطة", callback_data=data_accept)],
+        [InlineKeyboardButton("🔎 فتح البطاقة", callback_data=f"ucard:open:{tg_id}")],
         [InlineKeyboardButton("✋ تجاهل اليوم", callback_data=data_dismiss)],
     ])
 
@@ -550,6 +551,31 @@ async def check_and_send_auto_notifications(
                             quiet_hours=quiet_hours,
                         )
                         _record_last(last_notifications, last_key, today_str)
+
+                    admin_key = "expiry_admin_0"
+                    if last_notifications.get(admin_key) != today_str:
+                        plan_days = _infer_plan_days(user)
+                        kb = _renewal_admin_keyboard(
+                            tg_id,
+                            plan_days,
+                            max(1, _safe_int(daily_limit, 25)),
+                            max(1, _safe_int(monthly_limit, 50)),
+                        )
+                        super_msg = (
+                            "⛔ <b>اشتراك انتهى اليوم</b>\n"
+                            f"• المستخدم: <b>{_display_name(user)}</b> ({_fmt_tg_with_phone(tg_id)})\n"
+                            f"• الخطة الحالية: {plan_days} يوم | يومي {daily_limit} / شهري {monthly_limit}\n"
+                            f"• تاريخ الانتهاء: <code>{_fmt_date(exp)}</code>\n\n"
+                            "🔁 اضغط زر التجديد لإعادة تفعيل نفس الخطة أو افتح البطاقة للتفعيل السريع."
+                        )
+                        await _dispatch_super_notification(
+                            context,
+                            super_msg,
+                            kind="expiry:admin_0",
+                            kb=kb,
+                            log_only=effective_log_only,
+                        )
+                        _record_last(last_notifications, admin_key, today_str)
                     if user.get("is_active"):
                         user["is_active"] = False
             if days_left is not None and days_left < 0:
@@ -566,6 +592,38 @@ async def check_and_send_auto_notifications(
                         quiet_hours=quiet_hours,
                     )
                     _record_last(last_notifications, overdue_key, today_str)
+
+                # Controlled reactivation reminders to supers for overdue accounts.
+                try:
+                    cadence = int(SMART_NOTIFY_RULES.get("reactivate_every_days", 3) or 3)
+                except Exception:
+                    cadence = 3
+                cadence = max(1, cadence)
+                admin_key = "expiry_admin_overdue"
+                should_ping = (abs(days_left) % cadence) == 0
+                if should_ping and last_notifications.get(admin_key) != today_str:
+                    plan_days = _infer_plan_days(user)
+                    kb = _renewal_admin_keyboard(
+                        tg_id,
+                        plan_days,
+                        max(1, _safe_int(daily_limit, 25)),
+                        max(1, _safe_int(monthly_limit, 50)),
+                    )
+                    super_msg = (
+                        "⛔ <b>اشتراك منتهي</b>\n"
+                        f"• المستخدم: <b>{_display_name(user)}</b> ({_fmt_tg_with_phone(tg_id)})\n"
+                        f"• منتهي منذ: <b>{abs(days_left)}</b> يوم\n"
+                        f"• تاريخ الانتهاء: <code>{_fmt_date(exp)}</code>\n\n"
+                        "🔁 اضغط زر التجديد لإعادة التفعيل أو افتح البطاقة للتفعيل السريع."
+                    )
+                    await _dispatch_super_notification(
+                        context,
+                        super_msg,
+                        kind="expiry:admin_overdue",
+                        kb=kb,
+                        log_only=effective_log_only,
+                    )
+                    _record_last(last_notifications, admin_key, today_str)
                 if user.get("is_active"):
                     user["is_active"] = False
 

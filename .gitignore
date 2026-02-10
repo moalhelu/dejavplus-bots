@@ -6,7 +6,11 @@ __pycache__/
 
 # Ignore database backups
 db.json
-backups/db-*.json
+backups/*.json
+
+# Ignore lock/temp/test artifacts
+*.lock
+db_test_concurrency*.json
 
 # Ignore local DB merge scratch files
 tools/db_merge/*.json

@@ -705,6 +705,14 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
         if BeautifulSoup is None:
             return inject_rtl(html_input, lang=target_lang) if rtl else html_input
 
+        # Strict time budget: never let best-effort translation delay report extraction.
+        # We cap ALL follow-up retries/fallbacks by the remaining budget.
+        started_at = time.perf_counter()
+        deadline = started_at + float(TRANSLATE_TOTAL_TIMEOUT)
+
+        def _remaining_s() -> float:
+            return max(0.0, deadline - time.perf_counter())
+
         try:
             soup = BeautifulSoup(html_input, "html.parser")
             text_nodes: List[Any] = []
@@ -748,54 +756,77 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
             # Flatten segments for batch translation
             flat_segments: List[str] = [seg for segments in expanded_map for seg in segments]
             try:
+                remaining = _remaining_s()
+                if remaining <= 0.25:
+                    result_html = str(soup)
+                    return inject_rtl(result_html, lang=target_lang) if rtl else result_html
                 translated_segments = await asyncio.wait_for(
                     translate_batch(flat_segments, target=target_lang),
-                    timeout=TRANSLATE_TOTAL_TIMEOUT,
+                    timeout=max(0.25, min(float(TRANSLATE_TOTAL_TIMEOUT), remaining)),
                 )
             except Exception:
                 translated_segments = []
             if not translated_segments or len(translated_segments) != len(flat_segments):
                 translated_segments = flat_segments  # fallback to original
 
-            # Arabic-only: if translation is *partial* (some segments remain unchanged and still
-            # contain Latin letters), do a very small, capped Google-free fallback for those
-            # specific segments. This improves coverage without translating everything twice.
-            if target_lang_raw == "ar":
+            # If translation is *partial* (some segments remain unchanged and still contain Latin
+            # letters), do a bounded Google-free fallback for those specific segments.
+            # This reduces mixed-language reports without translating the whole document twice.
+            if target_lang != "en":
                 try:
+                    if _remaining_s() <= 0.35:
+                        raise RuntimeError("skip_fallback_budget")
                     unchanged_idx: List[int] = []
                     for i, (src, out) in enumerate(zip(flat_segments, translated_segments)):
                         if out != src:
                             continue
-                        # Only attempt fallback for segments that look like English labels.
-                        if not re.search(r"[A-Za-z]", src):
+                        if not re.search(r"[A-Za-z]{2,}", src):
                             continue
                         if len(src.strip()) < 2:
                             continue
-                        if len(src) > 300:
+                        if len(src) > 450:
+                            continue
+                        if re.search(r"\b[A-HJ-NPR-Z0-9]{17}\b", src):
+                            continue
+                        if re.search(r"https?://", src, flags=re.I):
                             continue
                         unchanged_idx.append(i)
 
-                    # Do fallback when it likely matters, but also cover the common case where only
-                    # a small number of English labels remain (user-visible) without adding much latency.
                     unchanged_ratio = len(unchanged_idx) / max(1, len(flat_segments))
+                    # Trigger even when only a small number of English labels remain.
                     should_fallback = bool(unchanged_idx) and (
-                        len(unchanged_idx) <= 25 or unchanged_ratio >= 0.08
+                        len(unchanged_idx) <= 80 or unchanged_ratio >= 0.02
                     )
                     if should_fallback:
-                        max_items = 160
+                        remaining_budget = _remaining_s()
+                        if remaining_budget <= 0.35:
+                            raise RuntimeError("skip_fallback_budget")
+                        # Cap work to keep latency bounded.
+                        max_items = 240 if target_lang_raw == "ar" else 180
                         idx_slice = unchanged_idx[:max_items]
                         src_slice = [flat_segments[i] for i in idx_slice]
-                        # Deduplicate to save requests.
+
                         uniq_map: Dict[str, List[int]] = {}
                         for pos, s in zip(idx_slice, src_slice):
                             uniq_map.setdefault(s, []).append(pos)
                         uniq_texts = list(uniq_map.keys())
 
-                        # Keep this bounded so it doesn't hurt the <10s target.
-                        if len(uniq_texts) <= 20:
-                            fallback_timeout = min(0.9, max(0.6, FREE_GOOGLE_TIMEOUT))
-                        else:
-                            fallback_timeout = min(1.5, max(0.8, FREE_GOOGLE_TIMEOUT))
+                        # Avoid very large fallback batches; we'll keep it small and focused.
+                        max_uniq = 90 if target_lang_raw == "ar" else 70
+                        uniq_texts = uniq_texts[:max_uniq]
+
+                        # Keep this bounded so it doesn't hurt report generation time.
+                        # Use a slightly higher timeout when there are more items.
+                        fallback_timeout = min(2.6, max(1.0, FREE_GOOGLE_TIMEOUT + 0.4))
+                        if len(uniq_texts) <= 12:
+                            fallback_timeout = min(fallback_timeout, 1.4)
+                        elif len(uniq_texts) <= 30:
+                            fallback_timeout = min(fallback_timeout, 2.0)
+
+                        # Hard cap so we don't introduce noticeable delays.
+                        fallback_timeout = min(fallback_timeout, 0.95 if target_lang_raw == "ar" else 0.85)
+                        fallback_timeout = min(fallback_timeout, max(0.2, _remaining_s()))
+
                         fallback_out: List[str] = []
                         try:
                             fallback_out = await asyncio.wait_for(
@@ -806,7 +837,6 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
                             fallback_out = []
 
                         if fallback_out and len(fallback_out) == len(uniq_texts):
-                            # Apply fallback only when it actually changed the text.
                             for src_text, tr_text in zip(uniq_texts, fallback_out):
                                 if not tr_text or tr_text == src_text:
                                     continue
@@ -828,9 +858,13 @@ async def translate_html(html_str: str, target: str = "ar") -> str:
             # If no change happened (provider failed silently), try batched Google free as last resort
             if no_change and target_lang != "en":
                 try:
+                    remaining_budget = _remaining_s()
+                    # Only try this when we still have budget AND the doc is not too large.
+                    if remaining_budget <= 0.6 or len(originals) > 120:
+                        raise RuntimeError("skip_full_fallback_budget")
                     fallback_rebuilt = await asyncio.wait_for(
                         _google_free_batch(originals, target_lang),
-                        timeout=FREE_GOOGLE_TIMEOUT + 1,
+                        timeout=min(1.0, remaining_budget),
                     )
                     rebuilt = fallback_rebuilt if len(fallback_rebuilt) == len(originals) else originals
                 except Exception:
